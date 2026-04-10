@@ -30,7 +30,8 @@ Call `record_constraint` with the rule, reason, scope, and hardness. Use hardnes
 ## When to Retrieve
 
 ### At conversation start:
-Call `get_project_summary` to orient yourself on the project's decisions, pipelines, and constraints. This prevents you from suggesting changes that violate established patterns.
+1. Call `get_compaction_report` first. If the report shows discrepancies (missing or modified entries), surface them to the user before doing anything else. Missing entries may need to be re-recorded.
+2. Then call `get_project_summary` to orient yourself on the project's decisions, pipelines, and constraints. This prevents you from suggesting changes that violate established patterns.
 
 ### Before making architectural changes:
 Call `get_context` with tags or a query describing what you're about to change. Check for conflicting decisions or constraints before proposing changes.

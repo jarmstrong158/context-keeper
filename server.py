@@ -233,6 +233,15 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "get_compaction_report",
+        "description": (
+            "Check if the last compaction lost or modified any context entries. "
+            "Call this at session start before get_project_summary. If discrepancies "
+            "are found, surface them to the user before proceeding."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 # ============================================================
@@ -748,6 +757,26 @@ def handle_prune_stale(params):
     }
 
 
+def handle_get_compaction_report(_params):
+    report_path = os.path.join(CONTEXT_DIR, "compaction_report.json")
+    if not os.path.exists(report_path):
+        return {"has_report": False, "message": "No compaction report found. No compaction has been detected yet."}
+
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to read compaction report: {e}"}
+
+    report["has_report"] = True
+    if report.get("status") == "discrepancies_found":
+        report["action"] = (
+            "Discrepancies detected after last compaction. Review missing and modified entries "
+            "with the user before making changes. Missing entries may need to be re-recorded."
+        )
+    return report
+
+
 HANDLERS = {
     "record_decision": handle_record_decision,
     "record_pipeline": handle_record_pipeline,
@@ -757,6 +786,7 @@ HANDLERS = {
     "update_entry": handle_update_entry,
     "deprecate_entry": handle_deprecate_entry,
     "prune_stale": handle_prune_stale,
+    "get_compaction_report": handle_get_compaction_report,
 }
 
 # ============================================================

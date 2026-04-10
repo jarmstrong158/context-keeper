@@ -22,6 +22,7 @@ Context Keeper gives Claude 8 tools to record and retrieve structured project co
 | `update_entry` | Update any entry by ID |
 | `deprecate_entry` | Retire an entry with reason |
 | `prune_stale` | Find entries not verified recently |
+| `get_compaction_report` | Check if last compaction lost any context |
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero external dependencies.
 
@@ -93,15 +94,57 @@ Without embeddings or external services, Context Keeper scores entries using:
 
 Results are capped by a configurable token budget (default: 4000 tokens).
 
+## Claude Code Hook Setup
+
+Context Keeper includes hooks that snapshot your context before Claude Code compaction and detect if anything was lost afterward.
+
+Add to your Claude Code hooks config (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/context-keeper/hooks/pre_compact.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/context-keeper/hooks/post_compact.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEEPER_PROJECT` env var if your project isn't in the current working directory.
+
+At session start, Claude calls `get_compaction_report` to check if the last compaction lost any context entries. If discrepancies are found, they're surfaced before any work begins.
+
 ## Data Storage
 
 ```
 your-project/
   .context/
-    decisions.json    # Design decisions with rationale
-    pipelines.json    # Multi-step workflows
-    constraints.json  # Rules and invariants
-    config.json       # Token budget, stale threshold
+    decisions.json           # Design decisions with rationale
+    pipelines.json           # Multi-step workflows
+    constraints.json         # Rules and invariants
+    config.json              # Token budget, stale threshold
+    compaction_snapshot.json  # Pre-compaction snapshot (auto-generated)
+    compaction_report.json   # Post-compaction diff report (auto-generated)
+    hook.log                 # Hook activity log
 ```
 
 All files are human-readable JSON. You can edit them directly. IDs are sequential and readable: `dec-001`, `pipe-001`, `con-001`.
