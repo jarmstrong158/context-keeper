@@ -2,20 +2,18 @@
 
 Context Keeper maintains project memory across Claude conversations: architectural decisions, pipeline flows, and constraints that must not be forgotten or violated.
 
-## CRITICAL: Always Confirm the Project Before Writing
+## Project Resolution
 
-Context Keeper stores data in a `.context/` directory inside a project. The server resolves the project directory from the `CONTEXT_KEEPER_PROJECT` env var, or falls back to the current working directory. That fallback is dangerous — Claude Code's cwd often isn't the project you think you're working on.
+Context Keeper stores data in a `.context/` directory inside a project. The server resolves the project directory in this order:
+1. `CONTEXT_KEEPER_PROJECT` env var (explicit opt-in — trusted)
+2. cwd, but **only if** it already contains a `.context/` directory
+3. Otherwise: refuse. `record_*`, `update_entry`, `deprecate_entry`, and `prune_stale` all return an "unresolved project" error.
 
-**Before calling any `record_*` tool, you MUST:**
-1. Tell the user what project you're about to record to (e.g., "I'm about to record this decision to `C:/Users/jarms/repos/skillmatch-mcp/.context/`")
-2. Ask the user to confirm the target project
-3. If the user specifies a different project, pass `project_dir` explicitly (if supported) or warn the user to set `CONTEXT_KEEPER_PROJECT` before proceeding
+This means you will never silently create a stray `.context/` in the wrong directory. The footgun from earlier versions — where Claude Code was launched from a parent directory and polluted it — is fixed at the code level.
 
-**Before calling `get_project_summary` or `get_context` at session start:**
-1. Ask the user which project they're working on
-2. Call the tool with the appropriate `project_dir` if possible, or verify the cwd matches their intent
-
-Never silently write to whatever directory happens to be the cwd. Stale or misplaced context entries are worse than no entries.
+**Still good practice:**
+- When recording to a non-obvious project, confirm with the user which project you're targeting before calling `record_*`.
+- For cross-project work, `get_context`, `get_project_summary`, `update_entry`, `deprecate_entry`, and `prune_stale` all accept an explicit `project_dir` parameter. Prefer that over relying on cwd.
 
 ## When to Record
 

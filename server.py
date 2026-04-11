@@ -12,13 +12,41 @@ from datetime import datetime, timezone
 
 CONTEXT_DIR_NAME = ".context"
 
-# Resolve project directory: env var > cwd
-PROJECT_DIR = os.environ.get("CONTEXT_KEEPER_PROJECT", os.getcwd())
-CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME)
-DECISIONS_PATH = os.path.join(CONTEXT_DIR, "decisions.json")
-PIPELINES_PATH = os.path.join(CONTEXT_DIR, "pipelines.json")
-CONSTRAINTS_PATH = os.path.join(CONTEXT_DIR, "constraints.json")
-CONFIG_PATH = os.path.join(CONTEXT_DIR, "config.json")
+
+def _resolve_project_dir():
+    """Resolve the project directory with a safe cwd fallback.
+
+    Order of precedence:
+      1. CONTEXT_KEEPER_PROJECT env var, if set (trusted — user opted in)
+      2. cwd, ONLY if it already contains a .context/ directory
+      3. None — refuse to default, callers must pass project_dir explicitly
+
+    This prevents the footgun where Claude Code is launched from a parent
+    directory and context-keeper silently creates a stray .context/ there.
+    """
+    explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
+    if explicit:
+        return explicit
+    cwd = os.getcwd()
+    if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
+        return cwd
+    return None
+
+
+PROJECT_DIR = _resolve_project_dir()
+CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME) if PROJECT_DIR else None
+DECISIONS_PATH = os.path.join(CONTEXT_DIR, "decisions.json") if CONTEXT_DIR else None
+PIPELINES_PATH = os.path.join(CONTEXT_DIR, "pipelines.json") if CONTEXT_DIR else None
+CONSTRAINTS_PATH = os.path.join(CONTEXT_DIR, "constraints.json") if CONTEXT_DIR else None
+CONFIG_PATH = os.path.join(CONTEXT_DIR, "config.json") if CONTEXT_DIR else None
+
+UNRESOLVED_PROJECT_ERROR = {
+    "error": (
+        "No project resolved. Set the CONTEXT_KEEPER_PROJECT environment "
+        "variable to the project root, or run from a directory that already "
+        "contains a .context/ folder. Refusing to create one implicitly."
+    )
+}
 
 DEFAULT_CONFIG = {
     "token_budget": 4000,
@@ -200,6 +228,10 @@ TOOLS = [
                     "type": "object",
                     "description": "Fields to update. Any field except id and created_at.",
                 },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to another project whose entry should be updated",
+                },
             },
             "required": ["id", "updates"],
         },
@@ -213,6 +245,10 @@ TOOLS = [
                 "id": {"type": "string", "description": "Entry ID to deprecate"},
                 "reason": {"type": "string", "description": "Why this is being deprecated"},
                 "superseded_by": {"type": "string", "description": "ID of the replacing decision (decisions only)"},
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to another project whose entry should be deprecated",
+                },
             },
             "required": ["id", "reason"],
         },
@@ -229,6 +265,10 @@ TOOLS = [
                 "days": {
                     "type": "integer",
                     "description": "Entries not verified in this many days are flagged (default: from config)",
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to another project to prune",
                 },
             },
         },
@@ -272,7 +312,7 @@ def write_json_file(path, data):
 
 def read_config(base_dir=None):
     cfg_path = os.path.join(base_dir, "config.json") if base_dir else CONFIG_PATH
-    if not os.path.exists(cfg_path):
+    if cfg_path is None or not os.path.exists(cfg_path):
         return dict(DEFAULT_CONFIG)
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -405,22 +445,35 @@ def _truncate_entry(entry, max_tokens):
 # ============================================================
 
 _PREFIX_TO_FILE = {"dec": "decisions", "pipe": "pipelines", "con": "constraints"}
-_TYPE_TO_PATH = {
-    "decisions": DECISIONS_PATH,
-    "pipelines": PIPELINES_PATH,
-    "constraints": CONSTRAINTS_PATH,
-}
 
 
 def _resolve_paths(base_dir=None):
-    """Return type->path mapping, optionally for another project."""
+    """Return type->path mapping, optionally for another project.
+
+    Returns None if no project is resolved and no base_dir is provided.
+    """
     if base_dir:
         return {
             "decisions": os.path.join(base_dir, "decisions.json"),
             "pipelines": os.path.join(base_dir, "pipelines.json"),
             "constraints": os.path.join(base_dir, "constraints.json"),
         }
-    return dict(_TYPE_TO_PATH)
+    if CONTEXT_DIR is None:
+        return None
+    return {
+        "decisions": DECISIONS_PATH,
+        "pipelines": PIPELINES_PATH,
+        "constraints": CONSTRAINTS_PATH,
+    }
+
+
+def _base_dir_from_params(params):
+    """Resolve a base .context/ dir from a params dict, or fall back to the
+    module-level CONTEXT_DIR. Returns None if nothing is resolvable."""
+    project_dir = params.get("project_dir")
+    if project_dir:
+        return os.path.join(os.path.normpath(project_dir), CONTEXT_DIR_NAME)
+    return CONTEXT_DIR
 
 
 def _find_entry_by_id(entry_id, base_dir=None):
@@ -428,6 +481,9 @@ def _find_entry_by_id(entry_id, base_dir=None):
     prefix = entry_id.split("-")[0] if "-" in entry_id else ""
     type_name = _PREFIX_TO_FILE.get(prefix)
     paths = _resolve_paths(base_dir)
+
+    if paths is None:
+        return None, None, None, None
 
     if type_name and type_name in paths:
         entries = read_json_file(paths[type_name])
@@ -450,6 +506,8 @@ def _find_entry_by_id(entry_id, base_dir=None):
 
 
 def handle_record_decision(params):
+    if CONTEXT_DIR is None:
+        return UNRESOLVED_PROJECT_ERROR
     ensure_context_dir()
     entries = read_json_file(DECISIONS_PATH)
     entry = {
@@ -470,6 +528,8 @@ def handle_record_decision(params):
 
 
 def handle_record_pipeline(params):
+    if CONTEXT_DIR is None:
+        return UNRESOLVED_PROJECT_ERROR
     ensure_context_dir()
     entries = read_json_file(PIPELINES_PATH)
     entry = {
@@ -488,6 +548,8 @@ def handle_record_pipeline(params):
 
 
 def handle_record_constraint(params):
+    if CONTEXT_DIR is None:
+        return UNRESOLVED_PROJECT_ERROR
     ensure_context_dir()
     entries = read_json_file(CONSTRAINTS_PATH)
     entry = {
@@ -536,29 +598,29 @@ def handle_get_context(params):
             "results": [],
         }
 
-    # Gather all entries
+    # Gather all entries. Track type alongside the entry instead of
+    # mutating the entry dict — keeps the returned payload clean without a
+    # pop/filter dance later.
     type_labels = {"decisions": "decision", "pipelines": "pipeline", "constraints": "constraint"}
-    all_entries = []
+    typed_entries = []
     for tname in types:
         if tname in paths:
             for e in read_json_file(paths[tname]):
-                e["_type"] = type_labels.get(tname, tname)
-                all_entries.append(e)
+                typed_entries.append((type_labels.get(tname, tname), e))
 
     # Filter out deprecated
-    all_entries = [e for e in all_entries if e.get("status", "active") != "deprecated"]
+    typed_entries = [(t, e) for t, e in typed_entries if e.get("status", "active") != "deprecated"]
 
     # Score and sort
     now_dt = datetime.now(timezone.utc)
-    scored = [(score_entry(e, tags, query, scope, now_dt), e) for e in all_entries]
+    scored = [(score_entry(e, tags, query, scope, now_dt), t, e) for t, e in typed_entries]
     scored.sort(key=lambda x: x[0], reverse=True)
 
     # Pack into budget with truncation
     results = []
     used_tokens = 0
-    for sc, entry in scored:
-        entry_type = entry.pop("_type", "unknown")
-        clean = {k: v for k, v in entry.items() if not k.startswith("_")}
+    for sc, entry_type, entry in scored:
+        clean = entry
 
         text = json.dumps(clean, indent=2)
         cost = estimate_tokens(text)
@@ -675,8 +737,11 @@ def handle_get_project_summary(params):
 def handle_update_entry(params):
     entry_id = params["id"]
     updates = params["updates"]
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
 
-    entry, type_name, file_path, index = _find_entry_by_id(entry_id)
+    entry, type_name, file_path, index = _find_entry_by_id(entry_id, base_dir)
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
 
@@ -701,8 +766,11 @@ def handle_deprecate_entry(params):
     entry_id = params["id"]
     reason = params["reason"]
     superseded_by = params.get("superseded_by")
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
 
-    entry, type_name, file_path, index = _find_entry_by_id(entry_id)
+    entry, type_name, file_path, index = _find_entry_by_id(entry_id, base_dir)
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
 
@@ -720,15 +788,19 @@ def handle_deprecate_entry(params):
 
 
 def handle_prune_stale(params):
-    cfg = read_config()
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    cfg = read_config(base_dir)
     days = params.get("days", cfg.get("stale_threshold_days", 30))
     now_dt = datetime.now(timezone.utc)
 
-    if not os.path.exists(CONTEXT_DIR):
+    if not os.path.exists(base_dir):
         return {"stale": [], "message": "No context directory found."}
 
+    paths = _resolve_paths(base_dir)
     stale = []
-    for tname, tpath in _TYPE_TO_PATH.items():
+    for tname, tpath in paths.items():
         for e in read_json_file(tpath):
             if e.get("status", "active") == "deprecated":
                 continue
@@ -758,6 +830,8 @@ def handle_prune_stale(params):
 
 
 def handle_get_compaction_report(_params):
+    if CONTEXT_DIR is None:
+        return {"has_report": False, "message": "No project resolved; no compaction report available."}
     report_path = os.path.join(CONTEXT_DIR, "compaction_report.json")
     if not os.path.exists(report_path):
         return {"has_report": False, "message": "No compaction report found. No compaction has been detected yet."}

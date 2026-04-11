@@ -60,6 +60,20 @@ def diff_entries(before, after):
     return changes
 
 
+def _already_compared(snapshot_ts):
+    """Return True if REPORT_PATH already records a comparison against this
+    exact snapshot timestamp. Prevents re-running on every Stop hook fire when
+    nothing new has happened since the last run."""
+    if not snapshot_ts or not os.path.exists(REPORT_PATH):
+        return False
+    try:
+        with open(REPORT_PATH, "r", encoding="utf-8") as f:
+            prev = json.load(f)
+        return prev.get("snapshot_timestamp") == snapshot_ts
+    except Exception:
+        return False
+
+
 def main():
     if not os.path.exists(SNAPSHOT_PATH):
         return
@@ -69,6 +83,12 @@ def main():
             snapshot = json.load(f)
     except Exception:
         log("POST_COMPACT: Could not read snapshot file")
+        return
+
+    # Idempotency: the Stop hook fires on every assistant response, but the
+    # snapshot only changes when PreCompact runs. Skip if we've already
+    # compared against this exact snapshot.
+    if _already_compared(snapshot.get("timestamp")):
         return
 
     missing = []

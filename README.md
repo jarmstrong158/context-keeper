@@ -10,7 +10,7 @@ As conversations get long, Claude loses the "why" behind earlier decisions. New 
 
 ## The Solution
 
-Context Keeper gives Claude 8 tools to record and retrieve structured project context:
+Context Keeper gives Claude 9 tools to record and retrieve structured project context:
 
 | Tool | Purpose |
 |------|---------|
