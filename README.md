@@ -124,12 +124,30 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"print('[Context Keeper] At session start: call get_compaction_report first, then get_project_summary. Record new decisions, pipelines, and constraints as they happen.')\""
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
 Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEEPER_PROJECT` env var if your project isn't in the current working directory.
+
+**Windows users:** Use forward slashes (`C:/Users/.../context-keeper/hooks/pre_compact.py`) or double-escaped backslashes in JSON. Single backslashes get mangled by the shell.
+
+The hooks do three things:
+- **PreCompact** — snapshots all active `.context/` entries before Claude Code compaction
+- **Stop** — compares post-compaction state against the snapshot, writes a diff report if anything changed
+- **SessionStart** — reminds Claude to call `get_compaction_report` and `get_project_summary` at the start of every new session
 
 At session start, Claude calls `get_compaction_report` to check if the last compaction lost any context entries. If discrepancies are found, they're surfaced before any work begins.
 
