@@ -6,12 +6,12 @@
     "url": "https://github.com/jarmstrong158/context-keeper",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "context-keeper-mcp",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "transport": {
         "type": "stdio"
       },

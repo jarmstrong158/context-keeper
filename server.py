@@ -815,7 +815,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.1.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.1.1"},
                 },
             }
         elif method == "notifications/initialized":
