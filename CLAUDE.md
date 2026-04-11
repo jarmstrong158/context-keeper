@@ -2,6 +2,21 @@
 
 Context Keeper maintains project memory across Claude conversations: architectural decisions, pipeline flows, and constraints that must not be forgotten or violated.
 
+## CRITICAL: Always Confirm the Project Before Writing
+
+Context Keeper stores data in a `.context/` directory inside a project. The server resolves the project directory from the `CONTEXT_KEEPER_PROJECT` env var, or falls back to the current working directory. That fallback is dangerous — Claude Code's cwd often isn't the project you think you're working on.
+
+**Before calling any `record_*` tool, you MUST:**
+1. Tell the user what project you're about to record to (e.g., "I'm about to record this decision to `C:/Users/jarms/repos/skillmatch-mcp/.context/`")
+2. Ask the user to confirm the target project
+3. If the user specifies a different project, pass `project_dir` explicitly (if supported) or warn the user to set `CONTEXT_KEEPER_PROJECT` before proceeding
+
+**Before calling `get_project_summary` or `get_context` at session start:**
+1. Ask the user which project they're working on
+2. Call the tool with the appropriate `project_dir` if possible, or verify the cwd matches their intent
+
+Never silently write to whatever directory happens to be the cwd. Stale or misplaced context entries are worse than no entries.
+
 ## When to Record
 
 ### Record a Decision when:
