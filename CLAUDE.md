@@ -11,9 +11,19 @@ Context Keeper stores data in a `.context/` directory inside a project. The serv
 
 This means you will never silently create a stray `.context/` in the wrong directory. The footgun from earlier versions — where Claude Code was launched from a parent directory and polluted it — is fixed at the code level.
 
+**All 9 tools accept `project_dir`** for explicit cross-project targeting. When cwd doesn't resolve, pass `project_dir` to any tool — including `record_*`.
+
 **Still good practice:**
 - When recording to a non-obvious project, confirm with the user which project you're targeting before calling `record_*`.
-- For cross-project work, `get_context`, `get_project_summary`, `update_entry`, `deprecate_entry`, and `prune_stale` all accept an explicit `project_dir` parameter. Prefer that over relying on cwd.
+
+## Capture Loop
+
+Context Keeper has two halves:
+
+1. **Retrieval** (session start): The SessionStart hook reminds you to call `get_compaction_report` then `get_project_summary`. This orients you on what's already recorded.
+2. **Capture** (during session + pre-compaction): Record decisions, constraints, and pipelines *as they happen* during the session. The PreCompact hook fires a reminder before compaction, prompting you to review the session and record anything important before context is compressed. This is a safety net — don't rely on it. Record in-line whenever possible.
+
+Both halves must work for the system to be useful. Retrieval without capture means the same entries get stale. Capture without retrieval means you don't know what's already recorded.
 
 ## When to Record
 

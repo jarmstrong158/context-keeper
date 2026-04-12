@@ -11,16 +11,29 @@ import sys
 from datetime import datetime, timezone
 
 CONTEXT_DIR_NAME = ".context"
-PROJECT_DIR = os.environ.get("CONTEXT_KEEPER_PROJECT", os.getcwd())
-CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME)
-SNAPSHOT_PATH = os.path.join(CONTEXT_DIR, "compaction_snapshot.json")
-LOG_PATH = os.path.join(CONTEXT_DIR, "hook.log")
+
+
+def _resolve_project_dir():
+    """Same resolution logic as server.py — env var, then cwd-if-exists, then None."""
+    explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
+    if explicit:
+        return explicit
+    cwd = os.getcwd()
+    if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
+        return cwd
+    return None
+
+
+PROJECT_DIR = _resolve_project_dir()
+CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME) if PROJECT_DIR else None
+SNAPSHOT_PATH = os.path.join(CONTEXT_DIR, "compaction_snapshot.json") if CONTEXT_DIR else None
+LOG_PATH = os.path.join(CONTEXT_DIR, "hook.log") if CONTEXT_DIR else None
 
 FILES = {
     "decisions": os.path.join(CONTEXT_DIR, "decisions.json"),
     "pipelines": os.path.join(CONTEXT_DIR, "pipelines.json"),
     "constraints": os.path.join(CONTEXT_DIR, "constraints.json"),
-}
+} if CONTEXT_DIR else {}
 
 
 def read_json(path):
@@ -35,6 +48,8 @@ def read_json(path):
 
 
 def log(message):
+    if CONTEXT_DIR is None:
+        return
     try:
         os.makedirs(CONTEXT_DIR, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -45,7 +60,7 @@ def log(message):
 
 
 def main():
-    if not os.path.exists(CONTEXT_DIR):
+    if CONTEXT_DIR is None or not os.path.exists(CONTEXT_DIR):
         return
 
     snapshot = {
@@ -68,6 +83,19 @@ def main():
 
     counts_str = ", ".join(f"{k}={v}" for k, v in snapshot["counts"].items())
     log(f"PRE_COMPACT: {total} active entries ({counts_str})")
+
+    # Capture prompt: this message becomes part of the context that gets
+    # compacted. Post-compaction, Claude sees the trace and is primed to
+    # review the session for unrecorded decisions/constraints.
+    print(
+        "[Context Keeper] COMPACTION IMMINENT -- context is about to be "
+        "compressed. After compaction, review what you remember from this "
+        "session and record anything important:\n"
+        "  - Architectural decisions or trade-offs: use record_decision\n"
+        "  - Bugs, gotchas, or 'never do X' rules: use record_constraint\n"
+        "  - Multi-step workflows established: use record_pipeline\n"
+        "Skip trivial details. Only record what future sessions need to know."
+    )
 
 
 if __name__ == "__main__":

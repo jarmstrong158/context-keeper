@@ -144,12 +144,13 @@ Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEE
 
 **Windows users:** Use forward slashes (`C:/Users/.../context-keeper/hooks/pre_compact.py`) or double-escaped backslashes in JSON. Single backslashes get mangled by the shell.
 
-The hooks do three things:
-- **PreCompact** — snapshots all active `.context/` entries before Claude Code compaction
-- **Stop** — compares post-compaction state against the snapshot, writes a diff report if anything changed
-- **SessionStart** — reminds Claude to call `get_compaction_report` and `get_project_summary` at the start of every new session
+The hooks form a complete capture-and-retrieval loop:
 
-At session start, Claude calls `get_compaction_report` to check if the last compaction lost any context entries. If discrepancies are found, they're surfaced before any work begins.
+- **SessionStart** — reminds Claude to call `get_compaction_report` and `get_project_summary`, and to record new entries throughout the session
+- **PreCompact** — snapshots all active `.context/` entries, then prints a capture prompt reminding Claude to review the session and record any unrecorded decisions, constraints, or pipelines before context is compressed
+- **Stop** — compares post-compaction state against the snapshot, writes a diff report if anything changed (idempotent — skips if the snapshot hasn't changed since last comparison)
+
+This closes the capture loop: SessionStart handles retrieval, PreCompact handles capture, Stop handles integrity checking.
 
 ## Data Storage
 

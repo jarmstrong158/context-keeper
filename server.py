@@ -102,6 +102,10 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "Tags for categorization and retrieval",
                 },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the target project. Creates .context/ if needed.",
+                },
             },
             "required": ["summary", "rationale"],
         },
@@ -132,6 +136,10 @@ TOOLS = [
                     "description": "Rules that apply to this pipeline",
                 },
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the target project. Creates .context/ if needed.",
+                },
             },
             "required": ["name", "steps"],
         },
@@ -156,6 +164,10 @@ TOOLS = [
                     "default": "absolute",
                 },
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the target project. Creates .context/ if needed.",
+                },
             },
             "required": ["rule", "reason"],
         },
@@ -280,7 +292,15 @@ TOOLS = [
             "Call this at session start before get_project_summary. If discrepancies "
             "are found, surface them to the user before proceeding."
         ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to another project to check",
+                },
+            },
+        },
     },
 ]
 
@@ -506,10 +526,12 @@ def _find_entry_by_id(entry_id, base_dir=None):
 
 
 def handle_record_decision(params):
-    if CONTEXT_DIR is None:
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
-    ensure_context_dir()
-    entries = read_json_file(DECISIONS_PATH)
+    ensure_context_dir(base_dir)
+    dec_path = os.path.join(base_dir, "decisions.json")
+    entries = read_json_file(dec_path)
     entry = {
         "id": next_id(entries, "dec"),
         "summary": params["summary"],
@@ -523,15 +545,17 @@ def handle_record_decision(params):
         "verified_at": now_iso(),
     }
     entries.append(entry)
-    write_json_file(DECISIONS_PATH, entries)
+    write_json_file(dec_path, entries)
     return {"success": True, "id": entry["id"], "entry": entry}
 
 
 def handle_record_pipeline(params):
-    if CONTEXT_DIR is None:
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
-    ensure_context_dir()
-    entries = read_json_file(PIPELINES_PATH)
+    ensure_context_dir(base_dir)
+    pipe_path = os.path.join(base_dir, "pipelines.json")
+    entries = read_json_file(pipe_path)
     entry = {
         "id": next_id(entries, "pipe"),
         "name": params["name"],
@@ -543,15 +567,17 @@ def handle_record_pipeline(params):
         "verified_at": now_iso(),
     }
     entries.append(entry)
-    write_json_file(PIPELINES_PATH, entries)
+    write_json_file(pipe_path, entries)
     return {"success": True, "id": entry["id"], "entry": entry}
 
 
 def handle_record_constraint(params):
-    if CONTEXT_DIR is None:
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
-    ensure_context_dir()
-    entries = read_json_file(CONSTRAINTS_PATH)
+    ensure_context_dir(base_dir)
+    con_path = os.path.join(base_dir, "constraints.json")
+    entries = read_json_file(con_path)
     entry = {
         "id": next_id(entries, "con"),
         "rule": params["rule"],
@@ -564,14 +590,13 @@ def handle_record_constraint(params):
         "verified_at": now_iso(),
     }
     entries.append(entry)
-    write_json_file(CONSTRAINTS_PATH, entries)
+    write_json_file(con_path, entries)
     return {"success": True, "id": entry["id"], "entry": entry}
 
 
 def handle_get_context(params):
     entry_id = params.get("id")
-    project_dir = params.get("project_dir")
-    base_dir = os.path.join(os.path.normpath(project_dir), CONTEXT_DIR_NAME) if project_dir else CONTEXT_DIR
+    base_dir = _base_dir_from_params(params)
 
     # Direct ID lookup — full fidelity, no budget
     if entry_id:
@@ -579,6 +604,9 @@ def handle_get_context(params):
         if entry is None:
             return {"error": f"No entry found with id '{entry_id}'"}
         return {"type": type_name, "entry": entry}
+
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
 
     query = params.get("query")
     tags = params.get("tags")
@@ -647,11 +675,10 @@ def handle_get_context(params):
 
 
 def handle_get_project_summary(params):
-    project_dir = params.get("project_dir")
-    base_dir = os.path.join(os.path.normpath(project_dir), CONTEXT_DIR_NAME) if project_dir else CONTEXT_DIR
+    base_dir = _base_dir_from_params(params)
     budget = params.get("token_budget", 2000)
 
-    if not os.path.exists(base_dir):
+    if base_dir is None or not os.path.exists(base_dir):
         return {
             "initialized": False,
             "message": "No context directory found. Use record_* tools to start building project memory.",
@@ -829,10 +856,11 @@ def handle_prune_stale(params):
     }
 
 
-def handle_get_compaction_report(_params):
-    if CONTEXT_DIR is None:
+def handle_get_compaction_report(params):
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
         return {"has_report": False, "message": "No project resolved; no compaction report available."}
-    report_path = os.path.join(CONTEXT_DIR, "compaction_report.json")
+    report_path = os.path.join(base_dir, "compaction_report.json")
     if not os.path.exists(report_path):
         return {"has_report": False, "message": "No compaction report found. No compaction has been detected yet."}
 
@@ -889,7 +917,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.1.1"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.2.0"},
                 },
             }
         elif method == "notifications/initialized":

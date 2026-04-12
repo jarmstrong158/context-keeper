@@ -11,17 +11,30 @@ import sys
 from datetime import datetime, timezone
 
 CONTEXT_DIR_NAME = ".context"
-PROJECT_DIR = os.environ.get("CONTEXT_KEEPER_PROJECT", os.getcwd())
-CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME)
-SNAPSHOT_PATH = os.path.join(CONTEXT_DIR, "compaction_snapshot.json")
-REPORT_PATH = os.path.join(CONTEXT_DIR, "compaction_report.json")
-LOG_PATH = os.path.join(CONTEXT_DIR, "hook.log")
+
+
+def _resolve_project_dir():
+    """Same resolution logic as server.py — env var, then cwd-if-exists, then None."""
+    explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
+    if explicit:
+        return explicit
+    cwd = os.getcwd()
+    if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
+        return cwd
+    return None
+
+
+PROJECT_DIR = _resolve_project_dir()
+CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME) if PROJECT_DIR else None
+SNAPSHOT_PATH = os.path.join(CONTEXT_DIR, "compaction_snapshot.json") if CONTEXT_DIR else None
+REPORT_PATH = os.path.join(CONTEXT_DIR, "compaction_report.json") if CONTEXT_DIR else None
+LOG_PATH = os.path.join(CONTEXT_DIR, "hook.log") if CONTEXT_DIR else None
 
 FILES = {
     "decisions": os.path.join(CONTEXT_DIR, "decisions.json"),
     "pipelines": os.path.join(CONTEXT_DIR, "pipelines.json"),
     "constraints": os.path.join(CONTEXT_DIR, "constraints.json"),
-}
+} if CONTEXT_DIR else {}
 
 
 def read_json(path):
@@ -36,6 +49,8 @@ def read_json(path):
 
 
 def log(message):
+    if CONTEXT_DIR is None:
+        return
     try:
         os.makedirs(CONTEXT_DIR, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -75,7 +90,7 @@ def _already_compared(snapshot_ts):
 
 
 def main():
-    if not os.path.exists(SNAPSHOT_PATH):
+    if SNAPSHOT_PATH is None or not os.path.exists(SNAPSHOT_PATH):
         return
 
     try:
