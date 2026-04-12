@@ -1,24 +1,24 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.jarmstrong158/context-keeper",
-  "description": "Project memory for Claude: decisions, pipelines, and constraints across conversations.",
+  "description": "Project memory for Claude: decisions, pipelines, and constraints across conversations. Complete capture loop with session-start retrieval, in-line recording, and pre-compaction capture prompts.",
   "repository": {
     "url": "https://github.com/jarmstrong158/context-keeper",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.2.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "context-keeper-mcp",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
           "name": "CONTEXT_KEEPER_PROJECT",
-          "description": "Absolute path to the project directory. Defaults to current working directory.",
+          "description": "Absolute path to the project directory. If omitted, uses cwd only when it already contains a .context/ directory; otherwise tools require explicit project_dir.",
           "isRequired": false,
           "format": "string",
           "isSecret": false
