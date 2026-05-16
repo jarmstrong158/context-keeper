@@ -90,13 +90,43 @@ TOOLS = [
     {
         "name": "record_decision",
         "description": (
-            "Record an architectural or design decision with rationale and alternatives considered."
+            "Record an architectural or design decision. v0.4 schema: rationale is split "
+            "into structured fields (problem, why_chosen, what_we_tried, tradeoffs) so future "
+            "sessions can recover the full why, not just a summary. Min-length validation is "
+            "enforced server-side — thin entries are rejected with guidance."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "summary": {"type": "string", "description": "What was decided (1-2 sentences)"},
-                "rationale": {"type": "string", "description": "Why this choice was made"},
+                "summary": {"type": "string", "description": "What was decided (1-2 sentences). Min 20 chars."},
+                "problem": {
+                    "type": "string",
+                    "description": (
+                        "What forced this decision? Describe the problem context, the trigger, "
+                        "and what was at stake. 1-3 sentences. Min 40 chars."
+                    ),
+                },
+                "why_chosen": {
+                    "type": "string",
+                    "description": (
+                        "Actual reasoning. Why this option specifically? What evidence, principle, "
+                        "or constraint drove the choice? 2-4 sentences. Min 60 chars."
+                    ),
+                },
+                "what_we_tried": {
+                    "type": "string",
+                    "description": (
+                        "Optional but encouraged: prior attempts that didn't work, dead ends "
+                        "explored, hypotheses ruled out. The 'we tried X 3 times before Y' arc."
+                    ),
+                },
+                "tradeoffs": {
+                    "type": "string",
+                    "description": (
+                        "Optional but encouraged: what was given up by choosing this. "
+                        "Future sessions need to know the cost, not just the benefit."
+                    ),
+                },
                 "alternatives": {
                     "type": "array",
                     "items": {
@@ -113,26 +143,61 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "New constraints this decision introduces",
                 },
+                "related_to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "IDs of related entries (e.g. ['dec-005', 'con-006']). Use this to "
+                        "link entries from the same arc — get_context can traverse the graph "
+                        "and surface connective tissue that would otherwise be lost."
+                    ),
+                },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Tags for categorization and retrieval",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": (
+                        "DEPRECATED in v0.4. Provided for backward compatibility only — if "
+                        "supplied without why_chosen, it will be auto-mapped to why_chosen. "
+                        "Prefer the structured fields above."
+                    ),
                 },
                 "project_dir": {
                     "type": "string",
                     "description": "Absolute path to the target project. Creates .context/ if needed.",
                 },
             },
-            "required": ["summary", "rationale"],
+            "required": ["summary", "problem", "why_chosen"],
         },
     },
     {
         "name": "record_pipeline",
-        "description": "Record a multi-step workflow or data pipeline that must be followed in order.",
+        "description": (
+            "Record a multi-step workflow or data pipeline that must be followed in order. "
+            "v0.4 schema adds purpose (required) and when_to_invoke (optional) so future "
+            "sessions know not just what the pipeline does but why it exists and when to use it."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Pipeline name"},
+                "purpose": {
+                    "type": "string",
+                    "description": (
+                        "Why this pipeline exists. What does it accomplish that ad-hoc steps "
+                        "couldn't? 1-3 sentences. Min 40 chars."
+                    ),
+                },
+                "when_to_invoke": {
+                    "type": "string",
+                    "description": (
+                        "Optional but encouraged: what triggers or conditions should make a "
+                        "future session reach for this pipeline? The reusable 'when' knowledge."
+                    ),
+                },
                 "steps": {
                     "type": "array",
                     "items": {
@@ -151,23 +216,45 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "Rules that apply to this pipeline",
                 },
+                "related_to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "IDs of related entries (decisions, constraints, other pipelines)",
+                },
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "project_dir": {
                     "type": "string",
                     "description": "Absolute path to the target project. Creates .context/ if needed.",
                 },
             },
-            "required": ["name", "steps"],
+            "required": ["name", "purpose", "steps"],
         },
     },
     {
         "name": "record_constraint",
-        "description": "Record a rule or constraint that must be followed in this project.",
+        "description": (
+            "Record a rule or constraint that must be followed in this project. v0.4 schema "
+            "enforces a min-length reason and adds an optional triggering_incident field — "
+            "the gotcha story behind the rule, not just the rule itself."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "rule": {"type": "string", "description": "The constraint in clear imperative language"},
-                "reason": {"type": "string", "description": "Why this constraint exists"},
+                "rule": {"type": "string", "description": "The constraint in clear imperative language. Min 20 chars."},
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why this constraint exists. What goes wrong if it's violated? 1-3 sentences. "
+                        "Min 40 chars."
+                    ),
+                },
+                "triggering_incident": {
+                    "type": "string",
+                    "description": (
+                        "Optional but encouraged: the specific bug, gotcha, or incident that "
+                        "led to this rule. Concrete > abstract for future sessions."
+                    ),
+                },
                 "scope": {
                     "type": "string",
                     "description": "Where this applies: 'global' for whole project, or a file/module path",
@@ -178,6 +265,11 @@ TOOLS = [
                     "enum": ["absolute", "advisory"],
                     "description": "absolute = never violate. advisory = prefer but exceptions exist.",
                     "default": "absolute",
+                },
+                "related_to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "IDs of related entries (the decision that created this constraint, etc.)",
                 },
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "project_dir": {
@@ -214,6 +306,14 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string", "enum": ["decisions", "pipelines", "constraints"]},
                     "description": "Limit to specific entry types. Default: all.",
+                },
+                "include_related": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, after scoring also pull in entries linked via related_to "
+                        "(depth=1) so arcs come through together. Default: true."
+                    ),
+                    "default": True,
                 },
                 "project_dir": {
                     "type": "string",
@@ -318,6 +418,30 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "verify_quality",
+        "description": (
+            "Scan all entries for quality issues: legacy entries (pre-v0.4 schema, "
+            "missing structured fields), thin reasons/why_chosen text, missing tags, "
+            "isolated entries (no related_to despite tag overlap with siblings). "
+            "Returns flagged entries with specific issues so you can enrich them. "
+            "Auto-called by the PreCompact hook — also call manually before recording "
+            "many entries from one arc, or when get_project_summary feels too sparse."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "min_reason_chars": {
+                    "type": "integer",
+                    "description": "Below this length, flag the entry as thin (default: 80)",
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to another project to verify",
+                },
+            },
+        },
+    },
 ]
 
 # ============================================================
@@ -387,9 +511,20 @@ def estimate_tokens(text):
 
 
 def _text_words(entry):
-    """Extract searchable words from an entry's text fields."""
+    """Extract searchable words from an entry's text fields.
+
+    Pulls from both v0.4 structured fields (problem, why_chosen,
+    what_we_tried, tradeoffs, purpose, when_to_invoke,
+    triggering_incident) and the legacy `rationale` field so old
+    entries remain searchable.
+    """
     parts = []
-    for key in ("summary", "rationale", "rule", "reason", "name"):
+    text_keys = (
+        "summary", "rationale", "rule", "reason", "name",
+        "problem", "why_chosen", "what_we_tried", "tradeoffs",
+        "purpose", "when_to_invoke", "triggering_incident",
+    )
+    for key in text_keys:
         val = entry.get(key, "")
         if val:
             parts.append(val.lower())
@@ -537,6 +672,52 @@ def _find_entry_by_id(entry_id, base_dir=None):
 
 
 # ============================================================
+# Validation (v0.4 — schema-enforced rationale depth)
+# ============================================================
+
+_FIELD_GUIDANCE = {
+    "summary": "1-2 sentences naming what was decided / what the rule is.",
+    "problem": "Describe what triggered this decision in 1-3 sentences. What problem does it solve, and what was at stake?",
+    "why_chosen": "Explain the actual reasoning. Why this option specifically? What evidence, principle, or constraint backs the choice?",
+    "reason": "Explain why this rule exists. What goes wrong if it's violated? Be concrete.",
+    "purpose": "Explain why this pipeline exists. What does it accomplish that ad-hoc steps couldn't?",
+    "rule": "State the rule in clear imperative language ('Always X', 'Never Y').",
+    "name": "A short pipeline name.",
+}
+
+
+def _check_min_lengths(params, requirements):
+    """Validate that required string fields meet minimum lengths.
+
+    requirements: dict of {field_name: min_chars}
+    Returns an error dict if any field fails, else None. Errors include
+    field-specific guidance to teach callers how to fix the entry rather
+    than just rejecting it.
+    """
+    errors = []
+    for field, min_len in requirements.items():
+        val = params.get(field)
+        actual = len(val.strip()) if isinstance(val, str) else 0
+        if actual < min_len:
+            errors.append({
+                "field": field,
+                "min_length": min_len,
+                "actual_length": actual,
+                "guidance": _FIELD_GUIDANCE.get(field, f"Field '{field}' is required."),
+            })
+    if errors:
+        return {
+            "error": (
+                "Entry rejected: required fields missing or too short. The schema enforces "
+                "depth so future sessions can recover the full why, not just a summary. "
+                "Re-call with richer content for the fields below."
+            ),
+            "validation_errors": errors,
+        }
+    return None
+
+
+# ============================================================
 # Tool handlers
 # ============================================================
 
@@ -545,21 +726,48 @@ def handle_record_decision(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
+
+    # Backward-compat: if caller passed deprecated `rationale` without
+    # `why_chosen`, promote it. This keeps old MCP clients working but
+    # deliberately doesn't auto-fill `problem` — that field MUST be
+    # explicit so we don't silently degrade entry quality.
+    if params.get("rationale") and not params.get("why_chosen"):
+        params = dict(params)
+        params["why_chosen"] = params["rationale"]
+
+    err = _check_min_lengths(params, {
+        "summary": 5,
+        "problem": 40,
+        "why_chosen": 60,
+    })
+    if err is not None:
+        return err
+
     ensure_context_dir(base_dir)
     dec_path = os.path.join(base_dir, "decisions.json")
     entries = read_json_file(dec_path)
     entry = {
         "id": next_id(entries, "dec"),
         "summary": params["summary"],
-        "rationale": params["rationale"],
+        "problem": params["problem"],
+        "why_chosen": params["why_chosen"],
+        "what_we_tried": params.get("what_we_tried", ""),
+        "tradeoffs": params.get("tradeoffs", ""),
         "alternatives": params.get("alternatives", []),
         "constraints_created": params.get("constraints_created", []),
+        "related_to": params.get("related_to", []),
         "tags": params.get("tags", []),
+        "schema_version": 4,
         "status": "active",
         "superseded_by": None,
         "created_at": now_iso(),
         "verified_at": now_iso(),
     }
+    # Preserve the deprecated `rationale` field on disk if the caller
+    # passed it explicitly. Lets old MCP clients (and old test
+    # assertions) keep working without losing what they wrote.
+    if params.get("rationale"):
+        entry["rationale"] = params["rationale"]
     entries.append(entry)
     write_json_file(dec_path, entries)
     return {"success": True, "id": entry["id"], "entry": entry}
@@ -569,15 +777,31 @@ def handle_record_pipeline(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
+
+    err = _check_min_lengths(params, {
+        "name": 3,
+        "purpose": 40,
+    })
+    if err is not None:
+        return err
+    if not params.get("steps"):
+        return {"error": "Pipeline requires at least one step.", "validation_errors": [
+            {"field": "steps", "guidance": "Provide an ordered list of steps."}
+        ]}
+
     ensure_context_dir(base_dir)
     pipe_path = os.path.join(base_dir, "pipelines.json")
     entries = read_json_file(pipe_path)
     entry = {
         "id": next_id(entries, "pipe"),
         "name": params["name"],
+        "purpose": params["purpose"],
+        "when_to_invoke": params.get("when_to_invoke", ""),
         "steps": params["steps"],
         "constraints": params.get("constraints", []),
+        "related_to": params.get("related_to", []),
         "tags": params.get("tags", []),
+        "schema_version": 4,
         "status": "active",
         "created_at": now_iso(),
         "verified_at": now_iso(),
@@ -591,6 +815,14 @@ def handle_record_constraint(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
+
+    err = _check_min_lengths(params, {
+        "rule": 5,
+        "reason": 40,
+    })
+    if err is not None:
+        return err
+
     ensure_context_dir(base_dir)
     con_path = os.path.join(base_dir, "constraints.json")
     entries = read_json_file(con_path)
@@ -598,9 +830,12 @@ def handle_record_constraint(params):
         "id": next_id(entries, "con"),
         "rule": params["rule"],
         "reason": params["reason"],
+        "triggering_incident": params.get("triggering_incident", ""),
         "scope": params.get("scope", "global"),
         "hardness": params.get("hardness", "absolute"),
+        "related_to": params.get("related_to", []),
         "tags": params.get("tags", []),
+        "schema_version": 4,
         "status": "active",
         "created_at": now_iso(),
         "verified_at": now_iso(),
@@ -663,6 +898,7 @@ def handle_get_context(params):
     # Pack into budget with truncation
     results = []
     used_tokens = 0
+    seen_ids = set()
     for sc, entry_type, entry in scored:
         clean = entry
 
@@ -679,7 +915,47 @@ def handle_get_context(params):
             break
 
         results.append({"score": round(sc, 1), "type": entry_type, "entry": clean})
+        seen_ids.add(entry.get("id"))
         used_tokens += cost
+
+    # Graph traversal: pull related entries (depth=1) so arcs come through.
+    # Default ON because the whole point of related_to is that retrieval
+    # surfaces connective tissue automatically. Caller can disable with
+    # include_related=False if they want pure relevance scoring.
+    include_related = params.get("include_related", True)
+    related_added = 0
+    if include_related and results:
+        # Collect all related_to ids referenced by the current result set
+        related_ids = set()
+        for r in results:
+            for rid in r["entry"].get("related_to", []) or []:
+                if rid not in seen_ids:
+                    related_ids.add(rid)
+
+        for rid in related_ids:
+            r_entry, r_type, _, _ = _find_entry_by_id(rid, base_dir)
+            if r_entry is None:
+                continue
+            if r_entry.get("status", "active") == "deprecated":
+                continue
+            clean = r_entry
+            text = json.dumps(clean, indent=2)
+            cost = estimate_tokens(text)
+            if cost > max_entry:
+                clean = _truncate_entry(clean, max_entry)
+                cost = estimate_tokens(json.dumps(clean, indent=2))
+            if used_tokens + cost > budget:
+                break
+            r_label = type_labels.get(r_type, r_type)
+            results.append({
+                "score": 0.0,
+                "type": r_label,
+                "entry": clean,
+                "via": "related_to",
+            })
+            seen_ids.add(rid)
+            used_tokens += cost
+            related_added += 1
 
     return {
         "results": results,
@@ -687,6 +963,7 @@ def handle_get_context(params):
         "token_budget": budget,
         "total_entries_scored": len(scored),
         "entries_returned": len(results),
+        "related_added": related_added,
     }
 
 
@@ -895,6 +1172,125 @@ def handle_get_compaction_report(params):
     return report
 
 
+def handle_verify_quality(params):
+    """Scan entries for quality issues and return a flagged list.
+
+    Issue types:
+      - legacy: pre-v0.4 entry, missing structured fields (problem,
+        why_chosen, purpose, triggering_incident). Suggest enrichment.
+      - thin_reason: rationale/reason text below min_reason_chars
+        threshold. Suggest expanding.
+      - no_tags: entry has zero tags, hurting retrieval.
+      - isolated: entry has no related_to but shares a tag with at least
+        one sibling — suggests a missed link.
+
+    The PreCompact hook calls this automatically and surfaces the result
+    so Claude can enrich entries before context is compressed. Also
+    callable manually from the chat.
+    """
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    if not os.path.exists(base_dir):
+        return {"flagged": [], "count": 0, "message": "No context directory found."}
+
+    min_reason = params.get("min_reason_chars", 80)
+    paths = _resolve_paths(base_dir)
+
+    # Build a tag→[id] index across all active entries so we can detect
+    # isolated entries (tag overlap but no related_to link).
+    all_active = []  # list of (type_name, entry)
+    for tname, tpath in paths.items():
+        for e in read_json_file(tpath):
+            if e.get("status", "active") == "deprecated":
+                continue
+            all_active.append((tname, e))
+
+    tag_index = {}
+    for tname, e in all_active:
+        for tag in e.get("tags", []):
+            tag_index.setdefault(tag.lower(), set()).add(e.get("id"))
+
+    flagged = []
+    for tname, e in all_active:
+        issues = []
+        eid = e.get("id", "?")
+
+        # Legacy detection — schema_version is set to 4 by v0.4 writes.
+        # Older entries lack it AND lack the new structured fields.
+        is_v4 = e.get("schema_version") == 4
+        if not is_v4:
+            if tname == "decisions" and not e.get("why_chosen"):
+                issues.append({
+                    "type": "legacy",
+                    "detail": "Pre-v0.4 decision: missing structured fields (problem, why_chosen). The freeform 'rationale' is preserved but won't show the full why. Consider re-recording with the v0.4 schema.",
+                })
+            elif tname == "pipelines" and not e.get("purpose"):
+                issues.append({
+                    "type": "legacy",
+                    "detail": "Pre-v0.4 pipeline: missing 'purpose' field. Re-record so future sessions know why this pipeline exists, not just what it does.",
+                })
+            elif tname == "constraints" and not e.get("triggering_incident"):
+                # triggering_incident is optional, so only flag if reason is also thin
+                pass
+
+        # Thin reason text
+        if tname == "decisions":
+            reason_text = (e.get("why_chosen") or "") + " " + (e.get("rationale") or "")
+        elif tname == "constraints":
+            reason_text = e.get("reason") or ""
+        elif tname == "pipelines":
+            reason_text = e.get("purpose") or ""
+        else:
+            reason_text = ""
+        if len(reason_text.strip()) < min_reason:
+            issues.append({
+                "type": "thin_reason",
+                "detail": f"Reasoning text is only {len(reason_text.strip())} chars (threshold: {min_reason}). Use update_entry to expand the rationale with concrete context.",
+            })
+
+        # No tags
+        if not e.get("tags"):
+            issues.append({
+                "type": "no_tags",
+                "detail": "Entry has no tags. Tags are the primary retrieval signal — add 2-4 lowercase, hyphen-separated tags.",
+            })
+
+        # Isolated: tag overlap with siblings but no related_to link
+        own_tags = set(t.lower() for t in e.get("tags", []))
+        own_links = set(e.get("related_to", []) or [])
+        sibling_ids = set()
+        for tag in own_tags:
+            sibling_ids |= tag_index.get(tag, set())
+        sibling_ids.discard(eid)
+        unlinked_siblings = sibling_ids - own_links
+        if own_tags and unlinked_siblings and not own_links:
+            issues.append({
+                "type": "isolated",
+                "detail": f"Shares tags with {len(unlinked_siblings)} other entries but has no related_to links. Suggested links: {sorted(unlinked_siblings)[:5]}",
+            })
+
+        if issues:
+            flagged.append({
+                "id": eid,
+                "type": tname,
+                "summary": e.get("summary") or e.get("name") or e.get("rule") or "?",
+                "issues": issues,
+            })
+
+    return {
+        "flagged": flagged,
+        "count": len(flagged),
+        "total_active": len(all_active),
+        "min_reason_chars": min_reason,
+        "action": (
+            "Use update_entry to enrich flagged entries. For 'legacy' issues, "
+            "the original entry stays valid but a v0.4 re-record captures the full why. "
+            "Skip flags that don't apply — verification is advisory, not blocking."
+        ),
+    }
+
+
 HANDLERS = {
     "record_decision": handle_record_decision,
     "record_pipeline": handle_record_pipeline,
@@ -905,6 +1301,7 @@ HANDLERS = {
     "deprecate_entry": handle_deprecate_entry,
     "prune_stale": handle_prune_stale,
     "get_compaction_report": handle_get_compaction_report,
+    "verify_quality": handle_verify_quality,
 }
 
 # ============================================================
@@ -933,7 +1330,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.3.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.4.0"},
                 },
             }
         elif method == "notifications/initialized":

@@ -14,13 +14,23 @@ CONTEXT_DIR_NAME = ".context"
 
 
 def _resolve_project_dir():
-    """Same resolution logic as server.py — env var, then cwd-if-exists, then None."""
+    """Same resolution logic as server.py: env var, then cwd-if-exists,
+    then walk parents looking for an existing .context/, then None.
+    Never creates a .context/ implicitly."""
     explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
     if explicit:
         return explicit
     cwd = os.getcwd()
     if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
         return cwd
+    current = cwd
+    for _ in range(64):
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            break
+        if os.path.isdir(os.path.join(parent, CONTEXT_DIR_NAME)):
+            return parent
+        current = parent
     return None
 
 

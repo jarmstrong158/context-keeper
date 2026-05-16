@@ -10,21 +10,32 @@ As conversations get long, Claude loses the "why" behind earlier decisions. New 
 
 ## The Solution
 
-Context Keeper gives Claude 9 tools to record and retrieve structured project context:
+Context Keeper gives Claude 10 tools to record and retrieve structured project context:
 
 | Tool | Purpose |
 |------|---------|
-| `record_decision` | Save a decision with rationale and alternatives |
-| `record_pipeline` | Save a multi-step workflow with ordering |
-| `record_constraint` | Save a rule with scope and enforcement level |
-| `get_context` | Retrieve relevant entries by query, tags, scope, or ID |
+| `record_decision` | Save a decision with structured rationale (problem, why_chosen, what_we_tried, tradeoffs) |
+| `record_pipeline` | Save a multi-step workflow with ordering and `purpose` |
+| `record_constraint` | Save a rule with scope, enforcement level, and `triggering_incident` |
+| `get_context` | Retrieve relevant entries by query, tags, scope, or ID — pulls `related_to` links by default |
 | `get_project_summary` | Compact overview for conversation start |
 | `update_entry` | Update any entry by ID |
 | `deprecate_entry` | Retire an entry with reason |
 | `prune_stale` | Find entries not verified recently |
 | `get_compaction_report` | Check if last compaction lost any context |
+| `verify_quality` | Scan entries for thin rationale, missing tags, isolated arcs (auto-called by PreCompact hook) |
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero external dependencies.
+
+## v0.4: Structured Rationale + Arc Linking
+
+Earlier versions used a single freeform `rationale` field. In practice, agents wrote one-line summaries instead of full reasoning — defeating the point. v0.4 fixes this three ways:
+
+1. **Schema-enforced depth.** `record_decision` requires `problem` (min 40 chars), `why_chosen` (min 60 chars), and accepts optional `what_we_tried` and `tradeoffs`. `record_pipeline` requires `purpose`. `record_constraint` enforces `reason` ≥ 40 chars and accepts optional `triggering_incident`. Thin entries are rejected server-side with field-specific guidance — the lazy path no longer produces a useful entry.
+2. **Arc linking via `related_to`.** Every entry can reference IDs of related entries. `get_context` traverses these links by default (depth=1), so when you retrieve one decision the rest of its arc comes along. Connective tissue survives across sessions.
+3. **Quality verification.** A new `verify_quality` tool scans for legacy entries, thin reasoning, missing tags, and isolated entries (tag overlap with no `related_to`). The `PreCompact` hook calls it automatically and surfaces flagged entries so they can be enriched before context is compressed.
+
+Legacy entries (pre-v0.4) stay valid — they're never auto-rejected, just flagged by `verify_quality` for optional enrichment. The deprecated `rationale` parameter still works on `record_decision` for backward compatibility (it auto-maps to `why_chosen`), but `problem` is still required.
 
 ## Install
 
@@ -72,7 +83,8 @@ Steps 2 and 3 only resolve to directories that **already** contain `.context/`. 
 When you make a design decision:
 ```
 You: Let's use JSON files instead of SQLite for storage.
-Claude: [calls record_decision with summary, rationale, and alternatives]
+Claude: [calls record_decision with summary, problem, why_chosen, alternatives,
+         and optionally what_we_tried + tradeoffs + related_to links]
 ```
 
 When you establish a workflow:
@@ -154,7 +166,7 @@ Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEE
 The hooks form a complete capture-and-retrieval loop:
 
 - **SessionStart** — reminds Claude to call `get_compaction_report` and `get_project_summary`, and to record new entries throughout the session
-- **PreCompact** — snapshots all active `.context/` entries, then prints a capture prompt reminding Claude to review the session and record any unrecorded decisions, constraints, or pipelines before context is compressed
+- **PreCompact** — snapshots all active `.context/` entries, runs a quality scan (`verify_quality`), and prints a capture prompt + any flagged entries (thin reasoning, missing tags, isolated arcs) so Claude can enrich them before context is compressed
 - **Stop** — compares post-compaction state against the snapshot, writes a diff report if anything changed (idempotent — skips if the snapshot hasn't changed since last comparison)
 
 This closes the capture loop: SessionStart handles retrieval, PreCompact handles capture, Stop handles integrity checking.

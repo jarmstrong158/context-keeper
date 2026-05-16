@@ -42,12 +42,95 @@ from server import (
 # Helper: build a params dict that targets a tmp project directory
 # ---------------------------------------------------------------------------
 
+# Sentinel strings that satisfy v0.4 min-length validation. Tests use
+# these so they exercise real code paths instead of the validation
+# rejection path. Use _DECISION_DEFAULTS / _CONSTRAINT_DEFAULTS /
+# _PIPELINE_DEFAULTS to populate required fields without obscuring
+# test intent at every call site.
+_LONG_PROBLEM = (
+    "Test scenario requires a problem description long enough to satisfy "
+    "the v0.4 min-length validation enforced by the record handlers."
+)
+_LONG_WHY = (
+    "Test scenario requires a why_chosen explanation long enough to clear "
+    "the 60-character minimum that the v0.4 schema enforces server-side."
+)
+_LONG_REASON = (
+    "Test scenario requires reasoning text long enough to satisfy the "
+    "v0.4 minimum length requirement so the handler proceeds normally."
+)
+_LONG_PURPOSE = (
+    "Test pipeline purpose long enough to clear the v0.4 minimum length "
+    "requirement applied during pipeline registration."
+)
+
+
 def project_params(tmp_path: Path, extra: dict = None) -> dict:
-    """Return a params dict with project_dir set to ``tmp_path``."""
+    """Return a params dict with project_dir set to ``tmp_path``.
+
+    v0.4 compat shim: when ``extra`` looks like a record_* call (has
+    ``summary``, ``rule``, or ``name``+``steps``), auto-fill the v0.4
+    required fields (``problem``/``why_chosen``/``reason``/``purpose``)
+    if they aren't already set, so legacy test cases keep working
+    without rewriting every call site.
+    """
     params = {"project_dir": str(tmp_path)}
     if extra:
         params.update(extra)
+    # decision shape — extend short summaries to clear min-length
+    if "summary" in params:
+        params.setdefault("problem", _LONG_PROBLEM)
+        params.setdefault("why_chosen", _LONG_WHY)
+        if isinstance(params["summary"], str) and len(params["summary"]) < 5:
+            params["summary"] = params["summary"] + " (test entry)"
+    # constraint shape — extend the existing 'reason' if it's too short
+    if "rule" in params and "reason" in params:
+        if isinstance(params["reason"], str) and len(params["reason"]) < 40:
+            params["reason"] = params["reason"] + " " + _LONG_REASON
+        if isinstance(params["rule"], str) and len(params["rule"]) < 5:
+            params["rule"] = params["rule"] + " (test rule placeholder)"
+    # pipeline shape
+    if "name" in params and "steps" in params:
+        params.setdefault("purpose", _LONG_PURPOSE)
+        if isinstance(params["name"], str) and len(params["name"]) < 3:
+            params["name"] = params["name"] + " (test pipeline)"
     return params
+
+
+def decision_params(tmp_path: Path, **overrides) -> dict:
+    """Build a valid v0.4 record_decision params dict. Overrides
+    win, so a test can pass a longer summary or extra tags."""
+    base = {
+        "project_dir": str(tmp_path),
+        "summary": "Test decision summary text",
+        "problem": _LONG_PROBLEM,
+        "why_chosen": _LONG_WHY,
+    }
+    base.update(overrides)
+    return base
+
+
+def constraint_params(tmp_path: Path, **overrides) -> dict:
+    """Build a valid v0.4 record_constraint params dict."""
+    base = {
+        "project_dir": str(tmp_path),
+        "rule": "Test rule that is long enough",
+        "reason": _LONG_REASON,
+    }
+    base.update(overrides)
+    return base
+
+
+def pipeline_params(tmp_path: Path, **overrides) -> dict:
+    """Build a valid v0.4 record_pipeline params dict."""
+    base = {
+        "project_dir": str(tmp_path),
+        "name": "Test Pipeline",
+        "purpose": _LONG_PURPOSE,
+        "steps": [{"order": 1, "action": "do something"}],
+    }
+    base.update(overrides)
+    return base
 
 
 def context_dir(tmp_path: Path) -> Path:
@@ -360,15 +443,17 @@ class TestRecordConstraint:
         assert ids == ["con-001", "con-002", "con-003"]
 
     def test_correct_fields(self, tmp_path):
+        # v0.4: reason must be >= 40 chars; pass enough text to satisfy.
+        full_reason = "Security risk that must be avoided in this codebase."
         handle_record_constraint(project_params(tmp_path, {
             "rule": "Never use eval()",
-            "reason": "Security risk",
+            "reason": full_reason,
             "tags": ["security"],
         }))
         data = read_json_file(str(context_dir(tmp_path) / "constraints.json"))
         entry = data[0]
         assert entry["rule"] == "Never use eval()"
-        assert entry["reason"] == "Security risk"
+        assert entry["reason"] == full_reason
         assert entry["tags"] == ["security"]
         assert entry["status"] == "active"
         assert "created_at" in entry
@@ -940,6 +1025,260 @@ class TestGetCompactionReport:
         (ctx / "compaction_report.json").write_text("NOT JSON{{{", encoding="utf-8")
         result = handle_get_compaction_report(project_params(tmp_path))
         assert "error" in result
+
+
+# ===========================================================================
+# 11. v0.4 schema validation
+# ===========================================================================
+
+
+class TestSchemaValidation:
+    def test_decision_rejected_when_problem_missing(self, tmp_path):
+        """Decision without `problem` is rejected with validation_errors."""
+        result = handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "A decision",
+            "why_chosen": "Some reasoning that is definitely long enough to satisfy the minimum",
+        })
+        assert "error" in result
+        assert "validation_errors" in result
+        fields = [e["field"] for e in result["validation_errors"]]
+        assert "problem" in fields
+
+    def test_decision_rejected_when_why_chosen_too_short(self, tmp_path):
+        result = handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "A decision",
+            "problem": "We needed to test the validation logic for short reasoning fields.",
+            "why_chosen": "too short",
+        })
+        assert "error" in result
+        fields = [e["field"] for e in result["validation_errors"]]
+        assert "why_chosen" in fields
+
+    def test_rationale_back_compat_maps_to_why_chosen(self, tmp_path):
+        """Old-style `rationale` arg auto-promotes to `why_chosen` so
+        legacy MCP clients keep working — but `problem` still required."""
+        long_text = "Legacy rationale text that is comfortably long enough for the validator."
+        result = handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "A decision",
+            "problem": "Backward-compat path needs to keep old MCP clients working.",
+            "rationale": long_text,
+        })
+        assert result.get("success") is True
+        assert result["entry"]["why_chosen"] == long_text
+        assert result["entry"]["rationale"] == long_text  # preserved on disk too
+
+    def test_constraint_rejected_when_reason_too_short(self, tmp_path):
+        result = handle_record_constraint({
+            "project_dir": str(tmp_path),
+            "rule": "Never use eval()",
+            "reason": "short",
+        })
+        assert "error" in result
+        fields = [e["field"] for e in result["validation_errors"]]
+        assert "reason" in fields
+
+    def test_pipeline_rejected_when_purpose_missing(self, tmp_path):
+        result = handle_record_pipeline({
+            "project_dir": str(tmp_path),
+            "name": "Build Pipeline",
+            "steps": [{"order": 1, "action": "build"}],
+        })
+        assert "error" in result
+        fields = [e["field"] for e in result["validation_errors"]]
+        assert "purpose" in fields
+
+    def test_valid_decision_stores_v4_schema(self, tmp_path):
+        result = handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "Use symlog",
+            "problem": "Value head kept saturating because returns spanned 8 orders of magnitude.",
+            "why_chosen": "Symlog bounds targets by construction; three independent audits converged on this fix.",
+            "what_we_tried": "Reset value head 3 times; each recurred within hours.",
+            "tradeoffs": "Slight loss of small-value resolution in the bounded space.",
+        })
+        assert result.get("success") is True
+        entry = result["entry"]
+        assert entry["schema_version"] == 4
+        assert entry["problem"].startswith("Value head")
+        assert entry["what_we_tried"].startswith("Reset")
+        assert entry["tradeoffs"].startswith("Slight loss")
+
+
+# ===========================================================================
+# 12. related_to graph traversal
+# ===========================================================================
+
+
+class TestRelatedToTraversal:
+    def _setup_linked_pair(self, tmp_path):
+        """Record two decisions where the second links to the first."""
+        handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "Use symlog",
+            "problem": "Value head saturation caused by huge returns spanning 8 orders of magnitude.",
+            "why_chosen": "Symlog bounds the target distribution by construction, so no head reset is needed.",
+            "tags": ["value-head", "ppo"],
+        })
+        handle_record_constraint({
+            "project_dir": str(tmp_path),
+            "rule": "Never reset value head without addressing root cause",
+            "reason": "Without fixing the upstream distribution shift, the value head will saturate again.",
+            "tags": ["value-head"],
+            "related_to": ["dec-001"],
+        })
+
+    def test_related_entry_pulled_in_by_default(self, tmp_path):
+        self._setup_linked_pair(tmp_path)
+        # Query that matches the constraint by tag — the related decision
+        # (dec-001) should come along even though the query didn't target it.
+        result = handle_get_context(project_params(tmp_path, {
+            "tags": ["value-head"],
+            "types": ["constraints"],
+        }))
+        ids = [r["entry"]["id"] for r in result["results"]]
+        assert "con-001" in ids
+        assert "dec-001" in ids
+        assert result["related_added"] == 1
+        via_related = [r for r in result["results"] if r.get("via") == "related_to"]
+        assert any(r["entry"]["id"] == "dec-001" for r in via_related)
+
+    def test_include_related_false_skips_traversal(self, tmp_path):
+        self._setup_linked_pair(tmp_path)
+        result = handle_get_context(project_params(tmp_path, {
+            "tags": ["value-head"],
+            "types": ["constraints"],
+            "include_related": False,
+        }))
+        ids = [r["entry"]["id"] for r in result["results"]]
+        assert "dec-001" not in ids
+        assert result["related_added"] == 0
+
+
+# ===========================================================================
+# 13. verify_quality
+# ===========================================================================
+
+
+class TestVerifyQuality:
+    def test_legacy_decision_flagged(self, tmp_path):
+        """Pre-v0.4 entries (no schema_version, no why_chosen) get flagged."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(parents=True)
+        # Write a legacy entry directly (bypassing the handler so no
+        # auto-migration happens). Reasoning text is intentionally long
+        # enough so the only flag we get is 'legacy'.
+        legacy = [{
+            "id": "dec-001",
+            "summary": "Old decision",
+            "rationale": (
+                "Some long enough rationale text that easily clears the "
+                "thin-reason threshold so we isolate the legacy flag in this test."
+            ),
+            "tags": ["old"],
+            "status": "active",
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "verified_at": "2024-01-01T00:00:00+00:00",
+        }]
+        (ctx / "decisions.json").write_text(
+            json.dumps(legacy), encoding="utf-8"
+        )
+        from server import handle_verify_quality
+        result = handle_verify_quality(project_params(tmp_path))
+        assert result["count"] >= 1
+        flag = next(f for f in result["flagged"] if f["id"] == "dec-001")
+        issue_types = [i["type"] for i in flag["issues"]]
+        assert "legacy" in issue_types
+
+    def test_thin_reason_flagged(self, tmp_path):
+        """v0.4 entry with why_chosen that clears the 60-char validation
+        minimum but trips the higher quality-scan threshold."""
+        # 70 chars — above validation min (60), below test threshold (200)
+        why = "Short answer that passes server-side validation but trips quality scan."
+        assert 60 <= len(why) < 200
+        handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "Decision",
+            "problem": "We needed a quick test of the thin-reason quality flag.",
+            "why_chosen": why,
+            "tags": ["test"],
+        })
+        from server import handle_verify_quality
+        result = handle_verify_quality(project_params(tmp_path, {"min_reason_chars": 200}))
+        assert any(
+            "thin_reason" in [i["type"] for i in f["issues"]]
+            for f in result["flagged"]
+        )
+
+    def test_no_tags_flagged(self, tmp_path):
+        handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "Decision",
+            "problem": "We needed an entry with no tags so we can flag it for the test.",
+            "why_chosen": (
+                "Tags are the primary retrieval signal — entries without tags "
+                "won't surface from get_context queries, which is the issue we want to flag here."
+            ),
+        })
+        from server import handle_verify_quality
+        result = handle_verify_quality(project_params(tmp_path))
+        assert any(
+            "no_tags" in [i["type"] for i in f["issues"]]
+            for f in result["flagged"]
+        )
+
+    def test_isolated_flagged(self, tmp_path):
+        """Two entries sharing a tag but no related_to link → both flagged isolated."""
+        for i in range(2):
+            handle_record_decision({
+                "project_dir": str(tmp_path),
+                "summary": f"Decision {i}",
+                "problem": "We needed two entries that share a tag for the isolation flag test.",
+                "why_chosen": (
+                    "Both entries share the 'shared' tag but neither links to the other, "
+                    "which is exactly the missed-link condition the isolated flag is designed to catch."
+                ),
+                "tags": ["shared"],
+            })
+        from server import handle_verify_quality
+        result = handle_verify_quality(project_params(tmp_path))
+        isolated = [
+            f for f in result["flagged"]
+            if any(i["type"] == "isolated" for i in f["issues"])
+        ]
+        assert len(isolated) == 2
+
+    def test_clean_entry_not_flagged(self, tmp_path):
+        """Entry with full v0.4 schema + tags + related_to should pass clean."""
+        handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "First decision",
+            "problem": "We need a clean entry that passes every quality check we run today.",
+            "why_chosen": (
+                "Full v0.4 schema, populated tags, and a related_to link to dec-002 "
+                "should make this entry survive verify_quality with zero flags."
+            ),
+            "tags": ["clean"],
+            "related_to": ["dec-002"],
+        })
+        handle_record_decision({
+            "project_dir": str(tmp_path),
+            "summary": "Second decision",
+            "problem": "We need a second entry so the related_to link target exists in scope.",
+            "why_chosen": (
+                "Same shape as the first entry, with related_to pointing back at dec-001 "
+                "so neither shows up isolated despite sharing the 'clean' tag."
+            ),
+            "tags": ["clean"],
+            "related_to": ["dec-001"],
+        })
+        from server import handle_verify_quality
+        result = handle_verify_quality(project_params(tmp_path))
+        flagged_ids = [f["id"] for f in result["flagged"]]
+        assert "dec-001" not in flagged_ids
+        assert "dec-002" not in flagged_ids
 
 
 # ===========================================================================
