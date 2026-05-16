@@ -56,7 +56,14 @@ Add to your `claude_desktop_config.json`:
 }
 ```
 
-Set `CONTEXT_KEEPER_PROJECT` to the root of your project. If omitted, it uses the current working directory.
+Set `CONTEXT_KEEPER_PROJECT` to the root of your project. If omitted, the server resolves the project directory in this order:
+
+1. **`CONTEXT_KEEPER_PROJECT`** env var (explicit opt-in — trusted)
+2. **cwd** if it already contains a `.context/` directory
+3. **Walk parent dirs** from cwd looking for an existing `.context/` (git-style discovery — finds your project when the server is launched from any subdirectory of it)
+4. Otherwise: refuse, and `record_*` returns an "unresolved project" error
+
+Steps 2 and 3 only resolve to directories that **already** contain `.context/`. The server never creates one implicitly, so you can never accidentally pollute a parent directory by launching from the wrong place. Pass `project_dir` explicitly to any tool to force-create a new project.
 
 ## How It Works
 

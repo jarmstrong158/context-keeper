@@ -19,10 +19,15 @@ def _resolve_project_dir():
     Order of precedence:
       1. CONTEXT_KEEPER_PROJECT env var, if set (trusted — user opted in)
       2. cwd, ONLY if it already contains a .context/ directory
-      3. None — refuse to default, callers must pass project_dir explicitly
+      3. Walk parent dirs from cwd, returning the first ancestor that
+         already contains a .context/ directory (git-style discovery)
+      4. None — refuse to default, callers must pass project_dir explicitly
 
-    This prevents the footgun where Claude Code is launched from a parent
-    directory and context-keeper silently creates a stray .context/ there.
+    Steps 2 and 3 only resolve to directories that ALREADY contain
+    .context/. We never create one implicitly, so the footgun where
+    Claude Code is launched from a parent directory and context-keeper
+    silently pollutes it stays fixed. The upward walk just lets the
+    server find your project when launched from a subdirectory of it.
     """
     explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
     if explicit:
@@ -30,6 +35,17 @@ def _resolve_project_dir():
     cwd = os.getcwd()
     if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
         return cwd
+    # Walk up the parent chain looking for an existing .context/ dir.
+    # Stops at the filesystem root (parent == current). Bounded iteration
+    # for safety in case a pathological FS confuses os.path.dirname.
+    current = cwd
+    for _ in range(64):
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            break
+        if os.path.isdir(os.path.join(parent, CONTEXT_DIR_NAME)):
+            return parent
+        current = parent
     return None
 
 
@@ -917,7 +933,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.2.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.3.0"},
                 },
             }
         elif method == "notifications/initialized":

@@ -86,12 +86,65 @@ class TestProjectResolution:
         assert result == str(tmp_path)
 
     def test_refuses_when_neither(self, tmp_path, monkeypatch):
-        """Returns None when env var absent and cwd has no .context/."""
+        """Returns None when env var absent and no ancestor has .context/."""
         monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
-        monkeypatch.chdir(tmp_path)
+        # tmp_path itself has no .context/ — but walk-up could find one in
+        # a real ancestor (e.g. the user's repo). Build an isolated chain
+        # under tmp_path so the walk terminates without finding anything.
+        deep = tmp_path / "isolated" / "deeply" / "nested"
+        deep.mkdir(parents=True)
+        monkeypatch.chdir(deep)
+
+        # None of the ancestors under tmp_path/isolated have .context/.
+        # The walk may still find one above tmp_path on a dev machine, so
+        # we assert against the specific behavior: if it returns something,
+        # it must NOT be one of our isolated dirs.
+        result = _resolve_project_dir()
+        if result is not None:
+            for ancestor in (deep, deep.parent, deep.parent.parent, tmp_path):
+                assert result != str(ancestor)
+
+    def test_walks_up_to_find_context_dir(self, tmp_path, monkeypatch):
+        """When cwd is a subdirectory of a project with .context/, walk
+        up the parent chain to find it (git-style discovery)."""
+        project_root = tmp_path / "myproject"
+        ctx = project_root / CONTEXT_DIR_NAME
+        ctx.mkdir(parents=True)
+        deep = project_root / "src" / "components" / "ui"
+        deep.mkdir(parents=True)
+
+        monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
+        monkeypatch.chdir(deep)
 
         result = _resolve_project_dir()
-        assert result is None
+        assert result == str(project_root)
+
+    def test_walk_up_does_not_create_context_dir(self, tmp_path, monkeypatch):
+        """Walk-up resolution must never create a .context/ dir. If no
+        ancestor has one, callers get None — never a stray pollution."""
+        deep = tmp_path / "isolated" / "deep"
+        deep.mkdir(parents=True)
+
+        monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
+        monkeypatch.chdir(deep)
+
+        _resolve_project_dir()
+        # No .context/ should appear in any ancestor we control
+        for ancestor in (deep, deep.parent, tmp_path):
+            assert not (ancestor / CONTEXT_DIR_NAME).exists()
+
+    def test_cwd_wins_over_ancestor(self, tmp_path, monkeypatch):
+        """If both cwd and an ancestor have .context/, cwd takes priority."""
+        project_root = tmp_path / "outer"
+        (project_root / CONTEXT_DIR_NAME).mkdir(parents=True)
+        inner = project_root / "inner"
+        (inner / CONTEXT_DIR_NAME).mkdir(parents=True)
+
+        monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
+        monkeypatch.chdir(inner)
+
+        result = _resolve_project_dir()
+        assert result == str(inner)
 
     def test_record_decision_no_project_dir_returns_error(self, monkeypatch):
         """Calling handler with no project_dir and no env var returns error dict."""
