@@ -101,7 +101,7 @@ Claude: [calls record_constraint with rule, reason, and hardness=absolute]
 
 ### Retrieving Context
 
-At conversation start, Claude calls `get_project_summary` to see all active decisions, pipelines, and constraints. Before making changes, it calls `get_context` with relevant tags to check for conflicts.
+At conversation start, the SessionStart hook injects the project summary (and any compaction-discrepancy report) directly into context — no tool call required, so retrieval can't be skipped on a task-focused first turn. `get_project_summary` remains callable on demand. Before making changes, Claude calls `get_context` with relevant tags to check for conflicts.
 
 ### Relevance Scoring
 
@@ -115,7 +115,7 @@ Results are capped by a configurable token budget (default: 4000 tokens).
 
 ## Claude Code Hook Setup
 
-Context Keeper includes hooks that snapshot your context before Claude Code compaction and detect if anything was lost afterward.
+Context Keeper includes hooks that inject project memory at session start, snapshot your context before Claude Code compaction, and detect if anything was lost afterward.
 
 Add to your Claude Code hooks config (`~/.claude/settings.json`):
 
@@ -150,7 +150,7 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "python -c \"print('[Context Keeper] At session start: call get_compaction_report first, then get_project_summary. Record new decisions, pipelines, and constraints as they happen.')\""
+            "command": "python /path/to/context-keeper/hooks/session_start.py"
           }
         ]
       }
@@ -165,11 +165,11 @@ Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEE
 
 The hooks form a complete capture-and-retrieval loop:
 
-- **SessionStart** — reminds Claude to call `get_compaction_report` and `get_project_summary`, and to record new entries throughout the session
+- **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report) straight to stdout, which Claude Code injects into context at turn one. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
 - **PreCompact** — snapshots all active `.context/` entries, runs a quality scan (`verify_quality`), and prints a capture prompt + any flagged entries (thin reasoning, missing tags, isolated arcs) so Claude can enrich them before context is compressed
 - **Stop** — compares post-compaction state against the snapshot, writes a diff report if anything changed (idempotent — skips if the snapshot hasn't changed since last comparison)
 
-This closes the capture loop: SessionStart handles retrieval, PreCompact handles capture, Stop handles integrity checking.
+This closes the capture loop: SessionStart injects retrieval at turn one, PreCompact handles capture, Stop handles integrity checking. Retrieval is now unavoidable; capture still relies on Claude calling `record_*` during the session.
 
 ## Data Storage
 

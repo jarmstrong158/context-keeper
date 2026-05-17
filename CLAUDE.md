@@ -21,7 +21,7 @@ Steps 2 and 3 only resolve to directories that **already** contain `.context/`. 
 
 Context Keeper has two halves:
 
-1. **Retrieval** (session start): The SessionStart hook reminds you to call `get_compaction_report` then `get_project_summary`. This orients you on what's already recorded.
+1. **Retrieval** (session start): The SessionStart hook injects the compaction report and project summary directly into context (it runs the handlers itself and prints their output). Retrieval is automatic and unskippable — you do not need to call the tools to be oriented on what's already recorded. `get_compaction_report` / `get_project_summary` remain callable on demand.
 2. **Capture** (during session + pre-compaction): Record decisions, constraints, and pipelines *as they happen* during the session. The PreCompact hook fires a reminder before compaction, prompting you to review the session and record anything important before context is compressed. This is a safety net — don't rely on it. Record in-line whenever possible.
 
 Both halves must work for the system to be useful. Retrieval without capture means the same entries get stale. Capture without retrieval means you don't know what's already recorded.
