@@ -1,3 +1,6 @@
 __pycache__/
 .context/
 .mcpregistry_*
+.pytest_cache/
+dist/
+*.egg-info/

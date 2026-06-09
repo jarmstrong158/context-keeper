@@ -74,6 +74,10 @@ def _scan_quality(entries_by_type, min_reason_chars=80):
     but inlined here so the hook stays dependency-free (the hook can't
     import the MCP server at runtime — it's a separate process).
 
+    KEEP IN SYNC with server.handle_verify_quality: the two flag-detection
+    rules (legacy / thin_reason / no_tags / isolated) are intentionally
+    duplicated. If you change the rules in one place, change them in both.
+
     Returns a list of {id, type, summary, issues} flagged entries.
     """
     # Build tag→ids index for isolation detection

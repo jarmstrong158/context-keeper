@@ -40,7 +40,7 @@ Legacy entries (pre-v0.4) stay valid — they're never auto-rejected, just flagg
 ## Install
 
 ```bash
-pip install context-keeper
+pip install context-keeper-mcp
 ```
 
 ### Claude Code

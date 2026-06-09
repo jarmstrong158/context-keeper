@@ -37,6 +37,7 @@ context-keeper = "server:main"
 [tool.hatch.build.targets.sdist]
 include = [
     "server.py",
+    "hooks/session_start.py",
     "hooks/pre_compact.py",
     "hooks/post_compact.py",
     "LICENSE",
@@ -47,5 +48,6 @@ include = [
 [tool.hatch.build.targets.wheel.force-include]
 "server.py" = "server.py"
 "CLAUDE.md" = "CLAUDE.md"
+"hooks/session_start.py" = "hooks/session_start.py"
 "hooks/pre_compact.py" = "hooks/pre_compact.py"
 "hooks/post_compact.py" = "hooks/post_compact.py"

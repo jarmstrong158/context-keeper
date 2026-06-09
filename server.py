@@ -460,7 +460,7 @@ def read_json_file(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, Exception):
+    except Exception:
         return []
 
 
@@ -1037,6 +1037,10 @@ def handle_get_project_summary(params):
     if estimate_tokens(summary_text) > budget:
         # Keep constraints, trim decisions/pipelines
         while estimate_tokens(summary_text) > budget and lines:
+            lines.pop()
+        # Don't leave a dangling section header (e.g. "Pipelines (3):") or a
+        # trailing blank line after trimming the entries out from under it.
+        while lines and (not lines[-1].strip() or lines[-1].rstrip().endswith(":")):
             lines.pop()
         summary_text = "\n".join(lines)
 
