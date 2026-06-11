@@ -22,7 +22,7 @@ Steps 2 and 3 only resolve to directories that **already** contain `.context/`. 
 Context Keeper has two halves:
 
 1. **Retrieval** (session start): The SessionStart hook injects the compaction report and project summary directly into context (it runs the handlers itself and prints their output). Retrieval is automatic and unskippable — you do not need to call the tools to be oriented on what's already recorded. `get_compaction_report` / `get_project_summary` remain callable on demand.
-2. **Capture** (during session + pre-compaction): Record decisions, constraints, and pipelines *as they happen* during the session. The PreCompact hook fires a reminder before compaction, prompting you to review the session and record anything important before context is compressed. This is a safety net — don't rely on it. Record in-line whenever possible.
+2. **Capture** (during session + pre-compaction): Record decisions, constraints, and pipelines *as they happen* during the session. **A git commit is the capture trigger**: a commit that establishes a decision/constraint/gotcha is not finished until the matching record_*/update_entry lands in the same work cycle — never batch capture "for later" (in field use, "later" never came and the user had to ask three times in one night). The PostToolUse commit-reminder hook injects this prompt automatically after every `git commit`; the PreCompact hook is the last-resort safety net before context is compressed. Don't rely on either — record in-line whenever possible.
 
 Both halves must work for the system to be useful. Retrieval without capture means the same entries get stale. Capture without retrieval means you don't know what's already recorded.
 

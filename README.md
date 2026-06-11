@@ -115,7 +115,7 @@ Results are capped by a configurable token budget (default: 4000 tokens).
 
 ## Claude Code Hook Setup
 
-Context Keeper includes hooks that inject project memory at session start, snapshot your context before Claude Code compaction, and detect if anything was lost afterward.
+Context Keeper includes hooks that inject project memory at session start, remind Claude to capture after every git commit, snapshot your context before Claude Code compaction, and detect if anything was lost afterward.
 
 Add to your Claude Code hooks config (`~/.claude/settings.json`):
 
@@ -154,6 +154,17 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/context-keeper/hooks/commit_capture_reminder.py"
+          }
+        ]
+      }
     ]
   }
 }
@@ -166,10 +177,11 @@ Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEE
 The hooks form a complete capture-and-retrieval loop:
 
 - **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report) straight to stdout, which Claude Code injects into context at turn one. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
+- **PostToolUse (Bash)** — fires after every Bash tool call; when the command contains `git commit`, it injects a reminder to record the matching decision/constraint/gotcha **in the same work cycle**. A commit is the single best capture trigger — it's the exact moment something became real enough to persist in version control. Born from field use: during incident-heavy sessions the agent batched capture "for later," and the user had to ask "update context keeper" three times in one night while a dozen commits shipped
 - **PreCompact** — snapshots all active `.context/` entries, runs a quality scan (`verify_quality`), and prints a capture prompt + any flagged entries (thin reasoning, missing tags, isolated arcs) so Claude can enrich them before context is compressed
 - **Stop** — compares post-compaction state against the snapshot, writes a diff report if anything changed (idempotent — skips if the snapshot hasn't changed since last comparison)
 
-This closes the capture loop: SessionStart injects retrieval at turn one, PreCompact handles capture, Stop handles integrity checking. Retrieval is now unavoidable; capture still relies on Claude calling `record_*` during the session.
+This closes the capture loop: SessionStart injects retrieval at turn one, the commit reminder anchors capture to the moment changes land, PreCompact is the pre-compression safety net, and Stop handles integrity checking. Retrieval is unavoidable; capture is now *prompted at the right moment* rather than left to the agent's discretion mid-task.
 
 ## Data Storage
 
