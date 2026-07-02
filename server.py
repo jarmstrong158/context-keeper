@@ -453,21 +453,69 @@ def ensure_context_dir(path=None):
     os.makedirs(path or CONTEXT_DIR, exist_ok=True)
 
 
-def read_json_file(path):
+def _read_json_file_checked(path):
+    """Read a JSON entry file, distinguishing missing from corrupt.
+
+    Returns (entries, error). A missing file is ([], None) — a fresh
+    store. A file that exists but cannot be parsed
+    (or isn't a list) returns ([], "<description>") so write paths can
+    refuse instead of silently treating the store as empty and wiping
+    history on the next write.
+    """
     if not os.path.exists(path):
-        return []
+        return [], None
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    except Exception as e:
+        return [], f"unparseable JSON ({e})"
+    if not isinstance(data, list):
+        return [], "top-level value is not a JSON list"
+    return data, None
+
+
+def read_json_file(path):
+    """Soft read for retrieval paths: missing or corrupt both yield [].
+
+    Write paths must use _load_entries_for_write instead — silently
+    treating a corrupt store as empty turns the next append into a
+    full-history wipe.
+    """
+    entries, _err = _read_json_file_checked(path)
+    return entries
+
+
+def _load_entries_for_write(path):
+    """Load entries for a read-modify-write cycle. Returns (entries, error_dict).
+
+    If the file exists but is corrupt, returns an error instead of []
+    so the caller refuses to write over existing history.
+    """
+    entries, err = _read_json_file_checked(path)
+    if err:
+        return None, {
+            "error": (
+                f"Refusing to write: {os.path.basename(path)} exists but could not "
+                f"be read ({err}). Writing now would silently discard every entry "
+                f"already in the file. Fix or restore the file, then retry."
+            )
+        }
+    return entries, None
 
 
 def write_json_file(path, data):
+    """Atomically write entries: write to a temp file, then os.replace.
+
+    A crash mid-write leaves the old file intact instead of a truncated
+    JSON document that the next read would treat as an empty store.
+    """
     ensure_context_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def read_config(base_dir=None):
@@ -579,7 +627,9 @@ def score_entry(entry, query_tags=None, query_text=None, scope=None, now_dt=None
         try:
             v_dt = datetime.fromisoformat(verified.replace("Z", "+00:00"))
             days_ago = (now_dt - v_dt).days
-            recency = max(0, 1 - (days_ago / 90))
+            # Clamp to [0, 1]: a future timestamp (clock skew, manual edit)
+            # must not push recency past its 20-point cap.
+            recency = max(0.0, min(1.0, 1 - (days_ago / 90)))
             score += 20 * recency
         except Exception:
             score += 10  # can't parse, give middle score
@@ -592,6 +642,52 @@ def score_entry(entry, query_tags=None, query_text=None, scope=None, now_dt=None
         score += 5
 
     return score
+
+
+def _jaccard(a, b):
+    """Word-set Jaccard similarity of two entries' text (zero-dependency)."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _mmr_reorder(scored, lam=0.7):
+    """Greedily reorder (score, type, entry) tuples for Maximal Marginal Relevance.
+
+    Penalizes a candidate by its peak lexical similarity to already-selected
+    entries, so near-duplicate restatements of one topic don't crowd the budget
+    and a second relevant topic gets a seat. Entries linked by `related_to` are
+    exempt from the penalty — those are intentional arcs meant to surface
+    together, not redundancy. lam=1.0 reduces to pure relevance order.
+    """
+    if len(scored) < 2:
+        return scored
+    max_score = max((s for s, _t, _e in scored), default=0.0) or 1.0
+    items = []
+    for s, t, e in scored:
+        items.append({
+            "orig": s, "norm": s / max_score, "type": t, "entry": e,
+            "words": _text_words(e), "id": e.get("id"),
+            "related": set(e.get("related_to") or []),
+        })
+    selected, ordered = [], []
+    while items:
+        best_i, best_val = 0, None
+        for i, d in enumerate(items):
+            sim = 0.0
+            for s in selected:
+                if d["id"] in s["related"] or s["id"] in d["related"]:
+                    continue  # arc-linked: no diversity penalty
+                sim = max(sim, _jaccard(d["words"], s["words"]))
+            val = lam * d["norm"] - (1 - lam) * sim
+            if best_val is None or val > best_val:
+                best_val, best_i = val, i
+        chosen = items.pop(best_i)
+        selected.append(chosen)
+        ordered.append((chosen["orig"], chosen["type"], chosen["entry"]))
+    return ordered
 
 
 def _truncate_entry(entry, max_tokens):
@@ -745,7 +841,9 @@ def handle_record_decision(params):
 
     ensure_context_dir(base_dir)
     dec_path = os.path.join(base_dir, "decisions.json")
-    entries = read_json_file(dec_path)
+    entries, load_err = _load_entries_for_write(dec_path)
+    if load_err is not None:
+        return load_err
     entry = {
         "id": next_id(entries, "dec"),
         "summary": params["summary"],
@@ -791,7 +889,9 @@ def handle_record_pipeline(params):
 
     ensure_context_dir(base_dir)
     pipe_path = os.path.join(base_dir, "pipelines.json")
-    entries = read_json_file(pipe_path)
+    entries, load_err = _load_entries_for_write(pipe_path)
+    if load_err is not None:
+        return load_err
     entry = {
         "id": next_id(entries, "pipe"),
         "name": params["name"],
@@ -825,7 +925,9 @@ def handle_record_constraint(params):
 
     ensure_context_dir(base_dir)
     con_path = os.path.join(base_dir, "constraints.json")
-    entries = read_json_file(con_path)
+    entries, load_err = _load_entries_for_write(con_path)
+    if load_err is not None:
+        return load_err
     entry = {
         "id": next_id(entries, "con"),
         "rule": params["rule"],
@@ -890,10 +992,35 @@ def handle_get_context(params):
     # Filter out deprecated
     typed_entries = [(t, e) for t, e in typed_entries if e.get("status", "active") != "deprecated"]
 
+    # Optional semantic blend — opt-in via config "semantic.enabled" (or a per-call
+    # params["semantic"] override). Adds embedding-cosine signal to rescue
+    # vocabulary-mismatch queries. Any failure (Ollama down, model missing, import
+    # error) silently falls back to pure lexical ranking, so zero-dep stays default.
+    sem_cfg = {**cfg.get("semantic", {}), **(params.get("semantic") or {})}
+    sem_map = {}
+    if sem_cfg.get("enabled") and query:
+        try:
+            import semantic_index
+            sem_map = semantic_index.query_cosines(
+                query, [e for _t, e in typed_entries], base_dir, sem_cfg) or {}
+        except Exception:
+            sem_map = {}
+    sem_weight = sem_cfg.get("weight", 150)
+
     # Score and sort
     now_dt = datetime.now(timezone.utc)
-    scored = [(score_entry(e, tags, query, scope, now_dt), t, e) for t, e in typed_entries]
+    scored = [
+        (score_entry(e, tags, query, scope, now_dt) + sem_weight * sem_map.get(e.get("id"), 0.0), t, e)
+        for t, e in typed_entries
+    ]
     scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Optional MMR diversity — opt-in via config "mmr.enabled" (or per-call
+    # params["mmr"]). Reorders the ranked list so near-duplicate entries don't
+    # crowd the token budget; arc-linked (related_to) entries are exempt.
+    mmr_cfg = {**cfg.get("mmr", {}), **(params.get("mmr") or {})}
+    if mmr_cfg.get("enabled"):
+        scored = _mmr_reorder(scored, mmr_cfg.get("lambda", 0.7))
 
     # Pack into budget with truncation
     results = []
@@ -912,7 +1039,9 @@ def handle_get_context(params):
             cost = estimate_tokens(text)
 
         if used_tokens + cost > budget:
-            break
+            # Skip entries that don't fit but keep packing: one oversized
+            # mid-ranked entry must not block smaller entries behind it.
+            continue
 
         results.append({"score": round(sc, 1), "type": entry_type, "entry": clean})
         seen_ids.add(entry.get("id"))
@@ -945,7 +1074,7 @@ def handle_get_context(params):
                 clean = _truncate_entry(clean, max_entry)
                 cost = estimate_tokens(json.dumps(clean, indent=2))
             if used_tokens + cost > budget:
-                break
+                continue
             r_label = type_labels.get(r_type, r_type)
             results.append({
                 "score": 0.0,
@@ -1058,6 +1187,16 @@ def handle_get_project_summary(params):
     }
 
 
+# Min lengths enforced when a structured field is *updated*. Without this,
+# update_entry could hollow out the very fields the v0.4 record_* schema
+# protects (e.g. set why_chosen to "").
+_UPDATE_MIN_LENGTHS = {
+    "decisions": {"summary": 5, "problem": 40, "why_chosen": 60},
+    "pipelines": {"name": 3, "purpose": 40},
+    "constraints": {"rule": 5, "reason": 40},
+}
+
+
 def handle_update_entry(params):
     entry_id = params["id"]
     updates = params["updates"]
@@ -1069,6 +1208,22 @@ def handle_update_entry(params):
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
 
+    # Validate any structured fields being updated, so update_entry can't
+    # bypass the min-length schema that record_* enforces.
+    requirements = {
+        field: min_len
+        for field, min_len in _UPDATE_MIN_LENGTHS.get(type_name, {}).items()
+        if field in updates
+    }
+    if requirements:
+        err = _check_min_lengths(updates, requirements)
+        if err is not None:
+            return err
+    if type_name == "pipelines" and "steps" in updates and not updates["steps"]:
+        return {"error": "Pipeline requires at least one step.", "validation_errors": [
+            {"field": "steps", "guidance": "Provide an ordered list of steps."}
+        ]}
+
     # Apply updates (protect id and created_at)
     protected = {"id", "created_at"}
     for key, val in updates.items():
@@ -1079,7 +1234,9 @@ def handle_update_entry(params):
     entry["updated_at"] = now_iso()
 
     # Write back
-    entries = read_json_file(file_path)
+    entries, load_err = _load_entries_for_write(file_path)
+    if load_err is not None:
+        return load_err
     entries[index] = entry
     write_json_file(file_path, entries)
 
@@ -1104,7 +1261,9 @@ def handle_deprecate_entry(params):
     if superseded_by and type_name == "decisions":
         entry["superseded_by"] = superseded_by
 
-    entries = read_json_file(file_path)
+    entries, load_err = _load_entries_for_write(file_path)
+    if load_err is not None:
+        return load_err
     entries[index] = entry
     write_json_file(file_path, entries)
 
@@ -1334,7 +1493,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.4.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.5.0"},
                 },
             }
         elif method == "notifications/initialized":

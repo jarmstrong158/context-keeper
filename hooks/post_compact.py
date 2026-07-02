@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """Context Keeper — PostCompact hook.
 
-Fires after Claude Code compaction (via Stop hook). Compares current context
-state against the pre-compaction snapshot and reports any discrepancies.
+Compares current context state against the pre-compaction snapshot and
+writes a discrepancy report. Wired under Stop (see README) as a safety
+net, but the same comparison is also invoked directly by
+session_start.py, because SessionStart(source=compact) fires immediately
+after compaction — before any Stop — and the report must exist by the
+time session_start injects it.
+
+Idempotent: the comparison is keyed to the snapshot timestamp, so
+re-running against an already-compared snapshot is a no-op.
+
+Project resolution and file reading are imported from server.py (same
+sys.path trick as session_start.py) instead of being duplicated here.
 """
 
 import json
@@ -10,32 +20,16 @@ import os
 import sys
 from datetime import datetime, timezone
 
-CONTEXT_DIR_NAME = ".context"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
+try:
+    import server as _server
+except Exception:
+    _server = None  # never break the hook flow; everything below no-ops
 
-def _resolve_project_dir():
-    """Same resolution logic as server.py: env var, then cwd-if-exists,
-    then walk parents looking for an existing .context/, then None.
-    Never creates a .context/ implicitly."""
-    explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
-    if explicit:
-        return explicit
-    cwd = os.getcwd()
-    if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
-        return cwd
-    current = cwd
-    for _ in range(64):
-        parent = os.path.dirname(current)
-        if not parent or parent == current:
-            break
-        if os.path.isdir(os.path.join(parent, CONTEXT_DIR_NAME)):
-            return parent
-        current = parent
-    return None
-
-
-PROJECT_DIR = _resolve_project_dir()
-CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME) if PROJECT_DIR else None
+CONTEXT_DIR = _server.CONTEXT_DIR if _server else None
 SNAPSHOT_PATH = os.path.join(CONTEXT_DIR, "compaction_snapshot.json") if CONTEXT_DIR else None
 REPORT_PATH = os.path.join(CONTEXT_DIR, "compaction_report.json") if CONTEXT_DIR else None
 LOG_PATH = os.path.join(CONTEXT_DIR, "hook.log") if CONTEXT_DIR else None
@@ -45,17 +39,6 @@ FILES = {
     "pipelines": os.path.join(CONTEXT_DIR, "pipelines.json"),
     "constraints": os.path.join(CONTEXT_DIR, "constraints.json"),
 } if CONTEXT_DIR else {}
-
-
-def read_json(path):
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
 
 
 def log(message):
@@ -99,22 +82,24 @@ def _already_compared(snapshot_ts):
         return False
 
 
-def main():
-    if SNAPSHOT_PATH is None or not os.path.exists(SNAPSHOT_PATH):
-        return
+def generate_report():
+    """Run the snapshot-vs-current comparison and write the report file.
+
+    Returns the report dict, or None if there is nothing to do (no
+    project, no snapshot, or this snapshot was already compared).
+    """
+    if _server is None or SNAPSHOT_PATH is None or not os.path.exists(SNAPSHOT_PATH):
+        return None
 
     try:
         with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
             snapshot = json.load(f)
     except Exception:
         log("POST_COMPACT: Could not read snapshot file")
-        return
+        return None
 
-    # Idempotency: the Stop hook fires on every assistant response, but the
-    # snapshot only changes when PreCompact runs. Skip if we've already
-    # compared against this exact snapshot.
     if _already_compared(snapshot.get("timestamp")):
-        return
+        return None
 
     missing = []
     modified = []
@@ -124,7 +109,7 @@ def main():
         if not path:
             continue
 
-        after_entries = read_json(path)
+        after_entries = _server.read_json_file(path)
         after_by_id = {e.get("id"): e for e in after_entries}
 
         for before_entry in before_entries:
@@ -161,18 +146,31 @@ def main():
     }
 
     os.makedirs(CONTEXT_DIR, exist_ok=True)
-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+    tmp = REPORT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+    os.replace(tmp, REPORT_PATH)
 
     if has_discrepancies:
-        print(f"[Context Keeper] WARNING: Compaction discrepancies detected!", file=sys.stderr)
-        print(f"  Missing entries: {len(missing)}", file=sys.stderr)
-        print(f"  Modified entries: {len(modified)}", file=sys.stderr)
-        print(f"  Report: {REPORT_PATH}", file=sys.stderr)
-        print(f"  Call get_compaction_report to review details.", file=sys.stderr)
         log(f"POST_COMPACT: DISCREPANCIES — {len(missing)} missing, {len(modified)} modified")
     else:
         log("POST_COMPACT: clean — no discrepancies")
+
+    return report
+
+
+def main():
+    report = generate_report()
+    if report is None:
+        return
+    if report.get("status") == "discrepancies_found":
+        # Transcript/verbose-visible only — the model-visible surface for
+        # this is session_start.py, which injects the report at turn one.
+        print("[Context Keeper] WARNING: Compaction discrepancies detected!", file=sys.stderr)
+        print(f"  Missing entries: {report['missing_count']}", file=sys.stderr)
+        print(f"  Modified entries: {report['modified_count']}", file=sys.stderr)
+        print(f"  Report: {REPORT_PATH}", file=sys.stderr)
+        print("  Call get_compaction_report to review details.", file=sys.stderr)
 
 
 if __name__ == "__main__":

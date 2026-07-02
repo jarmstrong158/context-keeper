@@ -75,6 +75,18 @@ def main():
         # Never break session start because memory could not load.
         return
 
+    # Generate the compaction report NOW if a fresh snapshot is pending.
+    # SessionStart(source=compact) fires immediately after compaction --
+    # before any Stop hook -- so without this the report we inject below
+    # could be one compaction stale. generate_report() is idempotent
+    # (keyed to the snapshot timestamp), so this is a no-op when the
+    # Stop hook already compared this snapshot.
+    try:
+        import post_compact
+        post_compact.generate_report()
+    except Exception:
+        pass
+
     try:
         report = server.handle_get_compaction_report({})
     except Exception:
@@ -83,6 +95,10 @@ def main():
         summary = server.handle_get_project_summary({})
     except Exception:
         summary = None
+    try:
+        quality = server.handle_verify_quality({})
+    except Exception:
+        quality = None
 
     blocks = []
     c = _fmt_compaction(report)
@@ -97,6 +113,17 @@ def main():
     if not blocks:
         # No project memory yet -- stay silent rather than nag every session.
         return
+
+    # Quality nudge: PreCompact stdout is not injected into model context,
+    # so SessionStart is the model-visible surface for the scan. One line
+    # only -- the full detail is a verify_quality call away.
+    if quality and quality.get("count"):
+        ids = ", ".join(str(f.get("id")) for f in quality.get("flagged", [])[:5])
+        blocks.append(
+            f"Quality scan: {quality['count']} entries look thin, untagged, "
+            f"or unlinked (e.g. {ids}). Call verify_quality for details and "
+            f"enrich via update_entry when convenient."
+        )
 
     blocks.append(
         "Capture as you go: when a decision, constraint, or pipeline is "

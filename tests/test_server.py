@@ -35,6 +35,7 @@ from server import (
     handle_update_entry,
     next_id,
     read_json_file,
+    score_entry,
 )
 
 
@@ -1306,3 +1307,177 @@ class TestNextId:
         assert next_id([], "con") == "con-001"
         entries = [{"id": "con-009"}]
         assert next_id(entries, "con") == "con-010"
+
+
+# ===========================================================================
+# Data integrity: atomic writes + corrupt-store protection
+# ===========================================================================
+
+
+class TestDataIntegrity:
+    def test_record_refuses_to_write_over_corrupt_store(self, tmp_path):
+        """A corrupt decisions.json must reject the write, not be wiped."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir()
+        corrupt = "{this is not valid json"
+        (ctx / "decisions.json").write_text(corrupt, encoding="utf-8")
+
+        result = handle_record_decision(decision_params(tmp_path))
+
+        assert "error" in result
+        assert "Refusing to write" in result["error"]
+        # Original file untouched — history preserved for manual recovery
+        assert (ctx / "decisions.json").read_text(encoding="utf-8") == corrupt
+
+    def test_record_refuses_non_list_store(self, tmp_path):
+        """Valid JSON that isn't a list is still a corrupt store for writes."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir()
+        (ctx / "constraints.json").write_text('{"oops": "a dict"}', encoding="utf-8")
+
+        result = handle_record_constraint(constraint_params(tmp_path))
+
+        assert "error" in result
+        assert "Refusing to write" in result["error"]
+
+    def test_missing_file_is_still_a_fresh_store(self, tmp_path):
+        """Absent file (vs corrupt) records normally from dec-001."""
+        result = handle_record_decision(decision_params(tmp_path))
+        assert result["success"] is True
+        assert result["id"] == "dec-001"
+
+    def test_read_paths_soft_fallback_on_corrupt(self, tmp_path):
+        """Retrieval stays soft: corrupt file reads as empty, no crash."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir()
+        (ctx / "decisions.json").write_text("<<<", encoding="utf-8")
+        result = handle_get_context({"project_dir": str(tmp_path), "query": "anything"})
+        assert result["results"] == []
+
+    def test_atomic_write_leaves_no_tmp_file(self, tmp_path):
+        result = handle_record_decision(decision_params(tmp_path))
+        assert result["success"] is True
+        ctx = context_dir(tmp_path)
+        assert not (ctx / "decisions.json.tmp").exists()
+        # And the written file parses back
+        entries = json.loads((ctx / "decisions.json").read_text(encoding="utf-8"))
+        assert len(entries) == 1
+
+
+# ===========================================================================
+# update_entry validation (can't hollow out v0.4 structured fields)
+# ===========================================================================
+
+
+class TestUpdateEntryValidation:
+    def test_update_rejects_thin_why_chosen(self, tmp_path):
+        rec = handle_record_decision(decision_params(tmp_path))
+        result = handle_update_entry({
+            "project_dir": str(tmp_path),
+            "id": rec["id"],
+            "updates": {"why_chosen": "short"},
+        })
+        assert "validation_errors" in result
+        # Entry on disk unchanged
+        got = handle_get_context({"project_dir": str(tmp_path), "id": rec["id"]})
+        assert got["entry"]["why_chosen"] == _LONG_WHY
+
+    def test_update_accepts_valid_why_chosen(self, tmp_path):
+        rec = handle_record_decision(decision_params(tmp_path))
+        new_why = _LONG_WHY + " Revised after further evidence came in."
+        result = handle_update_entry({
+            "project_dir": str(tmp_path),
+            "id": rec["id"],
+            "updates": {"why_chosen": new_why},
+        })
+        assert result["success"] is True
+        assert result["entry"]["why_chosen"] == new_why
+
+    def test_update_rejects_thin_constraint_reason(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(tmp_path))
+        result = handle_update_entry({
+            "project_dir": str(tmp_path),
+            "id": rec["id"],
+            "updates": {"reason": "because"},
+        })
+        assert "validation_errors" in result
+
+    def test_update_rejects_empty_pipeline_steps(self, tmp_path):
+        rec = handle_record_pipeline(pipeline_params(tmp_path))
+        result = handle_update_entry({
+            "project_dir": str(tmp_path),
+            "id": rec["id"],
+            "updates": {"steps": []},
+        })
+        assert "error" in result
+
+    def test_update_unvalidated_fields_pass_through(self, tmp_path):
+        """Fields outside the structured schema (tags, status) update freely."""
+        rec = handle_record_decision(decision_params(tmp_path))
+        result = handle_update_entry({
+            "project_dir": str(tmp_path),
+            "id": rec["id"],
+            "updates": {"tags": ["new-tag"]},
+        })
+        assert result["success"] is True
+        assert result["entry"]["tags"] == ["new-tag"]
+
+
+# ===========================================================================
+# Budget packing: oversized entries are skipped, not blocking
+# ===========================================================================
+
+
+class TestBudgetPackingSkip:
+    def test_oversized_entry_does_not_block_smaller_ones(self, tmp_path):
+        # dec-001: huge summary — even truncated it exceeds the tiny budget.
+        handle_record_decision(decision_params(
+            tmp_path, summary="B" * 4000, tags=["shared"]))
+        # dec-002: normal-sized entry that fits comfortably.
+        handle_record_decision(decision_params(
+            tmp_path, summary="A small decision that fits the budget", tags=["shared"]))
+
+        result = handle_get_context({
+            "project_dir": str(tmp_path),
+            "token_budget": 300,
+            "include_related": False,
+        })
+        ids = [r["entry"]["id"] for r in result["results"]]
+        # Old behavior: dec-001 didn't fit -> break -> nothing returned.
+        assert "dec-002" in ids
+        assert "dec-001" not in ids
+
+
+# ===========================================================================
+# Recency scoring clamp
+# ===========================================================================
+
+
+class TestRecencyClamp:
+    def test_future_timestamp_cannot_exceed_recency_cap(self):
+        now_dt = datetime.now(timezone.utc)
+        base = {"tags": [], "status": "active"}
+        future_entry = dict(base, verified_at=(now_dt + timedelta(days=365)).isoformat())
+        fresh_entry = dict(base, verified_at=now_dt.isoformat())
+        s_future = score_entry(future_entry, now_dt=now_dt)
+        s_fresh = score_entry(fresh_entry, now_dt=now_dt)
+        assert s_future <= s_fresh + 1e-9
+
+
+# ===========================================================================
+# Semantic layer: unreachable embedder falls back to lexical
+# ===========================================================================
+
+
+class TestSemanticFallback:
+    def test_unreachable_embedder_falls_back_to_lexical(self, tmp_path):
+        handle_record_decision(decision_params(
+            tmp_path, summary="Use JSON files for storage", tags=["storage"]))
+        # Port 9 (discard) — nothing listens there; connection is refused
+        # immediately and get_context must still return lexical results.
+        result = handle_get_context({
+            "project_dir": str(tmp_path),
+            "query": "storage decision",
+            "semantic": {"enabled": True, "url": "http://127.0.0.1:9"},
+        })
+        assert result["entries_returned"] >= 1

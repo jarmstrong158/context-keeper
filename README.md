@@ -27,6 +27,15 @@ Context Keeper gives Claude 10 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero external dependencies.
 
+## v0.5: Data Integrity + Retrieval Fixes
+
+- **Atomic writes.** Entry files are written to a temp file and swapped in with `os.replace`, so a crash mid-write can no longer leave a truncated JSON file behind.
+- **Corrupt-store protection.** If an entry file exists but can't be parsed, `record_*`/`update_entry`/`deprecate_entry` now refuse to write (previously a corrupt file read as empty, and the next record silently replaced your entire history with one entry). Read-only tools still degrade gracefully.
+- **`update_entry` enforces the schema.** Structured fields (`why_chosen`, `problem`, `reason`, `purpose`, ...) are min-length validated on update too, so entries can't be hollowed out after recording.
+- **Better budget packing.** `get_context` skips entries that don't fit the token budget and keeps packing smaller ones, instead of stopping at the first oversized entry.
+- **Fresh compaction reports.** The SessionStart hook now runs the snapshot comparison itself (SessionStart fires with source `compact` immediately after compaction — before any Stop), so the injected report is never one compaction stale. It also injects a one-line quality-scan nudge, which is the model-visible surface for `verify_quality` (PreCompact stdout is only shown to the user, not the model).
+- **Semantic layer shipped in the package** (`semantic_index.py` was missing from the wheel/sdist), with batched embedding requests and one fewer HTTP round-trip per query.
+
 ## v0.4: Structured Rationale + Arc Linking
 
 Earlier versions used a single freeform `rationale` field. In practice, agents wrote one-line summaries instead of full reasoning — defeating the point. v0.4 fixes this three ways:
@@ -176,10 +185,10 @@ Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEE
 
 The hooks form a complete capture-and-retrieval loop:
 
-- **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report) straight to stdout, which Claude Code injects into context at turn one. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
+- **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report and a one-line quality-scan nudge) straight to stdout, which Claude Code injects into context at turn one. It also runs the post-compaction snapshot comparison itself before reading the report — SessionStart fires with source `compact` immediately after compaction, before any Stop hook, so this keeps the injected report fresh. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
 - **PostToolUse (Bash)** — fires after every Bash tool call; when the command contains `git commit`, it injects a reminder to record the matching decision/constraint/gotcha **in the same work cycle**. A commit is the single best capture trigger — it's the exact moment something became real enough to persist in version control. Born from field use: during incident-heavy sessions the agent batched capture "for later," and the user had to ask "update context keeper" three times in one night while a dozen commits shipped
-- **PreCompact** — snapshots all active `.context/` entries, runs a quality scan (`verify_quality`), and prints a capture prompt + any flagged entries (thin reasoning, missing tags, isolated arcs) so Claude can enrich them before context is compressed
-- **Stop** — compares post-compaction state against the snapshot, writes a diff report if anything changed (idempotent — skips if the snapshot hasn't changed since last comparison)
+- **PreCompact** — snapshots all active `.context/` entries and runs a quality scan (`verify_quality`), printing flagged entries (thin reasoning, missing tags, isolated arcs) to the transcript. Note: PreCompact stdout is user-visible only — Claude Code does not inject it into the model's context, which is why the model-visible quality nudge lives in the SessionStart hook instead
+- **Stop** — safety-net run of the same snapshot comparison SessionStart performs, in case the session ends without a new session starting (idempotent — skips if the snapshot hasn't changed since last comparison)
 
 This closes the capture loop: SessionStart injects retrieval at turn one, the commit reminder anchors capture to the moment changes land, PreCompact is the pre-compression safety net, and Stop handles integrity checking. Retrieval is unavoidable; capture is now *prompted at the right moment* rather than left to the agent's discretion mid-task.
 
@@ -208,9 +217,47 @@ Create `.context/config.json` to customize:
   "project_name": "my-project",
   "token_budget": 4000,
   "max_entry_tokens": 1000,
-  "stale_threshold_days": 30
+  "stale_threshold_days": 30,
+  "semantic": {
+    "enabled": false,
+    "weight": 150,
+    "model": "nomic-embed-text",
+    "url": "http://localhost:11434"
+  },
+  "mmr": {
+    "enabled": false,
+    "lambda": 0.7
+  }
 }
 ```
+
+`mmr` (opt-in, default off) reorders the ranked results for **Maximal Marginal
+Relevance**: a candidate is penalized by its lexical similarity to entries already
+chosen, so near-duplicate restatements of one topic don't crowd the token budget
+and a second relevant topic gets a seat. `lambda` trades relevance (1.0 = pure
+relevance order) against diversity. Entries linked by `related_to` are exempt —
+those arcs are meant to surface together. On today's store sizes the effect is
+small (redundancy@5 is already low); it earns its keep as a store grows and
+accumulates superseded/restated entries.
+
+## Semantic Retrieval (opt-in)
+
+By default, `get_context` ranks entries with pure lexical matching (tag + word
+overlap) — zero dependencies, works offline. The weakness is **vocabulary
+mismatch**: a query about a "value network diverging" won't find the decision
+about a "value head saturating", because they share no keywords.
+
+Setting `semantic.enabled: true` blends an embedding-cosine signal into the
+ranking, using a local [Ollama](https://ollama.com) server
+(`ollama pull nomic-embed-text`). On a held-out eval across three real project
+stores this lifted **hit@5 from 80% to 93% and MRR from 0.63 to 0.88** (the
+retrieval harness lives in [`evals/`](evals/)). Entry embeddings are cached per
+store in `.context/embeddings.json`, keyed by a hash of the entry text, so an
+edited entry is re-embedded automatically.
+
+It is strictly additive and fail-safe: if Ollama is unreachable or the model is
+missing, retrieval silently falls back to lexical ranking. The default stays
+`enabled: false`, so zero-dependency remains the out-of-the-box behavior.
 
 ## Cross-Project Context
 
