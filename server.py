@@ -157,6 +157,25 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "Tags for categorization and retrieval",
                 },
+                "retrieval_hints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional but encouraged: 2-4 alternate phrasings a future session "
+                        "might search for (synonyms, symptom descriptions, error messages). "
+                        "Indexed for retrieval — rescues vocabulary-mismatch queries without "
+                        "needing embeddings."
+                    ),
+                },
+                "origin": {
+                    "type": "string",
+                    "enum": ["user", "agent", "import"],
+                    "description": (
+                        "Who authored this entry: 'user' = the user explicitly stated it, "
+                        "'agent' = inferred from the session, 'import' = backfilled or "
+                        "migrated. User-origin entries rank higher at retrieval. Default: agent."
+                    ),
+                },
                 "rationale": {
                     "type": "string",
                     "description": (
@@ -222,6 +241,19 @@ TOOLS = [
                     "description": "IDs of related entries (decisions, constraints, other pipelines)",
                 },
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "retrieval_hints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional: 2-4 alternate phrasings a future session might search for. "
+                        "Indexed for retrieval."
+                    ),
+                },
+                "origin": {
+                    "type": "string",
+                    "enum": ["user", "agent", "import"],
+                    "description": "Who authored this entry (user/agent/import). Default: agent.",
+                },
                 "project_dir": {
                     "type": "string",
                     "description": "Absolute path to the target project. Creates .context/ if needed.",
@@ -272,6 +304,19 @@ TOOLS = [
                     "description": "IDs of related entries (the decision that created this constraint, etc.)",
                 },
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "retrieval_hints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional: 2-4 alternate phrasings a future session might search for. "
+                        "Indexed for retrieval."
+                    ),
+                },
+                "origin": {
+                    "type": "string",
+                    "enum": ["user", "agent", "import"],
+                    "description": "Who authored this entry (user/agent/import). Default: agent.",
+                },
                 "project_dir": {
                     "type": "string",
                     "description": "Absolute path to the target project. Creates .context/ if needed.",
@@ -306,6 +351,20 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string", "enum": ["decisions", "pipelines", "constraints"]},
                     "description": "Limit to specific entry types. Default: all.",
+                },
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Temporal filter: only entries verified/created on or after this ISO "
+                        "date (e.g. '2026-06-01' or full ISO timestamp)."
+                    ),
+                },
+                "before": {
+                    "type": "string",
+                    "description": (
+                        "Temporal filter: only entries verified/created strictly before this "
+                        "ISO date."
+                    ),
                 },
                 "include_related": {
                     "type": "boolean",
@@ -549,6 +608,30 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso_utc(raw):
+    """Parse an ISO date/timestamp into an aware UTC datetime, or None.
+
+    Accepts date-only strings ('2026-06-01') and full timestamps; naive
+    values are assumed UTC so they compare safely against stored
+    (timezone-aware) entry timestamps.
+    """
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _entry_timestamp(entry):
+    """The timestamp used for recency and temporal filtering."""
+    return _parse_iso_utc(
+        entry.get("verified_at") or entry.get("updated_at") or entry.get("created_at"))
+
+
 # ============================================================
 # Scoring & token estimation
 # ============================================================
@@ -578,6 +661,10 @@ def _text_words(entry):
             parts.append(val.lower())
     for tag in entry.get("tags", []):
         parts.append(tag.lower())
+    # Anticipated-query hints: alternate phrasings supplied at record time,
+    # indexed so vocabulary-mismatch queries hit without embeddings.
+    for hint in entry.get("retrieval_hints", []) or []:
+        parts.append(str(hint).lower())
     # Include step actions for pipelines
     for step in entry.get("steps", []):
         action = step.get("action", "")
@@ -640,6 +727,13 @@ def score_entry(entry, query_tags=None, query_text=None, scope=None, now_dt=None
         score += 20
     elif status == "superseded":
         score += 5
+
+    # Origin trust (0-10): user-stated entries outrank agent-inferred,
+    # which outrank imported/backfilled. Entries without an origin
+    # (pre-v0.7) score as agent — a uniform shift that preserves their
+    # relative order.
+    origin = entry.get("origin", "agent")
+    score += {"user": 10, "agent": 5, "import": 2}.get(origin, 5)
 
     return score
 
@@ -813,6 +907,15 @@ def _check_min_lengths(params, requirements):
     return None
 
 
+_VALID_ORIGINS = {"user", "agent", "import"}
+
+
+def _origin_from_params(params):
+    """Coerce the origin field to a valid source level (default: agent)."""
+    origin = params.get("origin", "agent")
+    return origin if origin in _VALID_ORIGINS else "agent"
+
+
 # ============================================================
 # Similar-entry surfacing (dedup / conflict detection at capture)
 # ============================================================
@@ -930,6 +1033,8 @@ def handle_record_decision(params):
         "constraints_created": params.get("constraints_created", []),
         "related_to": params.get("related_to", []),
         "tags": params.get("tags", []),
+        "retrieval_hints": params.get("retrieval_hints", []),
+        "origin": _origin_from_params(params),
         "schema_version": 4,
         "status": "active",
         "superseded_by": None,
@@ -976,6 +1081,8 @@ def handle_record_pipeline(params):
         "constraints": params.get("constraints", []),
         "related_to": params.get("related_to", []),
         "tags": params.get("tags", []),
+        "retrieval_hints": params.get("retrieval_hints", []),
+        "origin": _origin_from_params(params),
         "schema_version": 4,
         "status": "active",
         "created_at": now_iso(),
@@ -1012,6 +1119,8 @@ def handle_record_constraint(params):
         "hardness": params.get("hardness", "absolute"),
         "related_to": params.get("related_to", []),
         "tags": params.get("tags", []),
+        "retrieval_hints": params.get("retrieval_hints", []),
+        "origin": _origin_from_params(params),
         "schema_version": 4,
         "status": "active",
         "created_at": now_iso(),
@@ -1066,6 +1175,24 @@ def handle_get_context(params):
 
     # Filter out deprecated
     typed_entries = [(t, e) for t, e in typed_entries if e.get("status", "active") != "deprecated"]
+
+    # Temporal filter (timeline view): since/before against the entry's
+    # verified/created timestamp. Entries with unparseable timestamps are
+    # excluded while a temporal filter is active — they can't satisfy it.
+    since_dt = _parse_iso_utc(params.get("since"))
+    before_dt = _parse_iso_utc(params.get("before"))
+    if since_dt or before_dt:
+        filtered = []
+        for t, e in typed_entries:
+            ts = _entry_timestamp(e)
+            if ts is None:
+                continue
+            if since_dt and ts < since_dt:
+                continue
+            if before_dt and ts >= before_dt:
+                continue
+            filtered.append((t, e))
+        typed_entries = filtered
 
     # Optional semantic blend — opt-in via config "semantic.enabled" (or a per-call
     # params["semantic"] override). Adds embedding-cosine signal to rescue
@@ -1568,7 +1695,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.6.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.7.0"},
                 },
             }
         elif method == "notifications/initialized":

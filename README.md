@@ -27,6 +27,12 @@ Context Keeper gives Claude 10 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero external dependencies.
 
+## v0.7: Anticipated Queries, Origin Trust, Timeline Filters
+
+- **`retrieval_hints`** (all `record_*` tools): 2-4 alternate phrasings a future session might search for — synonyms, symptom descriptions, error messages. Indexed for both lexical and semantic retrieval, so vocabulary-mismatch queries ("value network diverging" vs. "value head saturating") can hit without embeddings. The zero-dependency complement to the semantic blend.
+- **`origin` + trust weighting** (all `record_*` tools): entries record who authored them — `user` (explicitly stated), `agent` (inferred from the session), or `import` (backfilled). Retrieval scoring gives user-stated entries a trust boost over agent-inferred, which outrank imports. Pre-v0.7 entries score as `agent`, preserving their relative order.
+- **`since` / `before` on `get_context`**: temporal filters against each entry's verified/created timestamp — "what did we decide this month" is now a query.
+
 ## v0.6: Capture-Time Guardrails
 
 - **Scoped constraint injection.** New `scope_guard.py` hook (PostToolUse on `Edit|Write|NotebookEdit`): the moment the agent edits a file covered by a constraint's `scope`, that constraint is injected into context via `additionalContext`. Session-start injection briefs the model once at turn one; this enforces the rule at the exact moment it's about to matter. Each constraint fires at most once per session.
@@ -80,6 +86,37 @@ Add to your `claude_desktop_config.json`:
   }
 }
 ```
+
+### Other MCP clients (Cursor, Codex CLI, Gemini CLI, Windsurf, ...)
+
+The server is a standard stdio MCP server, so any MCP-capable client can use it — the hooks are Claude Code extras, not requirements. Point your client's MCP config at `python /path/to/context-keeper/server.py` and set `CONTEXT_KEEPER_PROJECT`:
+
+**Cursor** (`~/.cursor/mcp.json` or per-project `.cursor/mcp.json`) and **Windsurf** (`~/.codeium/windsurf/mcp_config.json`) use the same shape as Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "context-keeper": {
+      "command": "python",
+      "args": ["/path/to/context-keeper/server.py"],
+      "env": { "CONTEXT_KEEPER_PROJECT": "/path/to/your/project" }
+    }
+  }
+}
+```
+
+**OpenAI Codex CLI** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.context-keeper]
+command = "python"
+args = ["/path/to/context-keeper/server.py"]
+env = { "CONTEXT_KEEPER_PROJECT" = "/path/to/your/project" }
+```
+
+**Gemini CLI** (`~/.gemini/settings.json`) uses the same `mcpServers` JSON shape as Cursor above.
+
+Without the Claude Code hooks you lose automatic session-start injection and edit-time constraint guards — call `get_project_summary` at conversation start and `record_*` as you work instead (the tool descriptions prompt for this).
 
 Set `CONTEXT_KEEPER_PROJECT` to the root of your project. If omitted, the server resolves the project directory in this order:
 

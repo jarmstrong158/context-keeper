@@ -47,6 +47,10 @@ Call `record_decision` with the v0.4 structured fields:
 
 **Write rationales as mini-narratives, not summaries.** The schema enforces 60-char minimums on `why_chosen`, but the realistic floor for a useful entry is 2-4 sentences per structured field. Future-you cannot recover the "why" you didn't write.
 
+### On every record_* call (v0.7+):
+- **`retrieval_hints`** — add 2-4 alternate phrasings a future session might search for: synonyms, the symptom you saw, the error message. Ask "what would I have typed to find this before I knew its name?" This is what rescues vocabulary-mismatch queries.
+- **`origin`** — set `"user"` when the user explicitly stated the decision/rule in their own words; leave the default `"agent"` when you inferred it from the work; `"import"` for backfills. User-origin entries get a retrieval trust boost, so don't inflate: only claim `user` for things the user actually said.
+
 ### Record a Pipeline when:
 - A multi-step workflow is established (build, deploy, data processing)
 - Steps have ordering dependencies (A must happen before B)

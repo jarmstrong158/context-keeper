@@ -1601,3 +1601,117 @@ class TestScopeGuardHook:
         _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-a")
         again = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-b")
         assert rec["id"] in again
+
+
+# ===========================================================================
+# retrieval_hints: anticipated queries rescue vocabulary mismatch (v0.7)
+# ===========================================================================
+
+
+class TestRetrievalHints:
+    def test_hint_is_stored(self, tmp_path):
+        rec = handle_record_decision(decision_params(
+            tmp_path, retrieval_hints=["value network diverging"]))
+        assert rec["entry"]["retrieval_hints"] == ["value network diverging"]
+
+    def test_query_matching_only_a_hint_finds_the_entry(self, tmp_path):
+        hinted = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Clamp the value head output during training",
+            retrieval_hints=["value network diverging", "critic loss exploding"],
+            tags=["training"],
+        ))
+        handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use cosine schedule for the learning rate",
+            tags=["training"],
+        ))
+        result = handle_get_context({
+            "project_dir": str(tmp_path),
+            "query": "value network diverging",
+            "include_related": False,
+        })
+        assert result["results"][0]["entry"]["id"] == hinted["id"]
+
+
+# ===========================================================================
+# origin + trust weighting (v0.7)
+# ===========================================================================
+
+
+class TestOriginTrust:
+    def test_origin_stored_and_defaults_to_agent(self, tmp_path):
+        rec_user = handle_record_constraint(constraint_params(tmp_path, origin="user"))
+        rec_default = handle_record_constraint(constraint_params(
+            tmp_path, rule="Another rule long enough to record here"))
+        assert rec_user["entry"]["origin"] == "user"
+        assert rec_default["entry"]["origin"] == "agent"
+
+    def test_invalid_origin_coerced_to_agent(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(tmp_path, origin="alien"))
+        assert rec["entry"]["origin"] == "agent"
+
+    def test_user_origin_outranks_agent_origin(self, tmp_path):
+        handle_record_decision(decision_params(
+            tmp_path, summary="Agent inferred this decision entry", tags=["x"]))
+        user_rec = handle_record_decision(decision_params(
+            tmp_path, summary="User explicitly stated this decision entry",
+            tags=["x"], origin="user"))
+        result = handle_get_context({
+            "project_dir": str(tmp_path), "tags": ["x"], "include_related": False,
+        })
+        assert result["results"][0]["entry"]["id"] == user_rec["id"]
+
+
+# ===========================================================================
+# since/before temporal filters (v0.7)
+# ===========================================================================
+
+
+class TestTemporalFilters:
+    def _age_entry(self, tmp_path, entry_id, iso_ts):
+        """Rewrite an entry's timestamps directly on disk."""
+        path = context_dir(tmp_path) / "decisions.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        for e in entries:
+            if e["id"] == entry_id:
+                e["verified_at"] = iso_ts
+                e["created_at"] = iso_ts
+        path.write_text(json.dumps(entries), encoding="utf-8")
+
+    def test_since_excludes_older_entries(self, tmp_path):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="An old decision from last year"))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="A brand new decision from today"))
+        self._age_entry(tmp_path, old["id"], "2025-01-15T12:00:00+00:00")
+
+        result = handle_get_context({
+            "project_dir": str(tmp_path), "since": "2026-01-01",
+            "include_related": False,
+        })
+        ids = [r["entry"]["id"] for r in result["results"]]
+        assert new["id"] in ids
+        assert old["id"] not in ids
+
+    def test_before_excludes_newer_entries(self, tmp_path):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="An old decision from last year"))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="A brand new decision from today"))
+        self._age_entry(tmp_path, old["id"], "2025-01-15T12:00:00+00:00")
+
+        result = handle_get_context({
+            "project_dir": str(tmp_path), "before": "2026-01-01",
+            "include_related": False,
+        })
+        ids = [r["entry"]["id"] for r in result["results"]]
+        assert old["id"] in ids
+        assert new["id"] not in ids
+
+    def test_no_filter_returns_all(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path))
+        result = handle_get_context({
+            "project_dir": str(tmp_path), "include_related": False,
+        })
+        assert result["entries_returned"] == 1

@@ -31,6 +31,7 @@ _TEXT_FIELDS = (
 def entry_text(entry):
     parts = [str(entry[k]) for k in _TEXT_FIELDS if entry.get(k)]
     parts += [str(t) for t in entry.get("tags", [])]
+    parts += [str(h) for h in entry.get("retrieval_hints", []) or []]
     for step in entry.get("steps", []):
         if step.get("action"):
             parts.append(str(step["action"]))
