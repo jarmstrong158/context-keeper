@@ -51,31 +51,54 @@ _EMBED_BATCH_SIZE = 64
 
 
 class _Embedder:
-    def __init__(self, model, url):
+    """Talks to an embedding backend over localhost/remote HTTP, stdlib only.
+
+    Two API shapes are supported via config `semantic.api`:
+      - "ollama" (default): POST {url}/api/embed  -> {"embeddings": [...]}
+      - "openai": POST {url}/v1/embeddings -> {"data": [{"embedding": ...}]}
+        Covers LM Studio, llama.cpp server, OpenAI, and anything else
+        speaking the OpenAI embeddings API. Optional bearer auth via
+        `semantic.api_key_env` (name of an env var holding the key).
+    """
+
+    def __init__(self, model, url, api="ollama", api_key=None):
         self.model = model
         self.url = url.rstrip("/")
+        self.api = api if api in ("ollama", "openai") else "ollama"
+        self.api_key = api_key
+
+    def _prefixed(self, texts, kind):
+        # nomic-embed-text requires task prefixes; other models don't want them.
+        if "nomic" not in self.model.lower():
+            return texts
+        prefix = "search_query: " if kind == "query" else "search_document: "
+        return [prefix + t for t in texts]
 
     def _post(self, texts, kind, timeout):
-        """POST a batch to /api/embed. Ollama accepts a list input and
-        returns one embedding per text. Raises on any failure — callers
-        treat that as 'semantic unavailable' and fall back to lexical."""
-        prefix = "search_query: " if kind == "query" else "search_document: "
-        payload = json.dumps({
-            "model": self.model,
-            "input": [prefix + t for t in texts],
-        }).encode()
-        req = urllib.request.Request(
-            f"{self.url}/api/embed", data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
+        """POST a batch of texts; returns one embedding per text. Raises on
+        any failure — callers treat that as 'semantic unavailable' and fall
+        back to lexical."""
+        texts = self._prefixed(texts, kind)
+        headers = {"Content-Type": "application/json"}
+        if self.api == "openai":
+            endpoint = f"{self.url}/v1/embeddings"
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+        else:
+            endpoint = f"{self.url}/api/embed"
+        payload = json.dumps({"model": self.model, "input": texts}).encode()
+        req = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())["embeddings"]
+            body = json.loads(resp.read())
+        if self.api == "openai":
+            data = sorted(body["data"], key=lambda d: d.get("index", 0))
+            return [d["embedding"] for d in data]
+        return body["embeddings"]
 
     def embed(self, text, kind):
-        # The query embed doubles as the availability check: if Ollama is
-        # down or the model is missing this raises, and query_cosines
-        # returns None. Saves the /api/tags round-trip per query that the
-        # old available() pre-check cost.
+        # The query embed doubles as the availability check: if the backend
+        # is down or the model is missing this raises, and query_cosines
+        # returns None.
         return self._post([text], kind, timeout=10)[0]
 
     def embed_batch(self, texts):
@@ -107,8 +130,14 @@ def query_cosines(query, entries, base_dir, sem_cfg):
     """
     if not query:
         return None
+    api_key = None
+    key_env = sem_cfg.get("api_key_env")
+    if key_env:
+        api_key = os.environ.get(key_env) or None
     emb = _Embedder(sem_cfg.get("model", "nomic-embed-text"),
-                    sem_cfg.get("url", "http://localhost:11434"))
+                    sem_cfg.get("url", "http://localhost:11434"),
+                    api=sem_cfg.get("api", "ollama"),
+                    api_key=api_key)
     try:
         q_vec = emb.embed(query, "query")
     except Exception:

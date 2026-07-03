@@ -1825,6 +1825,80 @@ class TestMarkdownProjection:
 
 
 # ===========================================================================
+# v0.9: summary truncation bug, clustering, trust in similar_entries
+# ===========================================================================
+
+
+class TestSummaryBudgetTruncation:
+    def test_over_budget_summary_is_truncated_not_emptied(self, tmp_path):
+        """Regression: the truncation loop evaluated the ORIGINAL text every
+        iteration, so any store over budget injected an EMPTY summary."""
+        for i in range(30):
+            handle_record_decision(decision_params(
+                tmp_path,
+                summary=f"Decision number {i} with a reasonably long summary line "
+                        f"padded out so thirty of these comfortably exceed budget "
+                        + "x" * 200,
+                tags=[f"topic-{i % 3}"],
+            ))
+        result = handle_get_project_summary({
+            "project_dir": str(tmp_path), "token_budget": 500})
+        summary = result["summary"]
+        # Not empty, within budget, and still carries real content
+        assert len(summary.strip()) > 50
+        assert "Decision number 0" in summary or "Active Decisions" in summary
+        from server import estimate_tokens
+        assert estimate_tokens(summary) <= 500
+
+
+class TestSummaryClustering:
+    def test_small_stores_stay_flat(self, tmp_path):
+        for i in range(3):
+            handle_record_decision(decision_params(
+                tmp_path, summary=f"Small store decision {i}", tags=["alpha"]))
+        result = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert "clustered by topic" not in result["summary"]
+
+    def test_large_stores_cluster_by_topic(self, tmp_path):
+        for i in range(6):
+            handle_record_decision(decision_params(
+                tmp_path, summary=f"Storage related decision {i}", tags=["storage"]))
+        for i in range(5):
+            handle_record_decision(decision_params(
+                tmp_path, summary=f"Hooks related decision {i}", tags=["hooks"]))
+        result = handle_get_project_summary({"project_dir": str(tmp_path)})
+        summary = result["summary"]
+        assert "clustered by topic" in summary
+        assert "storage (6):" in summary
+        assert "hooks (5):" in summary
+
+    def test_untagged_decisions_grouped(self, tmp_path):
+        for i in range(9):
+            params = decision_params(tmp_path, summary=f"Untagged decision {i}")
+            params.pop("tags", None)
+            handle_record_decision(params)
+        result = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert "(untagged) (9):" in result["summary"]
+
+
+class TestSimilarEntriesTrust:
+    def test_matches_carry_origin(self, tmp_path):
+        handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use atomic writes with temp file and os.replace for entries",
+            tags=["storage"], origin="user",
+        ))
+        second = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Entry files use atomic writes via temp file and os.replace",
+            tags=["storage"],
+        ))
+        similar = second.get("similar_entries", [])
+        assert similar and similar[0]["origin"] == "user"
+        assert "origin trust" in second["similar_note"]
+
+
+# ===========================================================================
 # Tool-schema token budget (v0.7.1)
 # ===========================================================================
 

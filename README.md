@@ -28,6 +28,24 @@ Context Keeper gives Claude 11 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
 
+## v0.9: Topic Clustering, More Embedding Backends + a Bug the Measurement Caught
+
+- **Critical fix: empty session-start injection for large stores.** The summary truncation loop evaluated the *original* text in its condition, so any store whose summary exceeded the token budget (~30+ entries) silently popped every line and injected an **empty** summary at session start. Found while measuring token reduction: a 78-entry store was injecting ~0 tokens of memory. Now truncates correctly to budget.
+- **Topic clustering.** Above 8 decisions, `get_project_summary` groups decisions by their most-frequent shared tag instead of one flat list — a 59-decision store reads as a dozen topics.
+- **OpenAI-compatible embeddings.** `semantic.api: "openai"` points the semantic blend at any `/v1/embeddings` endpoint — LM Studio, llama.cpp server, or OpenAI itself (`api_key_env` names the env var holding the key). Ollama stays the default; same fail-safe lexical fallback. nomic task prefixes now apply only to nomic models.
+- **Trust-aware conflict guidance.** `similar_entries` matches now carry each entry's `origin`, and the guidance states the precedence: user-stated overrides agent-inferred overrides imported.
+- **Token-reduction measurement** (`evals/token_reduction.py`), run against four real stores:
+
+| store | active entries | full store (tokens) | injected at session start | reduction |
+|---|---|---|---|---|
+| balatron | 78 | ~75,277 | ~2,057 | 97.3% |
+| clark | 55 | ~35,445 | ~2,102 | 94.1% |
+| context-keeper | 13 | ~5,692 | ~828 | 85.5% |
+| conductor | 9 | ~1,538 | ~411 | 73.3% |
+
+  Baseline = dumping every active entry into context; injected = the `get_project_summary` output the SessionStart hook prints. Honest caveat: the summary is budget-capped (default 2000 tokens), so for large stores part of the reduction is by construction — the meaningful property is that injected cost stays flat as stores grow.
+- **Six more MCP clients documented** (OpenCode, Copilot CLI, Antigravity, OpenClaw, Hermes, pi/oh-my-pi) — see Other MCP clients below.
+
 ## v0.8: DECISIONS.md Projection (render-on-write)
 
 Opt-in: mirror the decisions store into a human-readable `DECISIONS.md` at the project root. Enable in `.context/config.json`:
@@ -131,6 +149,48 @@ env = { "CONTEXT_KEEPER_PROJECT" = "/path/to/your/project" }
 ```
 
 **Gemini CLI** (`~/.gemini/settings.json`) uses the same `mcpServers` JSON shape as Cursor above.
+
+**GitHub Copilot CLI** (`~/.copilot/mcp-config.json`) and **oh-my-pi** (`mcpServers` config) use the `mcpServers` shape with `"type": "stdio"`:
+
+```json
+{
+  "mcpServers": {
+    "context-keeper": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["/path/to/context-keeper/server.py"],
+      "env": { "CONTEXT_KEEPER_PROJECT": "/path/to/your/project" }
+    }
+  }
+}
+```
+
+**OpenCode** (`opencode.json`):
+
+```json
+{
+  "mcp": {
+    "context-keeper": {
+      "type": "local",
+      "command": ["python", "/path/to/context-keeper/server.py"],
+      "environment": { "CONTEXT_KEEPER_PROJECT": "/path/to/your/project" }
+    }
+  }
+}
+```
+
+**Antigravity** (`~/.gemini/config/mcp_config.json` or workspace `.agents/mcp_config.json`) and **OpenClaw** (`openclaw.json`) use the `mcpServers` shape with `command`/`args`, same as Copilot above.
+
+**Hermes** (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  context-keeper:
+    command: "python"
+    args: ["/path/to/context-keeper/server.py"]
+    env:
+      CONTEXT_KEEPER_PROJECT: "/path/to/your/project"
+```
 
 Without the Claude Code hooks you lose automatic session-start injection and edit-time constraint guards — call `get_project_summary` at conversation start and `record_*` as you work instead (the tool descriptions prompt for this).
 
@@ -294,7 +354,9 @@ Create `.context/config.json` to customize:
     "enabled": false,
     "weight": 150,
     "model": "nomic-embed-text",
-    "url": "http://localhost:11434"
+    "url": "http://localhost:11434",
+    "api": "ollama",
+    "api_key_env": ""
   },
   "mmr": {
     "enabled": false,
@@ -330,6 +392,10 @@ edited entry is re-embedded automatically.
 It is strictly additive and fail-safe: if Ollama is unreachable or the model is
 missing, retrieval silently falls back to lexical ranking. The default stays
 `enabled: false`, so zero-dependency remains the out-of-the-box behavior.
+
+Any OpenAI-compatible endpoint works too: set `"api": "openai"` and point `url`
+at an LM Studio / llama.cpp server (`http://localhost:1234`) or OpenAI itself,
+with `"api_key_env"` naming the environment variable that holds the key.
 
 ## Cross-Project Context
 

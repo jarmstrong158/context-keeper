@@ -939,6 +939,7 @@ def _find_similar_entries(new_entry, base_dir, exclude_ids=None, threshold=None)
                     "type": tname,
                     "summary": e.get("summary") or e.get("name") or e.get("rule") or "?",
                     "similarity": round(sim, 2),
+                    "origin": e.get("origin", "agent"),
                 })
     matches.sort(key=lambda m: m["similarity"], reverse=True)
     return matches[:3]
@@ -948,7 +949,9 @@ _SIMILAR_NOTE = (
     "Existing entries overlap heavily with this one. Review them: if this is a "
     "restatement, deprecate this entry and use update_entry on the original "
     "instead; if it contradicts one, resolve the conflict (deprecate_entry with "
-    "superseded_by); if genuinely distinct, link them via related_to."
+    "superseded_by); if genuinely distinct, link them via related_to. "
+    "When entries conflict, origin trust decides the default winner: "
+    "user-stated overrides agent-inferred overrides imported."
 )
 
 
@@ -1439,12 +1442,32 @@ def handle_get_project_summary(params):
         for c in advisory:
             lines.append(f"  [{c['id']}] {c['rule']}")
 
-    if decisions:
+    # Above this many decisions, a flat list stops being scannable —
+    # cluster by topic (most-frequent shared tag) instead.
+    CLUSTER_THRESHOLD = 8
+    if decisions and len(decisions) <= CLUSTER_THRESHOLD:
         lines.append(f"\nActive Decisions ({len(decisions)}):")
         for d in decisions:
             tags = ", ".join(d.get("tags", []))
             tag_str = f" [{tags}]" if tags else ""
             lines.append(f"  [{d['id']}] {d['summary']}{tag_str}")
+    elif decisions:
+        # Assign each decision to its most-frequent tag across the store,
+        # so entries sharing a dominant topic land in the same cluster.
+        tag_freq = {}
+        for d in decisions:
+            for t in d.get("tags", []):
+                tag_freq[t] = tag_freq.get(t, 0) + 1
+        clusters = {}
+        for d in decisions:
+            d_tags = d.get("tags", [])
+            topic = max(d_tags, key=lambda t: tag_freq[t]) if d_tags else "(untagged)"
+            clusters.setdefault(topic, []).append(d)
+        lines.append(f"\nActive Decisions ({len(decisions)}, clustered by topic):")
+        for topic, members in sorted(clusters.items(), key=lambda kv: -len(kv[1])):
+            lines.append(f"  {topic} ({len(members)}):")
+            for d in members:
+                lines.append(f"    [{d['id']}] {d['summary']}")
 
     if pipelines:
         lines.append(f"\nPipelines ({len(pipelines)}):")
@@ -1468,10 +1491,15 @@ def handle_get_project_summary(params):
             except Exception:
                 pass
 
-    # Truncate summary to budget
+    # Truncate summary to budget. The estimate must be recomputed from the
+    # REMAINING lines each iteration — evaluating the original summary_text
+    # in the loop condition never changes, which silently popped every line
+    # and injected an EMPTY summary for any store over budget (found by the
+    # token-reduction measurement: 78-entry stores were injecting ~0 tokens
+    # of memory at session start).
     if estimate_tokens(summary_text) > budget:
-        # Keep constraints, trim decisions/pipelines
-        while estimate_tokens(summary_text) > budget and lines:
+        # Keep constraints (built first), trim decisions/pipelines from the end
+        while lines and estimate_tokens("\n".join(lines)) > budget:
             lines.pop()
         # Don't leave a dangling section header (e.g. "Pipelines (3):") or a
         # trailing blank line after trimming the entries out from under it.
@@ -1828,7 +1856,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.8.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.9.0"},
                 },
             }
         elif method == "notifications/initialized":

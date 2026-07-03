@@ -1,5 +1,27 @@
 # context-keeper retrieval evals
 
+## Token reduction (`token_reduction.py`)
+
+Measures what session-start injection costs vs. the naive baseline of dumping
+the full store into context: `python token_reduction.py <project_dir> ...`.
+Results across four real stores (2026-07-03):
+
+| store | active entries | full store (tokens) | injected at session start | reduction |
+|---|---|---|---|---|
+| balatron | 78 | ~75,277 | ~2,057 | 97.3% |
+| clark | 55 | ~35,445 | ~2,102 | 94.1% |
+| context-keeper | 13 | ~5,692 | ~828 | 85.5% |
+| conductor | 9 | ~1,538 | ~411 | 73.3% |
+
+Caveats stated in the script: token counts are the server's chars/4 estimate
+(same estimator on both sides, so the ratio is meaningful), and the summary is
+budget-capped, so large-store reduction is partly by construction — the real
+property is injected cost staying flat as stores grow. Running this
+measurement found a real bug: the truncation loop never recomputed its
+estimate, so over-budget stores injected an *empty* summary (fixed in v0.9).
+
+## Retrieval quality
+
 Measures the one thing the test suite doesn't: **given a natural-language query a
 future session would actually ask, does `get_context` surface the entry that
 answers it?** Built on [llm-evals](../../llm-evals) as the engine.
