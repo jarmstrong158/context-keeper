@@ -66,6 +66,7 @@ Call `record_pipeline` with:
 
 Call `record_constraint` with:
 - `rule`, `scope`, `hardness` (absolute for true invariants, advisory for preferences)
+- Set `scope` to a real file/directory path (e.g. `hooks/`, `server.py`) whenever the rule is localized — the scope_guard hook re-injects scoped constraints at the moment a covered file is edited, so a precise scope turns the rule into an active guardrail instead of a session-start memo
 - `reason` (required, ≥40 chars) — what goes wrong if it's violated, concretely
 - `triggering_incident` (optional but encouraged) — the specific bug/gotcha/incident that led to this rule (concrete > abstract for future sessions)
 - `related_to` (link to the decision that created this constraint, etc.), `tags`
@@ -84,6 +85,12 @@ Call `get_context` with relevant tags to find the decision with its rationale.
 
 ### Before modifying a pipeline:
 Call `get_context` with the pipeline name or tags to see the current flow and its constraints.
+
+## Acting on similar_entries (v0.6+)
+When a `record_*` call succeeds but the response includes `similar_entries`, do not ignore it. Those are existing active entries whose text heavily overlaps what you just recorded. Resolve immediately, while you still have context:
+- **Restatement** — deprecate the entry you just created and `update_entry` the original instead (or vice versa if yours is richer).
+- **Contradiction** — decide which is current; `deprecate_entry` the loser with `superseded_by` pointing at the winner.
+- **Genuinely distinct** — link them: `update_entry` your new entry with `related_to` including the similar ids.
 
 ## When NOT to Record
 - Trivial implementation details (variable names, formatting choices)

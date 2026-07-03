@@ -27,6 +27,11 @@ Context Keeper gives Claude 10 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero external dependencies.
 
+## v0.6: Capture-Time Guardrails
+
+- **Scoped constraint injection.** New `scope_guard.py` hook (PostToolUse on `Edit|Write|NotebookEdit`): the moment the agent edits a file covered by a constraint's `scope`, that constraint is injected into context via `additionalContext`. Session-start injection briefs the model once at turn one; this enforces the rule at the exact moment it's about to matter. Each constraint fires at most once per session.
+- **Similar-entry surfacing at record time.** `record_*` now compares the new entry against the store (word-set Jaccard, threshold configurable via `similar_threshold`) and returns `similar_entries` when existing entries overlap heavily — catching restatements and contradictions at capture instead of relying on MMR to mitigate duplicates at retrieval. Advisory only: the write always proceeds.
+
 ## v0.5: Data Integrity + Retrieval Fixes
 
 - **Atomic writes.** Entry files are written to a temp file and swapped in with `os.replace`, so a crash mid-write can no longer leave a truncated JSON file behind.
@@ -173,6 +178,15 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
             "command": "python /path/to/context-keeper/hooks/commit_capture_reminder.py"
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/context-keeper/hooks/scope_guard.py"
+          }
+        ]
       }
     ]
   }
@@ -187,6 +201,7 @@ The hooks form a complete capture-and-retrieval loop:
 
 - **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report and a one-line quality-scan nudge) straight to stdout, which Claude Code injects into context at turn one. It also runs the post-compaction snapshot comparison itself before reading the report — SessionStart fires with source `compact` immediately after compaction, before any Stop hook, so this keeps the injected report fresh. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
 - **PostToolUse (Bash)** — fires after every Bash tool call; when the command contains `git commit`, it injects a reminder to record the matching decision/constraint/gotcha **in the same work cycle**. A commit is the single best capture trigger — it's the exact moment something became real enough to persist in version control. Born from field use: during incident-heavy sessions the agent batched capture "for later," and the user had to ask "update context keeper" three times in one night while a dozen commits shipped
+- **PostToolUse (Edit|Write)** — `scope_guard.py`: when the agent edits a file covered by a constraint's `scope` (e.g. a constraint scoped to `hooks/` and an edit to `hooks/session_start.py`), that constraint is injected right then via `additionalContext`. Session start briefs the rules; this enforces them at the moment of edit. Once per constraint per session
 - **PreCompact** — snapshots all active `.context/` entries and runs a quality scan (`verify_quality`), printing flagged entries (thin reasoning, missing tags, isolated arcs) to the transcript. Note: PreCompact stdout is user-visible only — Claude Code does not inject it into the model's context, which is why the model-visible quality nudge lives in the SessionStart hook instead
 - **Stop** — safety-net run of the same snapshot comparison SessionStart performs, in case the session ends without a new session starting (idempotent — skips if the snapshot hasn't changed since last comparison)
 

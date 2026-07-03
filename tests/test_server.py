@@ -1481,3 +1481,123 @@ class TestSemanticFallback:
             "semantic": {"enabled": True, "url": "http://127.0.0.1:9"},
         })
         assert result["entries_returned"] >= 1
+
+
+# ===========================================================================
+# Similar-entry surfacing at record time (v0.6)
+# ===========================================================================
+
+
+class TestSimilarEntrySurfacing:
+    def test_near_duplicate_is_flagged(self, tmp_path):
+        first = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use atomic writes with temp file and os.replace for entry files",
+            tags=["storage", "data-integrity"],
+        ))
+        second = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Entry files use atomic writes via temp file and os.replace",
+            tags=["storage", "data-integrity"],
+        ))
+        assert second["success"] is True  # write proceeds, advisory only
+        flagged_ids = [m["id"] for m in second.get("similar_entries", [])]
+        assert first["id"] in flagged_ids
+        assert "similar_note" in second
+
+    def test_unrelated_entries_not_flagged(self, tmp_path):
+        handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use atomic writes for entry files on disk",
+            problem="Crash mid-write corrupted the JSON store and destroyed recorded history.",
+            why_chosen="Atomic replace keeps the old file intact until the new one is complete on disk.",
+            tags=["storage"],
+        ))
+        second = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Never run the scheduler binary from source",
+            reason="Running from source skips the packaged environment and breaks scheduled job discovery.",
+            tags=["scheduler"],
+        ))
+        assert second["success"] is True
+        assert "similar_entries" not in second
+
+    def test_related_to_links_are_excluded(self, tmp_path):
+        first = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use atomic writes with temp file and os.replace for entry files",
+            tags=["storage", "data-integrity"],
+        ))
+        second = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Entry files use atomic writes via temp file and os.replace",
+            tags=["storage", "data-integrity"],
+            related_to=[first["id"]],
+        ))
+        # Caller already acknowledged the relation — no warning needed.
+        flagged_ids = [m["id"] for m in second.get("similar_entries", [])]
+        assert first["id"] not in flagged_ids
+
+
+# ===========================================================================
+# scope_guard hook (v0.6): edit-time injection of scoped constraints
+# ===========================================================================
+
+import subprocess
+
+_HOOK = str(Path(__file__).parent.parent / "hooks" / "scope_guard.py")
+
+
+def _run_scope_guard(project: Path, file_path: str, session_id: str = "s1"):
+    payload = json.dumps({
+        "session_id": session_id,
+        "tool_name": "Edit",
+        "tool_input": {"file_path": file_path},
+    })
+    env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
+    proc = subprocess.run(
+        [sys.executable, _HOOK], input=payload, capture_output=True,
+        text=True, env=env, timeout=30,
+    )
+    return proc.stdout.strip()
+
+
+class TestScopeGuardHook:
+    def _record_scoped(self, tmp_path):
+        return handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Hook output must be ASCII only in this project",
+            scope="hooks/",
+            tags=["hooks"],
+        ))
+
+    def test_scoped_constraint_fires_on_matching_edit(self, tmp_path):
+        rec = self._record_scoped(tmp_path)
+        out = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "session_start.py"))
+        assert rec["id"] in out
+        data = json.loads(out)
+        assert "additionalContext" in data["hookSpecificOutput"]
+
+    def test_global_constraint_does_not_fire(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="A global rule that applies everywhere in the project"))
+        out = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "x.py"))
+        assert out == ""
+
+    def test_non_matching_path_does_not_fire(self, tmp_path):
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(tmp_path, str(tmp_path / "src" / "main.py"))
+        assert out == ""
+
+    def test_fires_once_per_session(self, tmp_path):
+        rec = self._record_scoped(tmp_path)
+        first = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-a")
+        second = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "b.py"), "sess-a")
+        assert rec["id"] in first
+        assert second == ""
+
+    def test_new_session_fires_again(self, tmp_path):
+        rec = self._record_scoped(tmp_path)
+        _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-a")
+        again = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-b")
+        assert rec["id"] in again

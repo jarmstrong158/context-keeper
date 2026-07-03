@@ -814,6 +814,81 @@ def _check_min_lengths(params, requirements):
 
 
 # ============================================================
+# Similar-entry surfacing (dedup / conflict detection at capture)
+# ============================================================
+
+# Word-set Jaccard at or above this flags an existing entry as similar.
+# Overridable per store via config "similar_threshold".
+DEFAULT_SIMILAR_THRESHOLD = 0.30
+
+
+def _find_similar_entries(new_entry, base_dir, exclude_ids=None, threshold=None):
+    """Compare a new entry's text against all active entries in the store.
+
+    Returns a list of {id, type, summary, similarity} for entries whose
+    word-set Jaccard similarity meets the threshold, most similar first
+    (top 3). Entries the caller already linked via related_to are
+    excluded — those are acknowledged relations, not accidental
+    restatements.
+
+    Purpose: surface near-duplicates and potential contradictions at
+    capture time, so the store doesn't accumulate restatements that MMR
+    then has to mitigate at retrieval time. Advisory only — the write
+    always proceeds.
+    """
+    if threshold is None:
+        threshold = read_config(base_dir).get("similar_threshold", DEFAULT_SIMILAR_THRESHOLD)
+    exclude = set(exclude_ids or [])
+    new_words = _text_words(new_entry)
+    if not new_words:
+        return []
+
+    paths = _resolve_paths(base_dir)
+    if paths is None:
+        return []
+
+    matches = []
+    for tname, tpath in paths.items():
+        for e in read_json_file(tpath):
+            eid = e.get("id")
+            if not eid or eid in exclude or eid == new_entry.get("id"):
+                continue
+            if e.get("status", "active") == "deprecated":
+                continue
+            sim = _jaccard(new_words, _text_words(e))
+            if sim >= threshold:
+                matches.append({
+                    "id": eid,
+                    "type": tname,
+                    "summary": e.get("summary") or e.get("name") or e.get("rule") or "?",
+                    "similarity": round(sim, 2),
+                })
+    matches.sort(key=lambda m: m["similarity"], reverse=True)
+    return matches[:3]
+
+
+_SIMILAR_NOTE = (
+    "Existing entries overlap heavily with this one. Review them: if this is a "
+    "restatement, deprecate this entry and use update_entry on the original "
+    "instead; if it contradicts one, resolve the conflict (deprecate_entry with "
+    "superseded_by); if genuinely distinct, link them via related_to."
+)
+
+
+def _attach_similar(result, entry, base_dir):
+    """Add similar-entry warnings to a successful record_* result."""
+    try:
+        similar = _find_similar_entries(
+            entry, base_dir, exclude_ids=entry.get("related_to") or [])
+    except Exception:
+        return result
+    if similar:
+        result["similar_entries"] = similar
+        result["similar_note"] = _SIMILAR_NOTE
+    return result
+
+
+# ============================================================
 # Tool handlers
 # ============================================================
 
@@ -868,7 +943,7 @@ def handle_record_decision(params):
         entry["rationale"] = params["rationale"]
     entries.append(entry)
     write_json_file(dec_path, entries)
-    return {"success": True, "id": entry["id"], "entry": entry}
+    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
 
 def handle_record_pipeline(params):
@@ -908,7 +983,7 @@ def handle_record_pipeline(params):
     }
     entries.append(entry)
     write_json_file(pipe_path, entries)
-    return {"success": True, "id": entry["id"], "entry": entry}
+    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
 
 def handle_record_constraint(params):
@@ -944,7 +1019,7 @@ def handle_record_constraint(params):
     }
     entries.append(entry)
     write_json_file(con_path, entries)
-    return {"success": True, "id": entry["id"], "entry": entry}
+    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
 
 def handle_get_context(params):
@@ -1493,7 +1568,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.5.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.6.0"},
                 },
             }
         elif method == "notifications/initialized":
