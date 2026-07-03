@@ -90,42 +90,31 @@ TOOLS = [
     {
         "name": "record_decision",
         "description": (
-            "Record an architectural or design decision. v0.4 schema: rationale is split "
-            "into structured fields (problem, why_chosen, what_we_tried, tradeoffs) so future "
-            "sessions can recover the full why, not just a summary. Min-length validation is "
-            "enforced server-side — thin entries are rejected with guidance."
+            "Record an architectural or design decision with structured rationale. "
+            "Min lengths enforced server-side; thin entries are rejected with guidance."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "summary": {"type": "string", "description": "What was decided (1-2 sentences). Min 20 chars."},
+                "summary": {"type": "string", "description": "What was decided (1-2 sentences)."},
                 "problem": {
                     "type": "string",
-                    "description": (
-                        "What forced this decision? Describe the problem context, the trigger, "
-                        "and what was at stake. 1-3 sentences. Min 40 chars."
-                    ),
+                    "description": "What forced this decision — trigger, context, stakes. Min 40 chars.",
                 },
                 "why_chosen": {
                     "type": "string",
                     "description": (
-                        "Actual reasoning. Why this option specifically? What evidence, principle, "
-                        "or constraint drove the choice? 2-4 sentences. Min 60 chars."
+                        "The actual reasoning: evidence, principle, or constraint behind the "
+                        "choice. 2-4 sentences, min 60 chars."
                     ),
                 },
                 "what_we_tried": {
                     "type": "string",
-                    "description": (
-                        "Optional but encouraged: prior attempts that didn't work, dead ends "
-                        "explored, hypotheses ruled out. The 'we tried X 3 times before Y' arc."
-                    ),
+                    "description": "Prior attempts and dead ends — the 'tried X before Y' arc. Encouraged.",
                 },
                 "tradeoffs": {
                     "type": "string",
-                    "description": (
-                        "Optional but encouraged: what was given up by choosing this. "
-                        "Future sessions need to know the cost, not just the benefit."
-                    ),
+                    "description": "What was given up by choosing this. Encouraged.",
                 },
                 "alternatives": {
                     "type": "array",
@@ -136,7 +125,7 @@ TOOLS = [
                             "reason_rejected": {"type": "string"},
                         },
                     },
-                    "description": "Other options considered and why they were rejected",
+                    "description": "Options considered and why rejected",
                 },
                 "constraints_created": {
                     "type": "array",
@@ -147,9 +136,8 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "IDs of related entries (e.g. ['dec-005', 'con-006']). Use this to "
-                        "link entries from the same arc — get_context can traverse the graph "
-                        "and surface connective tissue that would otherwise be lost."
+                        "IDs of related entries (e.g. ['dec-005', 'con-006']); "
+                        "get_context traverses these links."
                     ),
                 },
                 "tags": {
@@ -161,28 +149,22 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Optional but encouraged: 2-4 alternate phrasings a future session "
-                        "might search for (synonyms, symptom descriptions, error messages). "
-                        "Indexed for retrieval — rescues vocabulary-mismatch queries without "
-                        "needing embeddings."
+                        "2-4 alternate phrasings a future session might search for (synonyms, "
+                        "symptom descriptions, error messages). Indexed for retrieval — rescues "
+                        "vocabulary-mismatch queries without needing embeddings."
                     ),
                 },
                 "origin": {
                     "type": "string",
                     "enum": ["user", "agent", "import"],
                     "description": (
-                        "Who authored this entry: 'user' = the user explicitly stated it, "
-                        "'agent' = inferred from the session, 'import' = backfilled or "
-                        "migrated. User-origin entries rank higher at retrieval. Default: agent."
+                        "'user' = explicitly stated by the user; 'agent' = inferred (default); "
+                        "'import' = backfilled. User-origin ranks higher."
                     ),
                 },
                 "rationale": {
                     "type": "string",
-                    "description": (
-                        "DEPRECATED in v0.4. Provided for backward compatibility only — if "
-                        "supplied without why_chosen, it will be auto-mapped to why_chosen. "
-                        "Prefer the structured fields above."
-                    ),
+                    "description": "DEPRECATED: auto-maps to why_chosen if that field is absent.",
                 },
                 "project_dir": {
                     "type": "string",
@@ -194,28 +176,18 @@ TOOLS = [
     },
     {
         "name": "record_pipeline",
-        "description": (
-            "Record a multi-step workflow or data pipeline that must be followed in order. "
-            "v0.4 schema adds purpose (required) and when_to_invoke (optional) so future "
-            "sessions know not just what the pipeline does but why it exists and when to use it."
-        ),
+        "description": "Record a multi-step workflow that must be followed in order.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Pipeline name"},
                 "purpose": {
                     "type": "string",
-                    "description": (
-                        "Why this pipeline exists. What does it accomplish that ad-hoc steps "
-                        "couldn't? 1-3 sentences. Min 40 chars."
-                    ),
+                    "description": "Why this pipeline exists — what ad-hoc steps couldn't do. Min 40 chars.",
                 },
                 "when_to_invoke": {
                     "type": "string",
-                    "description": (
-                        "Optional but encouraged: what triggers or conditions should make a "
-                        "future session reach for this pipeline? The reusable 'when' knowledge."
-                    ),
+                    "description": "What should make a future session reach for this pipeline. Encouraged.",
                 },
                 "steps": {
                     "type": "array",
@@ -244,10 +216,7 @@ TOOLS = [
                 "retrieval_hints": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "Optional: 2-4 alternate phrasings a future session might search for. "
-                        "Indexed for retrieval."
-                    ),
+                    "description": "2-4 alternate phrasings a future session might search for. Indexed for retrieval.",
                 },
                 "origin": {
                     "type": "string",
@@ -264,32 +233,25 @@ TOOLS = [
     },
     {
         "name": "record_constraint",
-        "description": (
-            "Record a rule or constraint that must be followed in this project. v0.4 schema "
-            "enforces a min-length reason and adds an optional triggering_incident field — "
-            "the gotcha story behind the rule, not just the rule itself."
-        ),
+        "description": "Record a rule or constraint that must be followed in this project.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "rule": {"type": "string", "description": "The constraint in clear imperative language. Min 20 chars."},
+                "rule": {"type": "string", "description": "The constraint in clear imperative language."},
                 "reason": {
                     "type": "string",
-                    "description": (
-                        "Why this constraint exists. What goes wrong if it's violated? 1-3 sentences. "
-                        "Min 40 chars."
-                    ),
+                    "description": "Why this exists — what goes wrong if violated, concretely. Min 40 chars.",
                 },
                 "triggering_incident": {
                     "type": "string",
-                    "description": (
-                        "Optional but encouraged: the specific bug, gotcha, or incident that "
-                        "led to this rule. Concrete > abstract for future sessions."
-                    ),
+                    "description": "The specific bug/gotcha/incident that led to this rule. Encouraged.",
                 },
                 "scope": {
                     "type": "string",
-                    "description": "Where this applies: 'global' for whole project, or a file/module path",
+                    "description": (
+                        "'global', or a file/module path — scoped constraints are re-injected "
+                        "when a covered file is edited (scope_guard hook)."
+                    ),
                     "default": "global",
                 },
                 "hardness": {
@@ -307,10 +269,7 @@ TOOLS = [
                 "retrieval_hints": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "Optional: 2-4 alternate phrasings a future session might search for. "
-                        "Indexed for retrieval."
-                    ),
+                    "description": "2-4 alternate phrasings a future session might search for. Indexed for retrieval.",
                 },
                 "origin": {
                     "type": "string",
@@ -328,9 +287,8 @@ TOOLS = [
     {
         "name": "get_context",
         "description": (
-            "Retrieve relevant project context. Returns decisions, pipelines, and constraints "
-            "sorted by relevance, capped by token budget. Pass an id to fetch a single entry "
-            "at full fidelity."
+            "Retrieve relevant project context ranked by relevance within a token budget. "
+            "Pass an id to fetch a single entry at full fidelity."
         ),
         "inputSchema": {
             "type": "object",
@@ -368,10 +326,7 @@ TOOLS = [
                 },
                 "include_related": {
                     "type": "boolean",
-                    "description": (
-                        "If true, after scoring also pull in entries linked via related_to "
-                        "(depth=1) so arcs come through together. Default: true."
-                    ),
+                    "description": "Also pull entries linked via related_to (depth 1). Default: true.",
                     "default": True,
                 },
                 "project_dir": {
@@ -384,8 +339,8 @@ TOOLS = [
     {
         "name": "get_project_summary",
         "description": (
-            "Return a concise overview of all active context: decisions, pipeline names, "
-            "and absolute constraints. Includes usage guidance. Designed for conversation start."
+            "Concise overview of all active context (constraints, decisions, pipelines). "
+            "Designed for conversation start."
         ),
         "inputSchema": {
             "type": "object",
@@ -464,8 +419,7 @@ TOOLS = [
         "name": "get_compaction_report",
         "description": (
             "Check if the last compaction lost or modified any context entries. "
-            "Call this at session start before get_project_summary. If discrepancies "
-            "are found, surface them to the user before proceeding."
+            "Surface discrepancies to the user before proceeding."
         ),
         "inputSchema": {
             "type": "object",
@@ -480,12 +434,8 @@ TOOLS = [
     {
         "name": "verify_quality",
         "description": (
-            "Scan all entries for quality issues: legacy entries (pre-v0.4 schema, "
-            "missing structured fields), thin reasons/why_chosen text, missing tags, "
-            "isolated entries (no related_to despite tag overlap with siblings). "
-            "Returns flagged entries with specific issues so you can enrich them. "
-            "Auto-called by the PreCompact hook — also call manually before recording "
-            "many entries from one arc, or when get_project_summary feels too sparse."
+            "Scan entries for quality issues (legacy schema, thin reasoning, missing "
+            "tags, isolated entries) and return them for enrichment via update_entry."
         ),
         "inputSchema": {
             "type": "object",
@@ -1695,7 +1645,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.7.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.7.1"},
                 },
             }
         elif method == "notifications/initialized":

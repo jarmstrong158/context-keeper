@@ -1715,3 +1715,24 @@ class TestTemporalFilters:
             "project_dir": str(tmp_path), "include_related": False,
         })
         assert result["entries_returned"] == 1
+
+
+# ===========================================================================
+# Tool-schema token budget (v0.7.1)
+# ===========================================================================
+
+
+class TestToolSchemaBudget:
+    def test_tools_list_payload_within_budget(self):
+        """Every connected MCP client pays the tools/list payload in context
+        tokens at every session start. Keep it bounded: a new field or a
+        wordier description must fit the budget or consciously raise it here,
+        with the cost acknowledged. Rich guidance belongs in _FIELD_GUIDANCE
+        rejection messages and CLAUDE.md, not in schema descriptions.
+        Measured ~2374 tokens at v0.7.1."""
+        from server import TOOLS, estimate_tokens
+        total = estimate_tokens(json.dumps(TOOLS))
+        assert total <= 2500, (
+            f"tools/list payload is ~{total} tokens (budget: 2500). "
+            "Trim schema descriptions or consciously raise the budget."
+        )
