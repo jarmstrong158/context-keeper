@@ -1899,6 +1899,132 @@ class TestSimilarEntriesTrust:
 
 
 # ===========================================================================
+# v0.10: abstention (no_confident_match) + supersession-as-ranking
+# ===========================================================================
+
+
+class TestAbstention:
+    def _seed(self, tmp_path):
+        handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use atomic temp-file writes with os.replace for the store",
+            problem="A crash mid-write corrupted the JSON file and lost recorded history.",
+            why_chosen="Atomic replace keeps the old file intact until the new one is complete.",
+            tags=["storage", "durability"]))
+
+    def test_no_answer_query_flags_no_confident_match(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_get_context({
+            "project_dir": str(tmp_path),
+            "query": "how does oauth authentication rate limiting work",
+            "include_related": False})
+        assert r.get("no_confident_match") is True
+        assert "guidance" in r
+        assert r["top_relevance"] < 0.20
+
+    def test_no_answer_still_returns_results_not_suppressed(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_get_context({
+            "project_dir": str(tmp_path),
+            "query": "how does oauth authentication work",
+            "include_related": False})
+        # Annotate, don't suppress — the entries are still there, just flagged.
+        assert r["entries_returned"] >= 1
+        assert r.get("no_confident_match") is True
+
+    def test_real_query_not_flagged(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_get_context({
+            "project_dir": str(tmp_path),
+            "query": "why do we use atomic writes for the storage file",
+            "include_related": False})
+        assert r.get("no_confident_match", False) is False
+        assert r["top_relevance"] >= 0.20
+
+    def test_no_query_no_abstention_signal(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_get_context({"project_dir": str(tmp_path), "include_related": False})
+        # Asking for everything is never an abstention case.
+        assert "no_confident_match" not in r
+        assert "top_relevance" not in r
+
+    def test_min_relevance_override(self, tmp_path):
+        self._seed(tmp_path)
+        q = "why do we use atomic writes for the storage file"
+        # Default floor: a strong lexical match is not flagged.
+        assert handle_get_context({
+            "project_dir": str(tmp_path), "query": q,
+            "include_related": False}).get("no_confident_match", False) is False
+        # A floor above the max possible relevance (1.0) makes even it abstain.
+        assert handle_get_context({
+            "project_dir": str(tmp_path), "query": q,
+            "min_relevance": 1.01, "include_related": False}).get("no_confident_match") is True
+
+
+class TestSupersession:
+    def test_supersedes_marks_old_entry(self, tmp_path):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="Store data in flat text files"))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="Store data in JSON instead",
+            supersedes=[old["id"]]))
+        assert new.get("superseded") == [old["id"]]
+        got = handle_get_context({"project_dir": str(tmp_path), "id": old["id"]})
+        assert got["entry"]["status"] == "superseded"
+        assert got["entry"]["superseded_by"] == new["id"]
+
+    def test_superseded_still_recallable_but_demoted(self, tmp_path):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="Use SQLite for the backing store", tags=["storage"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="Use JSON files for the backing store", tags=["storage"],
+            supersedes=[old["id"]]))
+        r = handle_get_context({
+            "project_dir": str(tmp_path), "query": "backing store",
+            "tags": ["storage"], "include_related": False})
+        ids = [x["entry"]["id"] for x in r["results"]]
+        # Superseded entry is NOT filtered out (unlike deprecated)...
+        assert old["id"] in ids
+        # ...but ranks below the current one.
+        assert ids.index(new["id"]) < ids.index(old["id"])
+
+    def test_supersedes_ignores_unknown_and_deprecated_ids(self, tmp_path):
+        dep = handle_record_decision(decision_params(tmp_path, summary="A decision to deprecate"))
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": dep["id"], "reason": "no longer valid at all"})
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="A new decision", supersedes=[dep["id"], "dec-999"]))
+        # Deprecated stays deprecated (not resurrected to superseded); unknown skipped.
+        assert new.get("superseded", []) == []
+        got = handle_get_context({"project_dir": str(tmp_path), "id": dep["id"]})
+        assert got["entry"]["status"] == "deprecated"
+
+    def test_superseded_skipped_by_prune_stale(self, tmp_path):
+        old = handle_record_decision(decision_params(tmp_path, summary="Old approach here"))
+        handle_record_decision(decision_params(
+            tmp_path, summary="New approach here", supersedes=[old["id"]]))
+        # Age the superseded entry far past the threshold.
+        path = context_dir(tmp_path) / "decisions.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        for e in entries:
+            if e["id"] == old["id"]:
+                e["verified_at"] = "2020-01-01T00:00:00+00:00"
+        path.write_text(json.dumps(entries), encoding="utf-8")
+        result = handle_prune_stale({"project_dir": str(tmp_path), "days": 30})
+        stale_ids = [s["id"] for s in result["stale"]]
+        assert old["id"] not in stale_ids
+
+    def test_superseded_marked_in_markdown_projection(self, tmp_path):
+        _enable_md_export(tmp_path)
+        old = handle_record_decision(decision_params(tmp_path, summary="Superseded decision text"))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="Replacement decision text", supersedes=[old["id"]]))
+        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
+        assert "**SUPERSEDED**" in md
+        assert f"by `{new['id']}`" in md
+
+
+# ===========================================================================
 # Tool-schema token budget (v0.7.1)
 # ===========================================================================
 

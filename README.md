@@ -28,6 +28,15 @@ Context Keeper gives Claude 11 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
 
+## v0.10: Abstention + Supersession-as-Ranking
+
+Two ideas adapted from studying [Curion](https://github.com/geanatz/curion), kept dependency-free:
+
+- **`get_context` can now say "I don't have anything relevant."** Previously it always returned its top-scored entries — but the composite score banks ~55 points from recency/status/origin regardless of relevance, so a query with *no* relevant memory silently got a confident-looking result. Measured confabulation was **100%** on no-answer queries (`evals/abstention.py`). Now the response carries `top_relevance` and, when the top entry's tag/text relevance falls below `min_relevance` (config, default 0.20), `no_confident_match: true` with guidance telling the agent not to present the entries as established fact. It **annotates, never suppresses** — weak matches are still returned, so the vocabulary-mismatch recall that `retrieval_hints` and the semantic blend preserve survives. 0.20 is the highest floor with zero false-abstention on the eval set.
+- **Supersession as a ranking signal, not just a filter.** `record_decision` accepts `supersedes: [ids]`: the prior decisions become `superseded` — **demoted in ranking but still recallable** ("why did we change from X?"), distinct from `deprecate_entry` which removes an entry from retrieval entirely. Superseded entries are skipped by `prune_stale`/`verify_quality` (they're intentional history, not stale work) and marked `**SUPERSEDED** by dec-NNN` in the `DECISIONS.md` projection.
+
+Deliberately *not* adopted from Curion: its LLM-controller architecture (an API call on every store and recall). context-keeper stays zero-dependency and offline by default.
+
 ## v0.9: Topic Clustering, More Embedding Backends + a Bug the Measurement Caught
 
 - **Critical fix: empty session-start injection for large stores.** The summary truncation loop evaluated the *original* text in its condition, so any store whose summary exceeded the token budget (~30+ entries) silently popped every line and injected an **empty** summary at session start. Found while measuring token reduction: a 78-entry store was injecting ~0 tokens of memory. Now truncates correctly to budget.
@@ -346,6 +355,7 @@ Create `.context/config.json` to customize:
   "token_budget": 4000,
   "max_entry_tokens": 1000,
   "stale_threshold_days": 30,
+  "min_relevance": 0.20,
   "markdown_export": {
     "enabled": false,
     "path": "DECISIONS.md"

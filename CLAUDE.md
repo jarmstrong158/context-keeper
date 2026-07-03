@@ -96,6 +96,14 @@ When a `record_*` call succeeds but the response includes `similar_entries`, do 
 - **Contradiction** — decide which is current; `deprecate_entry` the loser with `superseded_by` pointing at the winner.
 - **Genuinely distinct** — link them: `update_entry` your new entry with `related_to` including the similar ids.
 
+## Acting on no_confident_match (v0.10+)
+When `get_context` returns `no_confident_match: true`, the top entry's lexical relevance to your query was below the floor — the returned entries are the closest neighbors but probably nothing was recorded on this exact topic. Do **not** present them as established project decisions. Treat it as "no memory on this" unless an entry genuinely fits on inspection. The entries are still included (not suppressed) so you can judge; `top_relevance` is the score.
+
+## Superseding vs deprecating a decision (v0.10+)
+Two different lifecycle actions:
+- **`record_decision(..., supersedes=[old_id])`** — the new decision *replaces* an older one that was correct at the time. The old entry becomes `superseded`: demoted in ranking but still recallable, so "why did we change from X to Y?" still works. Use this for the normal evolution of a decision.
+- **`deprecate_entry(id, reason)`** — the entry was wrong, obsolete, or removed. It is filtered out of retrieval entirely. Use this when the history should *not* surface.
+
 ## When NOT to Record
 - Trivial implementation details (variable names, formatting choices)
 - Temporary workarounds that will be removed

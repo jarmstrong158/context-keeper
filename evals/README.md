@@ -20,6 +20,35 @@ property is injected cost staying flat as stores grow. Running this
 measurement found a real bug: the truncation loop never recomputed its
 estimate, so over-budget stores injected an *empty* summary (fixed in v0.9).
 
+## Abstention (`abstention.py`)
+
+Measures the question hit@k can't: when **nothing relevant** is stored, does
+`get_context` correctly signal `no_confident_match`, or confabulate a
+confident-looking top result? `python abstention.py` sweeps the relevance
+floor and reports the trade-off.
+
+**Finding (2026-07-03):** with no floor, confabulation is **100%** — every
+no-answer query returns a top result that looks like an answer, because the
+composite score banks ~55 points from recency/status/origin regardless of
+relevance. The fix keys the honesty signal on the *relevance signal*
+(tag/text overlap only) and **annotates rather than suppresses** (weak
+matches are still returned, just flagged — so vocab-mismatch recall
+survives).
+
+| floor | TNR (abstain on no-answer) | false-abstention (miss real) |
+|---|---|---|
+| 0.15 | 38% | 0% |
+| **0.20** (default) | **38%** | **0%** |
+| 0.25 | 56% | 3% |
+| 0.30 | 75% | 16% |
+
+0.20 is the highest floor with zero false-abstention (no positive query
+falls below it). Honest limit: hard-negatives that share real topic
+vocabulary ("compaction snapshots" present, "encrypted" absent) score ~0.50
+and still slip through — a lexical signal cannot separate them; the opt-in
+semantic blend is what helps there, and even dense retrieval struggles on
+this (a known-hard problem across the field).
+
 ## Retrieval quality
 
 Measures the one thing the test suite doesn't: **given a natural-language query a

@@ -69,6 +69,11 @@ DEFAULT_CONFIG = {
     "max_entry_tokens": 1000,
     "stale_threshold_days": 30,
     "project_name": "",
+    # Abstention floor: get_context flags no_confident_match when the top
+    # entry's tag/text relevance is below this (0-1). 0.20 is the highest
+    # value with zero false-abstention on the eval set (positive queries
+    # never fall below it). Results are still returned — this only annotates.
+    "min_relevance": 0.20,
     # Opt-in derived projection: regenerate a human-readable DECISIONS.md
     # from decisions.json on every decision write. The markdown is
     # read-only output — never parsed back in, never merged.
@@ -144,6 +149,14 @@ TOOLS = [
                         "get_context traverses these links."
                     ),
                 },
+                "supersedes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "IDs of prior decisions this replaces — marked 'superseded': demoted "
+                        "but still recallable, not deleted like deprecate_entry."
+                    ),
+                },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -154,8 +167,7 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": (
                         "2-4 alternate phrasings a future session might search for (synonyms, "
-                        "symptom descriptions, error messages). Indexed for retrieval — rescues "
-                        "vocabulary-mismatch queries without needing embeddings."
+                        "symptoms, error messages). Indexed for retrieval."
                     ),
                 },
                 "origin": {
@@ -316,17 +328,11 @@ TOOLS = [
                 },
                 "since": {
                     "type": "string",
-                    "description": (
-                        "Temporal filter: only entries verified/created on or after this ISO "
-                        "date (e.g. '2026-06-01' or full ISO timestamp)."
-                    ),
+                    "description": "Only entries verified/created on or after this ISO date.",
                 },
                 "before": {
                     "type": "string",
-                    "description": (
-                        "Temporal filter: only entries verified/created strictly before this "
-                        "ISO date."
-                    ),
+                    "description": "Only entries verified/created strictly before this ISO date.",
                 },
                 "include_related": {
                     "type": "boolean",
@@ -712,6 +718,48 @@ def score_entry(entry, query_tags=None, query_text=None, scope=None, now_dt=None
     return score
 
 
+# Common English + query-filler words that carry no retrieval signal. Small
+# and dependency-free. Used ONLY for the abstention relevance signal below,
+# never for the main ranking (which stays backward-compatible).
+_STOPWORDS = frozenset("""
+a an the this that these those of in on at to for from by with about into over
+and or but if is are was were be been being do does did doing done have has had
+how what why when where which who whom whose it its we our us you your they them
+their i my me can could should would will shall may might must not no nor as so
+than then there here out up down off again once only just also very more most
+""".split())
+
+
+def _relevance_signal(entry, query_tags, query_text):
+    """0-1 estimate of how well this entry matches the QUERY specifically —
+    tag/text overlap only, ignoring recency/status/origin.
+
+    This is the signal the abstention floor keys on. The composite
+    score_entry value is inflated by non-relevance terms (an active,
+    recent, global entry banks ~55 points with zero query overlap), so a
+    totally irrelevant entry can masquerade as a confident hit. This
+    isolates the part that actually reflects "does this answer the query."
+
+    Returns None when no query is given — a bare summary/tag-less request
+    is never an abstention case. Stopwords are dropped so filler like
+    "what/the/we/about" doesn't manufacture overlap on no-answer queries.
+    """
+    sigs = []
+    if query_tags:
+        q = set(t.lower() for t in query_tags)
+        if q:
+            et = set(t.lower() for t in entry.get("tags", []))
+            sigs.append(len(q & et) / len(q))
+    if query_text:
+        qw = {w for w in query_text.lower().split() if w and w not in _STOPWORDS}
+        if qw:
+            ew = _text_words(entry)
+            sigs.append(len(qw & ew) / len(qw))
+    if not sigs:
+        return None
+    return max(sigs)
+
+
 def _jaccard(a, b):
     """Word-set Jaccard similarity of two entries' text (zero-dependency)."""
     if not a or not b:
@@ -930,7 +978,7 @@ def _find_similar_entries(new_entry, base_dir, exclude_ids=None, threshold=None)
             eid = e.get("id")
             if not eid or eid in exclude or eid == new_entry.get("id"):
                 continue
-            if e.get("status", "active") == "deprecated":
+            if e.get("status", "active") in ("deprecated", "superseded"):
                 continue
             sim = _jaccard(new_words, _text_words(e))
             if sim >= threshold:
@@ -1017,8 +1065,12 @@ def render_decisions_markdown(decisions):
         eid = e.get("id", "?")
         title = (e.get("summary") or "").strip() or "(untitled)"
         heading = f"### {title} — {_md_date(e)} (`{eid}`)"
-        if e.get("status", "active") == "deprecated":
+        status = e.get("status", "active")
+        if status == "deprecated":
             heading += " — **DEPRECATED**"
+        elif status == "superseded":
+            sup = e.get("superseded_by")
+            heading += f" — **SUPERSEDED**" + (f" by `{sup}`" if sup else "")
         lines.append(heading)
 
         problem = (e.get("problem") or "").strip()
@@ -1153,9 +1205,33 @@ def handle_record_decision(params):
     if params.get("rationale"):
         entry["rationale"] = params["rationale"]
     entries.append(entry)
+
+    # Supersession: mark prior decisions this one replaces as 'superseded'
+    # in the SAME write, so the store is never momentarily inconsistent.
+    # Superseded != deprecated: the old decision stays recallable (history,
+    # "why did we change from X") but score_entry demotes it. Unknown or
+    # already-deprecated ids are skipped silently — never fail the record.
+    superseded = []
+    supersedes = params.get("supersedes") or []
+    if supersedes:
+        by_id = {e.get("id"): e for e in entries}
+        for sid in supersedes:
+            old = by_id.get(sid)
+            if old is None or old is entry:
+                continue
+            if old.get("status", "active") == "deprecated":
+                continue
+            old["status"] = "superseded"
+            old["superseded_by"] = entry["id"]
+            old["updated_at"] = now_iso()
+            superseded.append(sid)
+
     write_json_file(dec_path, entries)
     _maybe_export_markdown(base_dir)
-    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+    result = {"success": True, "id": entry["id"], "entry": entry}
+    if superseded:
+        result["superseded"] = superseded
+    return _attach_similar(result, entry, base_dir)
 
 
 def handle_record_pipeline(params):
@@ -1395,7 +1471,7 @@ def handle_get_context(params):
             used_tokens += cost
             related_added += 1
 
-    return {
+    response = {
         "results": results,
         "tokens_used": used_tokens,
         "token_budget": budget,
@@ -1403,6 +1479,37 @@ def handle_get_context(params):
         "entries_returned": len(results),
         "related_added": related_added,
     }
+
+    # Abstention signal. The composite score is inflated by recency/status/
+    # origin, so even a totally irrelevant active entry ranks ~55 and looks
+    # confident — meaning a query with NO relevant memory silently gets a
+    # confident-looking top result. Key the honesty signal on the relevance
+    # signal (tag/text overlap only) instead. We ANNOTATE, never suppress:
+    # the vocab-mismatch recall that retrieval_hints and the semantic blend
+    # work to preserve must survive, so weak matches are still returned —
+    # just flagged so the agent doesn't present them as established fact.
+    if (query or tags) and results:
+        min_rel = params.get("min_relevance", cfg.get("min_relevance", 0.20))
+        top_rel = 0.0
+        for r in results:
+            if r.get("via") == "related_to":
+                continue  # arc-pulled, not relevance-ranked against the query
+            sig = _relevance_signal(r["entry"], tags, query)
+            if sig is not None:
+                top_rel = max(top_rel, sig)
+        response["top_relevance"] = round(top_rel, 2)
+        if top_rel < min_rel:
+            response["no_confident_match"] = True
+            response["guidance"] = (
+                "No strongly relevant memory found (lexical relevance "
+                f"{top_rel:.2f} < {min_rel:.2f}). The entries above are the closest "
+                "lexical neighbors, but likely nothing was recorded on this exact "
+                "topic. Do NOT present them as established project decisions — treat "
+                "this as 'no memory on this' unless an entry genuinely fits. If "
+                "semantic retrieval is enabled it has already been blended in."
+            )
+
+    return response
 
 
 def handle_get_project_summary(params):
@@ -1623,7 +1730,9 @@ def handle_prune_stale(params):
     stale = []
     for tname, tpath in paths.items():
         for e in read_json_file(tpath):
-            if e.get("status", "active") == "deprecated":
+            # Superseded entries are intentionally-kept history, not stale
+            # work needing review — skip them like deprecated ones.
+            if e.get("status", "active") in ("deprecated", "superseded"):
                 continue
             verified = e.get("verified_at") or e.get("created_at", "")
             try:
@@ -1703,7 +1812,7 @@ def handle_verify_quality(params):
     all_active = []  # list of (type_name, entry)
     for tname, tpath in paths.items():
         for e in read_json_file(tpath):
-            if e.get("status", "active") == "deprecated":
+            if e.get("status", "active") in ("deprecated", "superseded"):
                 continue
             all_active.append((tname, e))
 
@@ -1856,7 +1965,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.9.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.10.0"},
                 },
             }
         elif method == "notifications/initialized":
