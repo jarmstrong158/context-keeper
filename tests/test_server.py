@@ -1718,6 +1718,113 @@ class TestTemporalFilters:
 
 
 # ===========================================================================
+# DECISIONS.md projection (v0.8): render-on-write + export_markdown
+# ===========================================================================
+
+from server import handle_export_markdown
+
+
+def _enable_md_export(tmp_path, path=None):
+    ctx = context_dir(tmp_path)
+    ctx.mkdir(exist_ok=True)
+    cfg = {"markdown_export": {"enabled": True}}
+    if path:
+        cfg["markdown_export"]["path"] = path
+    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+
+class TestMarkdownProjection:
+    def test_flag_off_by_default_no_file_created(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path))
+        assert not (tmp_path / "DECISIONS.md").exists()
+
+    def test_render_on_write_creates_projection(self, tmp_path):
+        _enable_md_export(tmp_path)
+        rec = handle_record_decision(decision_params(
+            tmp_path, summary="Use JSON files over SQLite"))
+        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
+        assert f"### Use JSON files over SQLite" in md
+        assert f"(`{rec['id']}`)" in md
+        assert "- **Why:**" in md
+        assert "do not edit by hand" in md
+
+    def test_regenerated_whole_hand_edits_clobbered(self, tmp_path):
+        _enable_md_export(tmp_path)
+        handle_record_decision(decision_params(tmp_path, summary="First decision here"))
+        md_path = tmp_path / "DECISIONS.md"
+        md_path.write_text("HAND EDIT THAT MUST NOT SURVIVE", encoding="utf-8")
+        handle_record_decision(decision_params(tmp_path, summary="Second decision here"))
+        md = md_path.read_text(encoding="utf-8")
+        assert "HAND EDIT" not in md
+        assert "First decision here" in md
+        assert "Second decision here" in md
+
+    def test_update_entry_regenerates(self, tmp_path):
+        _enable_md_export(tmp_path)
+        rec = handle_record_decision(decision_params(tmp_path, summary="Original title here"))
+        handle_update_entry({
+            "project_dir": str(tmp_path), "id": rec["id"],
+            "updates": {"summary": "Revised title here"},
+        })
+        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
+        assert "Revised title here" in md
+        assert "Original title here" not in md
+
+    def test_deprecate_regenerates_with_marker(self, tmp_path):
+        _enable_md_export(tmp_path)
+        rec = handle_record_decision(decision_params(tmp_path))
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": rec["id"],
+            "reason": "replaced by a better approach",
+            "superseded_by": "dec-099",
+        })
+        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
+        assert "**DEPRECATED**" in md
+        assert "replaced by a better approach" in md
+        assert "`dec-099`" in md
+
+    def test_non_decision_writes_do_not_render(self, tmp_path):
+        _enable_md_export(tmp_path)
+        handle_record_constraint(constraint_params(tmp_path))
+        assert not (tmp_path / "DECISIONS.md").exists()
+
+    def test_legacy_rationale_renders_as_why(self, tmp_path):
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        legacy = [{
+            "id": "dec-001", "summary": "Legacy entry from before v0.4",
+            "rationale": "The old freeform reasoning text lives here.",
+            "status": "active", "created_at": "2026-01-05T00:00:00+00:00",
+        }]
+        (ctx / "decisions.json").write_text(json.dumps(legacy), encoding="utf-8")
+        result = handle_export_markdown({"project_dir": str(tmp_path)})
+        assert result["success"] is True
+        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
+        assert "- **Why:** The old freeform reasoning text lives here." in md
+        assert "01-05" in md
+
+    def test_export_markdown_backfills_without_flag(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path))
+        assert not (tmp_path / "DECISIONS.md").exists()  # flag off
+        result = handle_export_markdown({"project_dir": str(tmp_path)})
+        assert result["success"] is True
+        assert result["decisions_rendered"] == 1
+        assert (tmp_path / "DECISIONS.md").exists()
+
+    def test_export_markdown_custom_path(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path))
+        result = handle_export_markdown({
+            "project_dir": str(tmp_path), "path": "docs/LOG.md"})
+        assert result["success"] is True
+        # Custom relative path resolves against the project root
+        assert (tmp_path / "docs" / "LOG.md").exists()
+
+    def test_export_markdown_unresolved_project(self, tmp_path):
+        result = handle_export_markdown({"project_dir": str(tmp_path / "nowhere")})
+        assert "error" in result
+
+
+# ===========================================================================
 # Tool-schema token budget (v0.7.1)
 # ===========================================================================
 

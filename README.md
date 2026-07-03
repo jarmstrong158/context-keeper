@@ -10,7 +10,7 @@ As conversations get long, Claude loses the "why" behind earlier decisions. New 
 
 ## The Solution
 
-Context Keeper gives Claude 10 tools to record and retrieve structured project context:
+Context Keeper gives Claude 11 tools to record and retrieve structured project context:
 
 | Tool | Purpose |
 |------|---------|
@@ -24,8 +24,24 @@ Context Keeper gives Claude 10 tools to record and retrieve structured project c
 | `prune_stale` | Find entries not verified recently |
 | `get_compaction_report` | Check if last compaction lost any context |
 | `verify_quality` | Scan entries for thin rationale, missing tags, isolated arcs (auto-called by PreCompact hook) |
+| `export_markdown` | Regenerate `DECISIONS.md` from the decisions store — a derived, read-only projection |
 
-All data stored as human-editable JSON files in `.context/` inside your project directory. Zero external dependencies.
+All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
+
+## v0.8: DECISIONS.md Projection (render-on-write)
+
+Opt-in: mirror the decisions store into a human-readable `DECISIONS.md` at the project root. Enable in `.context/config.json`:
+
+```json
+{ "markdown_export": { "enabled": true, "path": "DECISIONS.md" } }
+```
+
+- **Render-on-write.** Every tool call that mutates a decision (`record_decision`, `update_entry`, `deprecate_entry`) regenerates the entire file from `decisions.json` after the JSON write and before the tool returns — so a subsequent `git commit` captures both in the same commit. Deliberately *not* a git/PostToolUse hook: rendering after the commit snapshot would reintroduce drift.
+- **JSON stays canonical; markdown is derived and read-only.** The file is regenerated whole every time — never appended to, merged, or parsed back in. Hand edits are not preserved; a regenerated projection has no drift surface.
+- **`export_markdown` tool** regenerates on demand (optionally to a custom `path`), so existing repos can backfill without enabling the flag.
+- Pure stdlib string formatting; default behavior with the flag off is byte-for-byte unchanged.
+
+Born from field use: Balatron's `DECISIONS.md` was kept in sync with the store by hand, one mirror-edit per commit. This automates that convention.
 
 ## v0.7: Anticipated Queries, Origin Trust, Timeline Filters
 
@@ -270,6 +286,10 @@ Create `.context/config.json` to customize:
   "token_budget": 4000,
   "max_entry_tokens": 1000,
   "stale_threshold_days": 30,
+  "markdown_export": {
+    "enabled": false,
+    "path": "DECISIONS.md"
+  },
   "semantic": {
     "enabled": false,
     "weight": 150,

@@ -12,7 +12,7 @@ Context Keeper stores data in a `.context/` directory inside a project. The serv
 
 Steps 2 and 3 only resolve to directories that **already** contain `.context/`. The server never creates one implicitly, so you will never silently create a stray `.context/` in the wrong directory. The footgun from earlier versions — where Claude Code was launched from a parent directory and polluted it — is fixed at the code level.
 
-**All 10 tools accept `project_dir`** for explicit cross-project targeting. When cwd doesn't resolve, pass `project_dir` to any tool — including `record_*`.
+**All 11 tools accept `project_dir`** for explicit cross-project targeting. When cwd doesn't resolve, pass `project_dir` to any tool — including `record_*`.
 
 **Still good practice:**
 - When recording to a non-obvious project, confirm with the user which project you're targeting before calling `record_*`.
