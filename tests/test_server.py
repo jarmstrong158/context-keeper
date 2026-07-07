@@ -24,6 +24,7 @@ from server import (
     UNRESOLVED_PROJECT_ERROR,
     _base_dir_from_params,
     _resolve_project_dir,
+    build_constraints_block,
     handle_deprecate_entry,
     handle_get_compaction_report,
     handle_get_context,
@@ -32,6 +33,7 @@ from server import (
     handle_record_constraint,
     handle_record_decision,
     handle_record_pipeline,
+    handle_reload_constraints,
     handle_update_entry,
     next_id,
     read_json_file,
@@ -2036,10 +2038,180 @@ class TestToolSchemaBudget:
         wordier description must fit the budget or consciously raise it here,
         with the cost acknowledged. Rich guidance belongs in _FIELD_GUIDANCE
         rejection messages and CLAUDE.md, not in schema descriptions.
-        Measured ~2374 tokens at v0.7.1."""
+        Measured ~2374 tokens at v0.7.1; ~2579 at v0.11.0 after adding the
+        12th tool (reload_constraints) with a deliberately terse description
+        — budget raised to 2650 to accommodate one more real tool."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 2500, (
-            f"tools/list payload is ~{total} tokens (budget: 2500). "
+        assert total <= 2650, (
+            f"tools/list payload is ~{total} tokens (budget: 2650). "
             "Trim schema descriptions or consciously raise the budget."
         )
+
+
+# ===========================================================================
+# Constraint re-injection (v0.11): mid-session rules refresh
+# ===========================================================================
+
+_REINJECT_HOOK = str(Path(__file__).parent.parent / "hooks" / "constraint_reinject.py")
+
+
+def _write_config(project: Path, cfg: dict):
+    ctx = project / CONTEXT_DIR_NAME
+    ctx.mkdir(parents=True, exist_ok=True)
+    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+
+def _run_reinject(project: Path, session_id: str = "s1"):
+    payload = json.dumps({"session_id": session_id, "tool_name": "Bash"})
+    env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
+    proc = subprocess.run(
+        [sys.executable, _REINJECT_HOOK], input=payload, capture_output=True,
+        text=True, env=env, timeout=30,
+    )
+    return proc.stdout.strip()
+
+
+class TestBuildConstraintsBlock:
+    """The constraints-only block builder and the reload_constraints tool."""
+
+    def test_block_contains_only_constraints(self, tmp_path):
+        # Record one of each entry type; the block must surface only the
+        # constraint, not the decision or pipeline.
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Never bypass the auth middleware", hardness="absolute"))
+        handle_record_decision(decision_params(
+            tmp_path, summary="Adopt JSON store for memory"))
+        handle_record_pipeline(pipeline_params(tmp_path, name="Deploy flow"))
+
+        block = build_constraints_block(str(tmp_path / CONTEXT_DIR_NAME))
+        assert block["initialized"] is True
+        assert block["count"] == 1
+        assert "Never bypass the auth middleware" in block["text"]
+        assert "Absolute Constraints (1):" in block["text"]
+        # No decision / pipeline leakage.
+        assert "JSON store" not in block["text"]
+        assert "Deploy flow" not in block["text"]
+        assert "Decisions" not in block["text"]
+        assert "Pipelines" not in block["text"]
+
+    def test_block_format_matches_session_start(self, tmp_path):
+        # The re-injected block must render constraints identically to the
+        # session-start summary. Extract the constraint lines from the full
+        # summary and assert they appear verbatim in the block.
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Absolute one here", hardness="absolute"))
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Advisory two here", hardness="advisory"))
+        base = str(tmp_path / CONTEXT_DIR_NAME)
+        block = build_constraints_block(base)
+        summary = handle_get_project_summary({"project_dir": str(tmp_path)})["summary"]
+        assert block["text"] in summary
+
+    def test_deprecated_constraints_excluded(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, rule="Soon to be deprecated rule"))
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": rec["id"], "reason": "no longer true"})
+        block = build_constraints_block(str(tmp_path / CONTEXT_DIR_NAME))
+        assert block["count"] == 0
+        assert block["text"] == ""
+
+    def test_no_context_dir_uninitialized(self, tmp_path):
+        block = build_constraints_block(str(tmp_path / "does_not_exist"))
+        assert block["initialized"] is False
+        assert block["count"] == 0
+        assert block["text"] == ""
+
+    def test_reload_tool_returns_current_constraints(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Rule surfaced on demand"))
+        out = handle_reload_constraints({"project_dir": str(tmp_path)})
+        assert out["initialized"] is True
+        assert out["count"] == 1
+        assert "Rule surfaced on demand" in out["constraints"]
+
+    def test_reload_tool_reflects_updates(self, tmp_path):
+        # Recording another constraint changes what reload returns — it reads
+        # live, not a snapshot.
+        handle_record_constraint(constraint_params(tmp_path, rule="First rule here"))
+        first = handle_reload_constraints({"project_dir": str(tmp_path)})
+        assert first["count"] == 1
+        handle_record_constraint(constraint_params(tmp_path, rule="Second rule here"))
+        second = handle_reload_constraints({"project_dir": str(tmp_path)})
+        assert second["count"] == 2
+        assert "Second rule here" in second["constraints"]
+
+    def test_reload_tool_uninitialized_when_no_store(self, tmp_path):
+        out = handle_reload_constraints({"project_dir": str(tmp_path / "nope")})
+        assert out["initialized"] is False
+        assert out["count"] == 0
+
+
+class TestConstraintReinjectHook:
+    """The PostToolUse periodic re-injection hook: opt-in, default off."""
+
+    def _record(self, tmp_path):
+        return handle_record_constraint(constraint_params(
+            tmp_path, rule="Re-injected rule that must persist"))
+
+    def test_disabled_by_default(self, tmp_path):
+        # No config.json at all -> feature off -> never fires.
+        self._record(tmp_path)
+        for _ in range(6):
+            assert _run_reinject(tmp_path) == ""
+
+    def test_explicit_disabled_never_fires(self, tmp_path):
+        self._record(tmp_path)
+        _write_config(tmp_path, {"constraint_reinjection": {"enabled": False}})
+        for _ in range(6):
+            assert _run_reinject(tmp_path) == ""
+
+    def test_fires_every_n_tools(self, tmp_path):
+        rec = self._record(tmp_path)
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 3}})
+        fired = [bool(_run_reinject(tmp_path)) for _ in range(7)]
+        # Silent for the first 2, fires on the 3rd, then every 3rd after.
+        assert fired == [False, False, True, False, False, True, False]
+
+    def test_injected_payload_is_constraints_only(self, tmp_path):
+        rec = self._record(tmp_path)
+        handle_record_decision(decision_params(
+            tmp_path, summary="A decision that must not appear"))
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
+        out = _run_reinject(tmp_path)
+        data = json.loads(out)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        assert data["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+        assert rec["id"] in ctx
+        assert "Re-injected rule that must persist" in ctx
+        assert "A decision that must not appear" not in ctx
+
+    def test_counter_resets_per_session(self, tmp_path):
+        self._record(tmp_path)
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 3}})
+        # Two calls in session A (no fire yet), then a new session B restarts
+        # the count, so B also needs 3 calls before its first fire.
+        assert _run_reinject(tmp_path, "sess-a") == ""
+        assert _run_reinject(tmp_path, "sess-a") == ""
+        assert _run_reinject(tmp_path, "sess-b") == ""
+        assert _run_reinject(tmp_path, "sess-b") == ""
+        assert _run_reinject(tmp_path, "sess-b") != ""
+
+    def test_no_constraints_stays_silent(self, tmp_path):
+        # Feature on, but nothing recorded yet -> nothing to surface.
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
+        # Need a .context/ dir for the hook to resolve the project.
+        assert _run_reinject(tmp_path) == ""
+
+    def test_output_is_ascii(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Rule with unicode: cafe resume naive"))
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
+        out = _run_reinject(tmp_path)
+        out.encode("ascii")  # raises if any non-ASCII slipped through

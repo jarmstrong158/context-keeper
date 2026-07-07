@@ -25,8 +25,47 @@ Context Keeper gives Claude 11 tools to record and retrieve structured project c
 | `get_compaction_report` | Check if last compaction lost any context |
 | `verify_quality` | Scan entries for thin rationale, missing tags, isolated arcs (auto-called by PreCompact hook) |
 | `export_markdown` | Regenerate `DECISIONS.md` from the decisions store — a derived, read-only projection |
+| `reload_constraints` | Re-surface the constraints-only block on demand mid-session (rules refresh, not the full store) |
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
+
+## v0.11: Mid-Session Constraint Re-Injection (opt-in)
+
+The SessionStart hook injects your constraints once, at turn one. As a long
+session fills with tool output, those rules scroll out of the model's working
+attention and effectively decay — the model can violate a constraint it was
+briefed on an hour ago simply because it is buried. v0.11 re-surfaces the
+constraints **during** a long session, not just at the start.
+
+Two ways in, both **constraints-only** — they re-inject the exact
+Absolute/Advisory block SessionStart shows, and nothing else from the store
+(no decisions, no pipelines). It's a lightweight rules refresh, not a second
+full dump.
+
+- **`reload_constraints` tool** — returns the current constraints block on
+  demand. Always available; call it whenever you want the rules back in
+  context.
+- **`constraint_reinject.py` hook (PostToolUse)** — **opt-in, default off.**
+  When enabled, it counts tool calls per session and re-injects the
+  constraints block every *N* calls (`every_n_tools`, default 25) via
+  `additionalContext`.
+
+**What triggers it, honestly.** The automatic path is the **PostToolUse**
+hook — that surface *is* injected into the model, and its firing rate tracks
+tool-output volume, which is the thing actually burying the rules. It is **not
+a timer**: an MCP server has no wall-clock inside the context window, so
+re-injection is driven by counting tool calls, not elapsed seconds. It is
+**not PreCompact** either — PreCompact stdout is shown only to the user, never
+injected into the model (the compaction boundary is already re-covered by the
+SessionStart hook, which re-fires with source `compact`).
+
+**Default behavior is unchanged.** With no config (or `enabled: false`), the
+hook is inert and SessionStart works exactly as before. Enable it in
+`.context/config.json`:
+
+```json
+{ "constraint_reinjection": { "enabled": true, "every_n_tools": 25 } }
+```
 
 ## v0.10: Abstention + Supersession-as-Ranking
 
@@ -309,11 +348,25 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
             "command": "python /path/to/context-keeper/hooks/scope_guard.py"
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/context-keeper/hooks/constraint_reinject.py"
+          }
+        ]
       }
     ]
   }
 }
 ```
+
+The `constraint_reinject.py` entry is only active when
+`constraint_reinjection.enabled` is set in `.context/config.json` (default
+off) — wiring it up is harmless until you opt in. Its matcher is `""` (every
+tool call) so the per-session counter advances on all activity.
 
 Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEEPER_PROJECT` env var if your project isn't in the current working directory.
 
@@ -324,6 +377,7 @@ The hooks form a complete capture-and-retrieval loop:
 - **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report and a one-line quality-scan nudge) straight to stdout, which Claude Code injects into context at turn one. It also runs the post-compaction snapshot comparison itself before reading the report — SessionStart fires with source `compact` immediately after compaction, before any Stop hook, so this keeps the injected report fresh. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
 - **PostToolUse (Bash)** — fires after every Bash tool call; when the command contains `git commit`, it injects a reminder to record the matching decision/constraint/gotcha **in the same work cycle**. A commit is the single best capture trigger — it's the exact moment something became real enough to persist in version control. Born from field use: during incident-heavy sessions the agent batched capture "for later," and the user had to ask "update context keeper" three times in one night while a dozen commits shipped
 - **PostToolUse (Edit|Write)** — `scope_guard.py`: when the agent edits a file covered by a constraint's `scope` (e.g. a constraint scoped to `hooks/` and an edit to `hooks/session_start.py`), that constraint is injected right then via `additionalContext`. Session start briefs the rules; this enforces them at the moment of edit. Once per constraint per session
+- **PostToolUse (any tool)** — `constraint_reinject.py`: **opt-in, default off.** When `constraint_reinjection.enabled` is set, it counts tool calls per session and re-injects the constraints-only block every `every_n_tools` calls via `additionalContext`, so rules injected at session start don't decay as tool output buries them. PostToolUse is chosen deliberately: it's a model-visible surface (unlike PreCompact) and its firing rate tracks tool-output volume. Not a timer — an MCP server has no wall-clock in the context window
 - **PreCompact** — snapshots all active `.context/` entries and runs a quality scan (`verify_quality`), printing flagged entries (thin reasoning, missing tags, isolated arcs) to the transcript. Note: PreCompact stdout is user-visible only — Claude Code does not inject it into the model's context, which is why the model-visible quality nudge lives in the SessionStart hook instead
 - **Stop** — safety-net run of the same snapshot comparison SessionStart performs, in case the session ends without a new session starting (idempotent — skips if the snapshot hasn't changed since last comparison)
 
@@ -340,6 +394,7 @@ your-project/
     config.json              # Token budget, stale threshold
     compaction_snapshot.json  # Pre-compaction snapshot (auto-generated)
     compaction_report.json   # Post-compaction diff report (auto-generated)
+    reinject_state.json      # Per-session tool counter for constraint re-injection (auto-generated)
     hook.log                 # Hook activity log
 ```
 
@@ -359,6 +414,10 @@ Create `.context/config.json` to customize:
   "markdown_export": {
     "enabled": false,
     "path": "DECISIONS.md"
+  },
+  "constraint_reinjection": {
+    "enabled": false,
+    "every_n_tools": 25
   },
   "semantic": {
     "enabled": false,

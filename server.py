@@ -78,6 +78,16 @@ DEFAULT_CONFIG = {
     # from decisions.json on every decision write. The markdown is
     # read-only output — never parsed back in, never merged.
     "markdown_export": {"enabled": False, "path": "DECISIONS.md"},
+    # Opt-in periodic constraint re-injection. SessionStart injects the
+    # constraints once at turn one; as a long session fills with tool
+    # output those rules get buried. When enabled, the PostToolUse
+    # constraint_reinject.py hook re-surfaces the constraints-only block
+    # every `every_n_tools` tool calls via additionalContext. Default off
+    # so nothing changes unless a project asks for it. This is the ONLY
+    # honest mid-session surface: PreCompact stdout is not injected into
+    # the model, and no wall-clock timer exists — the hook counts tool
+    # calls (the thing actually burying context), not seconds.
+    "constraint_reinjection": {"enabled": False, "every_n_tools": 25},
 }
 
 USAGE_GUIDANCE = (
@@ -474,6 +484,22 @@ TOOLS = [
                     "type": "string",
                     "description": "Output path relative to project root. Default: config markdown_export.path.",
                 },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Absolute path to the target project.",
+                },
+            },
+        },
+    },
+    {
+        "name": "reload_constraints",
+        "description": (
+            "Re-surface the project's constraints only (not the full store) when a long "
+            "session has buried the ones injected at start. Same block as session start."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
                 "project_dir": {
                     "type": "string",
                     "description": "Absolute path to the target project.",
@@ -1512,6 +1538,73 @@ def handle_get_context(params):
     return response
 
 
+def _constraint_lines(constraints):
+    """Format active constraints into the Absolute/Advisory line list.
+
+    Single source of truth for how constraints render, so the SessionStart
+    summary, the reload_constraints tool, and the re-injection hook all
+    surface them identically. Absolute first (true invariants), advisory
+    second, a blank line between the two sections when both exist. Each
+    entry is `  [con-XXX] <rule>` — the exact shape get_project_summary
+    has always emitted.
+    """
+    absolute = [c for c in constraints if c.get("hardness") == "absolute"]
+    advisory = [c for c in constraints if c.get("hardness") != "absolute"]
+    lines = []
+    if absolute:
+        lines.append(f"Absolute Constraints ({len(absolute)}):")
+        for c in absolute:
+            lines.append(f"  [{c['id']}] {c['rule']}")
+    if advisory:
+        if lines:
+            lines.append("")
+        lines.append(f"Advisory Constraints ({len(advisory)}):")
+        for c in advisory:
+            lines.append(f"  [{c['id']}] {c['rule']}")
+    return lines
+
+
+def build_constraints_block(base_dir=None):
+    """Return the constraints-only re-injection block.
+
+    Deliberately narrow: the SAME Absolute/Advisory constraint lines
+    SessionStart surfaces, and nothing else from the store — no decisions,
+    no pipelines. The whole point of re-injection is a lightweight rules
+    refresh, not dumping the full store again. Shared by the
+    reload_constraints tool and the constraint_reinject.py hook.
+
+    Returns {"initialized": bool, "count": int, "text": str}.
+    """
+    if base_dir is None:
+        base_dir = CONTEXT_DIR
+    if base_dir is None or not os.path.exists(base_dir):
+        return {"initialized": False, "count": 0, "text": ""}
+    constraints = [c for c in read_json_file(os.path.join(base_dir, "constraints.json"))
+                   if c.get("status", "active") == "active"]
+    lines = _constraint_lines(constraints)
+    return {"initialized": True, "count": len(constraints), "text": "\n".join(lines)}
+
+
+def handle_reload_constraints(params):
+    """On-demand constraints-only recall. Returns the current constraints
+    block so the agent can pull rules back into working context mid-session
+    without waiting for any automatic trigger."""
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None or not os.path.exists(base_dir):
+        return {
+            "initialized": False,
+            "count": 0,
+            "constraints": "",
+            "message": "No context directory found. Nothing to re-surface.",
+        }
+    block = build_constraints_block(base_dir)
+    return {
+        "initialized": True,
+        "count": block["count"],
+        "constraints": block["text"],
+    }
+
+
 def handle_get_project_summary(params):
     base_dir = _base_dir_from_params(params)
     budget = params.get("token_budget", 2000)
@@ -1536,18 +1629,15 @@ def handle_get_project_summary(params):
     project_name = cfg.get("project_name") or os.path.basename(os.path.dirname(base_dir))
     lines.append(f"Project: {project_name}")
 
-    # Absolute constraints first (most important)
+    # Absolute constraints first (most important). Formatting is shared with
+    # the reload_constraints tool and the re-injection hook via
+    # _constraint_lines, so every surface renders constraints identically.
     absolute = [c for c in constraints if c.get("hardness") == "absolute"]
     advisory = [c for c in constraints if c.get("hardness") != "absolute"]
-    if absolute:
-        lines.append(f"\nAbsolute Constraints ({len(absolute)}):")
-        for c in absolute:
-            lines.append(f"  [{c['id']}] {c['rule']}")
-
-    if advisory:
-        lines.append(f"\nAdvisory Constraints ({len(advisory)}):")
-        for c in advisory:
-            lines.append(f"  [{c['id']}] {c['rule']}")
+    con_lines = _constraint_lines(constraints)
+    if con_lines:
+        lines.append("")
+        lines.extend(con_lines)
 
     # Above this many decisions, a flat list stops being scannable —
     # cluster by topic (most-frequent shared tag) instead.
@@ -1937,6 +2027,7 @@ HANDLERS = {
     "prune_stale": handle_prune_stale,
     "get_compaction_report": handle_get_compaction_report,
     "verify_quality": handle_verify_quality,
+    "reload_constraints": handle_reload_constraints,
 }
 
 # ============================================================
@@ -1965,7 +2056,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.10.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.11.0"},
                 },
             }
         elif method == "notifications/initialized":
