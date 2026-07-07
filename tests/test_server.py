@@ -23,7 +23,9 @@ from server import (
     CONTEXT_DIR_NAME,
     UNRESOLVED_PROJECT_ERROR,
     _base_dir_from_params,
+    _classify_overlap,
     _resolve_project_dir,
+    _text_words,
     build_constraints_block,
     handle_deprecate_entry,
     handle_get_compaction_report,
@@ -1539,6 +1541,69 @@ class TestSimilarEntrySurfacing:
         # Caller already acknowledged the relation — no warning needed.
         flagged_ids = [m["id"] for m in second.get("similar_entries", [])]
         assert first["id"] not in flagged_ids
+
+
+# ===========================================================================
+# Restatement vs contradiction classification on overlapping entries
+# ===========================================================================
+
+
+class TestOverlapClassification:
+    def test_classify_negation_asymmetry_is_contradiction(self):
+        a = _text_words({"rule": "api responses must be camelCase required"})
+        b = _text_words({"rule": "api responses must not be camelCase"})
+        assert _classify_overlap(a, b) == "likely_contradiction"
+
+    def test_classify_polarity_pair_is_contradiction(self):
+        a = _text_words({"rule": "always run conductor from the packaged exe"})
+        b = _text_words({"rule": "never run conductor from the packaged exe"})
+        assert _classify_overlap(a, b) == "likely_contradiction"
+
+    def test_classify_same_polarity_is_restatement(self):
+        a = _text_words({"summary": "all api responses use camelCase keys"})
+        b = _text_words({"summary": "api responses should use camelCase keys everywhere"})
+        assert _classify_overlap(a, b) == "likely_restatement"
+
+    def test_classify_both_negate_same_thing_is_restatement(self):
+        # Both carry a negation marker -> no asymmetry -> restatement, not a
+        # spurious contradiction.
+        a = _text_words({"rule": "never run the scheduler from source"})
+        b = _text_words({"rule": "do not run the scheduler from source, avoid it"})
+        assert _classify_overlap(a, b) == "likely_restatement"
+
+    def test_contradiction_surfaced_at_record_time(self, tmp_path):
+        first = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Always run the scheduler binary from the packaged exe",
+            reason="The packaged exe carries the environment the scheduler needs to find jobs.",
+            tags=["scheduler"],
+        ))
+        second = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Never run the scheduler binary from the packaged exe",
+            reason="The packaged exe pins a stale environment that hides newly added jobs.",
+            tags=["scheduler"],
+        ))
+        assert second["success"] is True  # advisory only, write proceeds
+        matches = second.get("similar_entries", [])
+        flagged = [m for m in matches if m["id"] == first["id"]]
+        assert flagged and flagged[0]["relation"] == "likely_contradiction"
+        assert "contradiction_note" in second
+
+    def test_restatement_has_no_contradiction_note(self, tmp_path):
+        handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use atomic writes with temp file and os.replace for entry files",
+            tags=["storage", "data-integrity"],
+        ))
+        second = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Entry files use atomic writes via temp file and os.replace",
+            tags=["storage", "data-integrity"],
+        ))
+        relations = [m["relation"] for m in second.get("similar_entries", [])]
+        assert relations and all(r == "likely_restatement" for r in relations)
+        assert "contradiction_note" not in second
 
 
 # ===========================================================================

@@ -29,6 +29,39 @@ Context Keeper gives Claude 11 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
 
+## Capabilities at a glance
+
+Context Keeper is a small, offline-first memory layer; several of its capabilities are easy to miss because they live inside existing tools rather than as separate features. The map below names them in memory-system terms:
+
+| Capability | How Context Keeper does it |
+|------------|----------------------------|
+| **Procedural memory** | `record_pipeline` stores ordered, dependency-aware workflows (build/deploy/data flows) with `purpose` + `when_to_invoke` — reusable "how we do X", not just facts. |
+| **Deduplication** | Every `record_*` runs a word-set Jaccard pass against the store and returns `similar_entries` when a new entry restates an existing one, so duplicates are caught at capture instead of accumulating. |
+| **Contradiction detection** | Those same overlaps are classified `likely_restatement` vs `likely_contradiction` (negation/antonym polarity), and a reversal raises a `contradiction_note` telling the agent to resolve the conflict rather than leave two live rules disagreeing. |
+| **Quality refinement** | `verify_quality` scans for thin rationale, missing tags, legacy-schema entries, and isolated (unlinked) arcs; the PreCompact hook runs it automatically so entries get enriched before context is compressed. |
+| **Supersede / decay / forget** | `supersedes` demotes-but-keeps prior decisions (recallable history); `prune_stale` surfaces unverified entries for review; `deprecate_entry` removes an entry from retrieval entirely. |
+| **Origin + trust / source attribution** | Every entry records `origin` (`user` / `agent` / `import`); retrieval gives user-stated entries a trust boost and it decides the default winner when entries conflict. |
+| **Anticipated queries** | `retrieval_hints` stores alternate phrasings a future session might search for, so vocabulary-mismatch queries hit without embeddings. |
+| **Hybrid retrieval** | Lexical (tag + word overlap) by default; an opt-in embedding-cosine blend (`semantic.enabled`) adds vector recall, with lexical fallback when the embedder is offline. |
+| **Cache-friendly injection** | The session-start memory block is deterministically ordered with a stable prefix and the only per-session-volatile line (quality-scan IDs) emitted last, so an unchanged store injects byte-identical text across sessions. |
+| **Narrative + clustering** | `get_project_summary` clusters decisions by topic above a threshold and renders a compact narrative; the `DECISIONS.md` projection mirrors the store as human-readable prose. |
+| **Data export / offline / privacy** | Plain JSON in `.context/` you can read, edit, grep, and commit; runs fully offline with zero required dependencies and no data leaving the machine. |
+
+### Evaluation & benchmarks (open methodology)
+
+The retrieval and honesty properties are measured, not asserted — the harness is in [`evals/`](evals/) and reproducible with no network required:
+
+- **Token reduction** — session-start injection vs. dumping the full store: **97.3% / 94.1% / 85.5% / 73.3%** across four real stores ([`evals/token_reduction.py`](evals/token_reduction.py)). The meaningful property is that injected cost stays roughly flat as the store grows.
+- **Retrieval quality** — on a held-out 3-store set, the opt-in semantic blend lifts **hit@5 from 80% → 93% and MRR 0.63 → 0.88** ([`evals/retrieval_eval.py`](evals/retrieval_eval.py)).
+- **Abstention** — measures whether `get_context` says "nothing relevant" instead of confabulating on no-answer queries; the 0.20 relevance floor is the highest with zero false-abstention on the eval set ([`evals/abstention.py`](evals/abstention.py)).
+
+Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md).
+
+## v0.12: Contradiction Detection + Cache-Stable Injection
+
+- **Restatement vs contradiction, at capture time.** The similar-entry pass already caught heavy overlaps; now it classifies each one. Two dependency-free signals — negation asymmetry ("X is required" vs "X is *not* required") and antonym polarity ("always" here / "never" there, "enable" / "disable") — label a match `likely_restatement` or `likely_contradiction`. A restatement nudges you to merge; a contradiction raises a `contradiction_note` telling the agent to resolve which rule is current (`deprecate_entry` with `superseded_by`) instead of silently leaving two live rules that disagree. Advisory only, and only evaluated on pairs Jaccard already flagged as overlapping — the write always proceeds. Zero new dependencies, no LLM call, no added tokens at record time.
+- **Cache-stable session-start injection.** The injected memory block is ordered so its large stable portion — constraints, decisions, pipelines, and the fixed capture guidance — forms a prefix that repeats byte-for-byte across sessions when the store hasn't changed, while the one volatile line (the quality scan's flagged IDs) is emitted last. This keeps the memory block inside the model's cacheable prompt prefix rather than busting the cache each session. It also *reduces* tokens rather than adding them.
+
 ## v0.11: Mid-Session Constraint Re-Injection (opt-in)
 
 The SessionStart hook injects your constraints once, at turn one. As a long

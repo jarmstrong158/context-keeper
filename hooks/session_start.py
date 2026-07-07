@@ -114,9 +114,22 @@ def main():
         # No project memory yet -- stay silent rather than nag every session.
         return
 
+    # Static capture guidance goes ahead of the volatile quality nudge below.
+    # Ordering is deliberate for prompt-cache friendliness: the memory block
+    # and this fixed guidance form a stable prefix that repeats verbatim across
+    # sessions (unchanged store -> byte-identical text -> cacheable), while the
+    # one line that changes session to session -- the quality scan's flagged
+    # IDs -- is emitted last so it never shifts the stable prefix behind it.
+    blocks.append(
+        "Capture as you go: when a decision, constraint, or pipeline is "
+        "established this session, record it immediately with the "
+        "record_* tools. Do not wait for compaction."
+    )
+
     # Quality nudge: PreCompact stdout is not injected into model context,
     # so SessionStart is the model-visible surface for the scan. One line
-    # only -- the full detail is a verify_quality call away.
+    # only -- the full detail is a verify_quality call away. Kept last: its
+    # flagged IDs are the most volatile content in the block.
     if quality and quality.get("count"):
         ids = ", ".join(str(f.get("id")) for f in quality.get("flagged", [])[:5])
         blocks.append(
@@ -124,12 +137,6 @@ def main():
             f"or unlinked (e.g. {ids}). Call verify_quality for details and "
             f"enrich via update_entry when convenient."
         )
-
-    blocks.append(
-        "Capture as you go: when a decision, constraint, or pipeline is "
-        "established this session, record it immediately with the "
-        "record_* tools. Do not wait for compaction."
-    )
 
     print(_ascii("[Context Keeper] " + "\n\n".join(blocks)))
 

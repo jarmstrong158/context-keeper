@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.jarmstrong158/context-keeper",
-  "description": "Project memory for Claude: records decisions, pipelines, and constraints across conversations.",
+  "description": "Project memory for Claude: records decisions, procedural pipelines, and constraints across conversations, with lexical+semantic retrieval, capture-time deduplication and contradiction detection, quality refinement, origin/trust weighting, and an open retrieval-eval harness.",
   "repository": {
     "url": "https://github.com/jarmstrong158/context-keeper",
     "source": "github"
   },
-  "version": "0.11.0",
+  "version": "0.12.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "context-keeper-mcp",
-      "version": "0.11.0",
+      "version": "0.12.0",
       "transport": {
         "type": "stdio"
       },
