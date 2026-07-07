@@ -37,7 +37,7 @@ Context Keeper is a small, offline-first memory layer; several of its capabiliti
 | Capability | How Context Keeper does it |
 |------------|----------------------------|
 | **Procedural memory** | `record_pipeline` stores ordered, dependency-aware workflows (build/deploy/data flows) with `purpose` + `when_to_invoke` — reusable "how we do X", not just facts. |
-| **Deduplication** | Every `record_*` runs a word-set Jaccard pass against the store and returns `similar_entries` when a new entry restates an existing one, so duplicates are caught at capture instead of accumulating. |
+| **Deduplication** | Every `record_*` runs a word-set Jaccard pass against the store and returns `similar_entries` when a new entry restates an existing one, so duplicates are caught at capture; `deprecate_entry(merge_into=...)` then folds the duplicate's unique content into the survivor and retires it in one non-destructive step. |
 | **Contradiction detection** | Those same overlaps are classified `likely_restatement` vs `likely_contradiction` (negation/antonym polarity), and a reversal raises a `contradiction_note` telling the agent to resolve the conflict rather than leave two live rules disagreeing. |
 | **Quality refinement** | `verify_quality` scans for thin rationale, missing tags, legacy-schema entries, and isolated (unlinked) arcs; the PreCompact hook runs it automatically so entries get enriched before context is compressed. |
 | **Supersede / decay / forget** | `supersedes` demotes-but-keeps prior decisions (recallable history); `prune_stale` surfaces unverified entries for review; `deprecate_entry` removes an entry from retrieval entirely. |
@@ -58,6 +58,22 @@ The retrieval and honesty properties are measured, not asserted — the harness 
 - **Abstention** — measures whether `get_context` says "nothing relevant" instead of confabulating on no-answer queries; the 0.20 relevance floor is the highest with zero false-abstention on the eval set ([`evals/abstention.py`](evals/abstention.py)).
 
 Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md).
+
+## v0.14: Dedup Merge (`deprecate_entry(merge_into=...)`)
+
+Capture-time detection already caught near-duplicates (`similar_entries` with a `likely_restatement` relation), but *resolving* one was a manual two-step: deprecate the duplicate, then `update_entry` the original to fold in anything it was missing. v0.14 collapses that into one atomic, non-destructive operation.
+
+- **Opt-in param on the existing tool, not a new tool.** `deprecate_entry(id=<dupe>, reason=..., merge_into=<survivor>)` folds the duplicate's unique content into the survivor, then deprecates the duplicate with `superseded_by=<survivor>`. When `merge_into` is absent, `deprecate_entry` behaves exactly as before — byte-for-byte.
+- **Additive and non-destructive.** The survivor can only *gain* content: list fields (`tags`, `retrieval_hints`, `related_to`, `constraints`/`constraints_created`) are unioned, and empty text fields are backfilled from the duplicate — a non-empty field on the survivor is **never** overwritten. The duplicate isn't hard-deleted; it stays on disk as a deprecated entry pointing at the survivor, so the merge is fully auditable and reversible.
+- **Same-type, single-write, validated first.** Merge requires both entries to be the same type (so their schemas line up), resolves and validates the target before any write, and mutates both entries in one file write so the two updates can't clobber each other. A bad `merge_into` (missing target, cross-type, or self) errors cleanly and deprecates nothing.
+- **Roots held.** Explicit and agent-invoked (like every other lifecycle tool), zero new dependencies, no LLM call, deterministic. It streamlines the restatement workflow the capture loop already prescribes rather than adding a background process.
+
+```jsonc
+// dec-002 restates dec-001 — merge and retire it in one call
+{ "id": "dec-002", "reason": "Restatement of dec-001", "merge_into": "dec-001" }
+// -> dec-001 gains dec-002's unique tags/hints/related_to + any text it lacked;
+//    dec-002 becomes deprecated with superseded_by = dec-001
+```
 
 ## v0.13: Structured Field Query (`query_entries`)
 
