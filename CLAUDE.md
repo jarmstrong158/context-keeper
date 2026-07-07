@@ -90,11 +90,11 @@ Call `get_context` with relevant tags to find the decision with its rationale.
 ### Before modifying a pipeline:
 Call `get_context` with the pipeline name or tags to see the current flow and its constraints.
 
-## Acting on similar_entries (v0.6+)
-When a `record_*` call succeeds but the response includes `similar_entries`, do not ignore it. Those are existing active entries whose text heavily overlaps what you just recorded. Resolve immediately, while you still have context:
-- **Restatement** — deprecate the entry you just created and `update_entry` the original instead (or vice versa if yours is richer).
-- **Contradiction** — decide which is current; `deprecate_entry` the loser with `superseded_by` pointing at the winner.
-- **Genuinely distinct** — link them: `update_entry` your new entry with `related_to` including the similar ids.
+## Acting on similar_entries (v0.6+, classified v0.12+)
+When a `record_*` call succeeds but the response includes `similar_entries`, do not ignore it. Those are existing active entries whose text heavily overlaps what you just recorded. Each match carries a `relation` label to tell you which case you're in — use it, then resolve immediately while you still have context:
+- **`likely_restatement`** — deprecate the entry you just created and `update_entry` the original instead (or vice versa if yours is richer).
+- **`likely_contradiction`** (also raises a top-level `contradiction_note`) — the new entry appears to *reverse* an existing rule, not restate it. Do not leave both live. Decide which is current and `deprecate_entry` the loser with `superseded_by` pointing at the winner. The flag is a heuristic (negation/antonym polarity) — confirm the reversal is real before acting.
+- **Genuinely distinct** — the overlap is incidental; link them: `update_entry` your new entry with `related_to` including the similar ids.
 
 ## Acting on no_confident_match (v0.10+)
 When `get_context` returns `no_confident_match: true`, the top entry's lexical relevance to your query was below the floor — the returned entries are the closest neighbors but probably nothing was recorded on this exact topic. Do **not** present them as established project decisions. Treat it as "no memory on this" unless an entry genuinely fits on inspection. The entries are still included (not suppressed) so you can judge; `top_relevance` is the score.

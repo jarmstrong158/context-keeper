@@ -972,6 +972,65 @@ def _origin_from_params(params):
 # Overridable per store via config "similar_threshold".
 DEFAULT_SIMILAR_THRESHOLD = 0.30
 
+# Two entries can overlap heavily for opposite reasons: one restates the other
+# (dedup), or one reverses it (contradiction — the more dangerous case, because
+# a silent contradiction leaves two live rules disagreeing). A lexical overlap
+# score alone can't tell them apart. These two signals do, dependency-free:
+#   1. Negation asymmetry — one entry carries a negation/prohibition marker the
+#      other doesn't ("X is required" vs "X is not required").
+#   2. Polarity split — each entry holds an opposing side of an antonym pair
+#      ("always" here / "never" there; "enable" / "disable").
+# Advisory only, and only consulted on already-high-overlap pairs, so an
+# occasional false "contradiction" just prompts a second look — cheap, in
+# keeping with the advisory-similar design.
+_NEGATION_TOKENS = frozenset("""
+never no not none nor cannot cant dont wont shouldnt neither without avoid
+disable disabled forbid forbidden prohibit prohibited prevent deny denied
+""".split())
+
+_POLARITY_PAIRS = (
+    frozenset({"always", "never"}),
+    frozenset({"enable", "disable"}),
+    frozenset({"enabled", "disabled"}),
+    frozenset({"allow", "deny"}),
+    frozenset({"allow", "forbid"}),
+    frozenset({"require", "forbid"}),
+    frozenset({"required", "forbidden"}),
+    frozenset({"required", "optional"}),
+    frozenset({"use", "avoid"}),
+    frozenset({"add", "remove"}),
+    frozenset({"include", "exclude"}),
+    frozenset({"before", "after"}),
+    frozenset({"keep", "drop"}),
+    frozenset({"true", "false"}),
+)
+
+
+def _classify_overlap(new_words, other_words):
+    """Label a high-overlap entry pair as a likely contradiction or restatement.
+
+    Returns "likely_contradiction" when the two texts hold opposite polarity —
+    a negation marker present on one side only, or each side holding an opposing
+    member of an antonym pair — else "likely_restatement". Called only after
+    Jaccard has already established the pair overlaps heavily, so this is purely
+    the direction of that overlap.
+    """
+    neg_a = bool(new_words & _NEGATION_TOKENS)
+    neg_b = bool(other_words & _NEGATION_TOKENS)
+    if neg_a != neg_b:
+        return "likely_contradiction"
+    for pair in _POLARITY_PAIRS:
+        x, y = tuple(pair)
+        # Split = one side sits in one entry and the other side in the other,
+        # and neither entry contains both (both-present = no directional signal).
+        a_has = (x in new_words, y in new_words)
+        b_has = (x in other_words, y in other_words)
+        if a_has[0] and b_has[1] and not a_has[1] and not b_has[0]:
+            return "likely_contradiction"
+        if a_has[1] and b_has[0] and not a_has[0] and not b_has[1]:
+            return "likely_contradiction"
+    return "likely_restatement"
+
 
 def _find_similar_entries(new_entry, base_dir, exclude_ids=None, threshold=None):
     """Compare a new entry's text against all active entries in the store.
@@ -1006,7 +1065,8 @@ def _find_similar_entries(new_entry, base_dir, exclude_ids=None, threshold=None)
                 continue
             if e.get("status", "active") in ("deprecated", "superseded"):
                 continue
-            sim = _jaccard(new_words, _text_words(e))
+            e_words = _text_words(e)
+            sim = _jaccard(new_words, e_words)
             if sim >= threshold:
                 matches.append({
                     "id": eid,
@@ -1014,18 +1074,29 @@ def _find_similar_entries(new_entry, base_dir, exclude_ids=None, threshold=None)
                     "summary": e.get("summary") or e.get("name") or e.get("rule") or "?",
                     "similarity": round(sim, 2),
                     "origin": e.get("origin", "agent"),
+                    "relation": _classify_overlap(new_words, e_words),
                 })
     matches.sort(key=lambda m: m["similarity"], reverse=True)
     return matches[:3]
 
 
 _SIMILAR_NOTE = (
-    "Existing entries overlap heavily with this one. Review them: if this is a "
-    "restatement, deprecate this entry and use update_entry on the original "
-    "instead; if it contradicts one, resolve the conflict (deprecate_entry with "
+    "Existing entries overlap heavily with this one. Each carries a `relation`: "
+    "`likely_restatement` (same rule said twice) or `likely_contradiction` "
+    "(this entry reverses the other). Review them: for a restatement, deprecate "
+    "this entry and use update_entry on the original instead; for a "
+    "contradiction, resolve which is current (deprecate_entry with "
     "superseded_by); if genuinely distinct, link them via related_to. "
     "When entries conflict, origin trust decides the default winner: "
     "user-stated overrides agent-inferred overrides imported."
+)
+
+_CONTRADICTION_NOTE = (
+    "At least one overlap is flagged `likely_contradiction` — the new entry "
+    "appears to REVERSE an existing one (opposite negation or antonym polarity), "
+    "not restate it. Do not leave both live: pick the current rule and "
+    "deprecate_entry the other with superseded_by, so the store never holds two "
+    "rules that disagree. The flag is a heuristic; confirm before acting."
 )
 
 
@@ -1039,6 +1110,8 @@ def _attach_similar(result, entry, base_dir):
     if similar:
         result["similar_entries"] = similar
         result["similar_note"] = _SIMILAR_NOTE
+        if any(m.get("relation") == "likely_contradiction" for m in similar):
+            result["contradiction_note"] = _CONTRADICTION_NOTE
     return result
 
 
@@ -2056,7 +2129,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.11.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.12.0"},
                 },
             }
         elif method == "notifications/initialized":
