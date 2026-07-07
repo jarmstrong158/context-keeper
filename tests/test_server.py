@@ -871,6 +871,116 @@ class TestDeprecateEntry:
         assert "updated_at" in data[0]
 
 
+class TestDeprecateMerge:
+    """deprecate_entry(merge_into=...) — dedup merge into a surviving entry."""
+
+    def _two_decisions(self, tmp_path):
+        a = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use JSON files for the entry store",
+            problem="Need a store a human can hand-edit and diff in git without extra tooling here.",
+            why_chosen="JSON is human-editable and diffable and needs zero dependencies unlike SQLite for this.",
+            tags=["storage"],
+            retrieval_hints=["json store"],
+        ))
+        b = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Entry store is plain JSON on disk",
+            problem="Same storage question, phrased differently by a later session that forgot A existed.",
+            why_chosen="Plain JSON keeps the store transparent, greppable, and dependency-free for contributors here.",
+            tags=["storage", "architecture"],
+            retrieval_hints=["flat file db"],
+            what_we_tried="Considered SQLite but rejected it for opacity.",
+        ))
+        return a["id"], b["id"]
+
+    def test_merge_unions_lists_and_backfills_text(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": f"Restatement of {a_id}", "merge_into": a_id,
+        })
+        assert r["success"] is True
+        assert r["merged_into"] == a_id
+        assert r["merged"]["tags_added"] == ["architecture"]
+        assert r["merged"]["fields_backfilled"] == ["what_we_tried"]
+        keep = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        assert keep["tags"] == ["storage", "architecture"]
+        assert keep["retrieval_hints"] == ["json store", "flat file db"]
+        assert keep["what_we_tried"] == "Considered SQLite but rejected it for opacity."
+
+    def test_merge_deprecates_source_with_superseded_by(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": "dupe", "merge_into": a_id,
+        })
+        dep = handle_get_context({"project_dir": str(tmp_path), "id": b_id})["entry"]
+        assert dep["status"] == "deprecated"
+        assert dep["superseded_by"] == a_id
+
+    def test_merge_never_overwrites_target_text(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        before = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        why_before = before["why_chosen"]
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": "dupe", "merge_into": a_id,
+        })
+        after = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        # Target's own non-empty why_chosen is preserved, not clobbered by B's.
+        assert after["why_chosen"] == why_before
+
+    def test_merge_into_self_errors(self, tmp_path):
+        a_id, _ = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a_id,
+            "reason": "x", "merge_into": a_id,
+        })
+        assert "error" in r
+
+    def test_merge_into_missing_target_errors_without_deprecating(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": "x", "merge_into": "dec-999",
+        })
+        assert "error" in r
+        # B must NOT have been deprecated — the bad merge failed cleanly.
+        b = handle_get_context({"project_dir": str(tmp_path), "id": b_id})["entry"]
+        assert b.get("status", "active") == "active"
+
+    def test_merge_into_cross_type_errors(self, tmp_path):
+        a_id, _ = self._two_decisions(tmp_path)
+        con = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="API responses must be camelCase",
+            reason="Consumers expect camelCase keys and break on snake_case in the payload.",
+        ))
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": con["id"],
+            "reason": "x", "merge_into": a_id,
+        })
+        assert "error" in r
+        # The constraint was not deprecated by the failed cross-type merge.
+        c = handle_get_context({"project_dir": str(tmp_path), "id": con["id"]})["entry"]
+        assert c.get("status", "active") == "active"
+
+    def test_plain_deprecate_unchanged_without_merge_into(self, tmp_path):
+        # Guard: default deprecate path is byte-for-byte the old behavior.
+        a_id, b_id = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id, "reason": "gone",
+        })
+        assert r["success"] is True and r["status"] == "deprecated"
+        assert "merged_into" not in r
+        b = handle_get_context({"project_dir": str(tmp_path), "id": b_id})["entry"]
+        assert b["status"] == "deprecated"
+        # A untouched — no merge happened.
+        a = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        assert a["tags"] == ["storage"]
+
+
 # ===========================================================================
 # 9. prune_stale
 # ===========================================================================
@@ -2303,11 +2413,13 @@ class TestToolSchemaBudget:
         v0.13.0 after adding the 13th tool (query_entries): a field-rich
         structured-query tool with 13 predicates is inherently ~470 tokens
         even with trimmed per-field descriptions — budget raised to 3100,
-        cost consciously accepted for a distinct query capability."""
+        cost consciously accepted for a distinct query capability. ~3121 at
+        v0.14.0 after adding the merge_into param to deprecate_entry (dedup
+        merge) — one param, no new tool; budget raised to 3150."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 3100, (
-            f"tools/list payload is ~{total} tokens (budget: 3100). "
+        assert total <= 3150, (
+            f"tools/list payload is ~{total} tokens (budget: 3150). "
             "Trim schema descriptions or consciously raise the budget."
         )
 

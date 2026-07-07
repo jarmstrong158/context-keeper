@@ -463,6 +463,14 @@ TOOLS = [
                 "id": {"type": "string", "description": "Entry ID to deprecate"},
                 "reason": {"type": "string", "description": "Why this is being deprecated"},
                 "superseded_by": {"type": "string", "description": "ID of the replacing decision (decisions only)"},
+                "merge_into": {
+                    "type": "string",
+                    "description": (
+                        "Dedup merge: fold this entry's unique content (tags, hints, related_to, "
+                        "backfilled text) into this same-type target, then deprecate this one with "
+                        "superseded_by=target. Non-destructive — the target is only added to."
+                    ),
+                },
                 "project_dir": {
                     "type": "string",
                     "description": "Absolute path to another project whose entry should be deprecated",
@@ -2082,10 +2090,52 @@ def handle_update_entry(params):
     return {"success": True, "entry": entry}
 
 
+# Fields folded when merging a duplicate into a surviving entry. List fields
+# are unioned (the target keeps its order, the source's new items append);
+# text fields are only *backfilled* — a non-empty value on the target is never
+# overwritten, because the target is the canonical entry being kept. This makes
+# merge additive and non-destructive: the survivor can only gain content.
+_MERGE_UNION_FIELDS = ("tags", "retrieval_hints", "related_to",
+                       "constraints_created", "constraints")
+_MERGE_BACKFILL_FIELDS = ("summary", "problem", "why_chosen", "what_we_tried",
+                          "tradeoffs", "purpose", "when_to_invoke", "rule",
+                          "reason", "triggering_incident")
+
+
+def _merge_entry_fields(target, source):
+    """Fold source's unique content into target in place; return a summary of
+    what changed. Never overwrites a non-empty target field."""
+    added_tags = []
+    backfilled = []
+    for field in _MERGE_UNION_FIELDS:
+        src_list = source.get(field)
+        if not isinstance(src_list, list) or not src_list:
+            continue
+        tgt_list = target.get(field)
+        if not isinstance(tgt_list, list):
+            tgt_list = []
+        existing = set(tgt_list)
+        for item in src_list:
+            if item not in existing:
+                tgt_list.append(item)
+                existing.add(item)
+                if field == "tags":
+                    added_tags.append(item)
+        target[field] = tgt_list
+    for field in _MERGE_BACKFILL_FIELDS:
+        if not target.get(field) and source.get(field):
+            target[field] = source[field]
+            backfilled.append(field)
+    target["updated_at"] = now_iso()
+    target["verified_at"] = now_iso()
+    return {"tags_added": added_tags, "fields_backfilled": backfilled}
+
+
 def handle_deprecate_entry(params):
     entry_id = params["id"]
     reason = params["reason"]
     superseded_by = params.get("superseded_by")
+    merge_into = params.get("merge_into")
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -2093,6 +2143,48 @@ def handle_deprecate_entry(params):
     entry, type_name, file_path, index = _find_entry_by_id(entry_id, base_dir)
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
+
+    # Merge path (opt-in): fold this entry's unique content into a surviving
+    # target of the SAME type, then deprecate this one pointing at the target.
+    # This turns the manual "deprecate the dupe + update the original" dance
+    # into one atomic write. Validate the target fully BEFORE any write, so a
+    # bad merge_into never leaves a half-applied state.
+    merge_result = None
+    if merge_into is not None:
+        if merge_into == entry_id:
+            return {"error": "merge_into cannot be the same entry being deprecated."}
+        target, target_type, target_file, _ = _find_entry_by_id(merge_into, base_dir)
+        if target is None:
+            return {"error": f"merge_into target '{merge_into}' not found."}
+        if target_type != type_name:
+            return {"error": (
+                f"merge_into requires the same entry type: '{entry_id}' is a "
+                f"{type_name} entry but '{merge_into}' is a {target_type} entry.")}
+        # Same type => same file. Load once, mutate both, write once, so the
+        # two updates can't clobber each other.
+        entries, load_err = _load_entries_for_write(file_path)
+        if load_err is not None:
+            return load_err
+        by_id = {e.get("id"): i for i, e in enumerate(entries)}
+        if entry_id not in by_id or merge_into not in by_id:
+            return {"error": "Entry moved during merge; retry."}
+        dep = entries[by_id[entry_id]]
+        keep = entries[by_id[merge_into]]
+        merge_result = _merge_entry_fields(keep, dep)
+        dep["status"] = "deprecated"
+        dep["deprecated_reason"] = reason
+        dep["superseded_by"] = merge_into
+        dep["updated_at"] = now_iso()
+        write_json_file(file_path, entries)
+        if type_name == "decisions":
+            _maybe_export_markdown(base_dir)
+        return {
+            "success": True,
+            "id": entry_id,
+            "status": "deprecated",
+            "merged_into": merge_into,
+            "merged": merge_result,
+        }
 
     entry["status"] = "deprecated"
     entry["deprecated_reason"] = reason
@@ -2363,7 +2455,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.13.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.14.0"},
                 },
             }
         elif method == "notifications/initialized":
