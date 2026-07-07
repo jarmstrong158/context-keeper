@@ -10,14 +10,15 @@ As conversations get long, Claude loses the "why" behind earlier decisions. New 
 
 ## The Solution
 
-Context Keeper gives Claude 11 tools to record and retrieve structured project context:
+Context Keeper gives Claude 13 tools to record and retrieve structured project context:
 
 | Tool | Purpose |
 |------|---------|
 | `record_decision` | Save a decision with structured rationale (problem, why_chosen, what_we_tried, tradeoffs) |
 | `record_pipeline` | Save a multi-step workflow with ordering and `purpose` |
 | `record_constraint` | Save a rule with scope, enforcement level, and `triggering_incident` |
-| `get_context` | Retrieve relevant entries by query, tags, scope, or ID — pulls `related_to` links by default |
+| `get_context` | Retrieve relevant entries by query, tags, scope, or ID — relevance-ranked, pulls `related_to` links by default |
+| `query_entries` | **Exact structured-field filtering** (status, origin, tags, scope, hardness, supersession, dates) — deterministic, no ranking; distinct from `get_context`'s relevance search |
 | `get_project_summary` | Compact overview for conversation start |
 | `update_entry` | Update any entry by ID |
 | `deprecate_entry` | Retire an entry with reason |
@@ -43,6 +44,7 @@ Context Keeper is a small, offline-first memory layer; several of its capabiliti
 | **Origin + trust / source attribution** | Every entry records `origin` (`user` / `agent` / `import`); retrieval gives user-stated entries a trust boost and it decides the default winner when entries conflict. |
 | **Anticipated queries** | `retrieval_hints` stores alternate phrasings a future session might search for, so vocabulary-mismatch queries hit without embeddings. |
 | **Hybrid retrieval** | Lexical (tag + word overlap) by default; an opt-in embedding-cosine blend (`semantic.enabled`) adds vector recall, with lexical fallback when the embedder is offline. |
+| **Fact-metadata query** | `query_entries` filters entries by exact predicates over structured fields (status, origin, tags-any/all, scope, hardness, supersession, dates), AND-combined and deterministic — a precise lookup path distinct from `get_context`'s fuzzy relevance ranking. |
 | **Cache-friendly injection** | The session-start memory block is deterministically ordered with a stable prefix and the only per-session-volatile line (quality-scan IDs) emitted last, so an unchanged store injects byte-identical text across sessions. |
 | **Narrative + clustering** | `get_project_summary` clusters decisions by topic above a threshold and renders a compact narrative; the `DECISIONS.md` projection mirrors the store as human-readable prose. |
 | **Data export / offline / privacy** | Plain JSON in `.context/` you can read, edit, grep, and commit; runs fully offline with zero required dependencies and no data leaving the machine. |
@@ -56,6 +58,33 @@ The retrieval and honesty properties are measured, not asserted — the harness 
 - **Abstention** — measures whether `get_context` says "nothing relevant" instead of confabulating on no-answer queries; the 0.20 relevance floor is the highest with zero false-abstention on the eval set ([`evals/abstention.py`](evals/abstention.py)).
 
 Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md).
+
+## v0.13: Structured Field Query (`query_entries`)
+
+`get_context` answers *"what's relevant to what I'm working on?"* — it ranks by relevance, blends optional semantics, and flags low-relevance results with an abstention signal. That's the right tool for fuzzy recall, but the wrong one when you already know the exact field values you want. `query_entries` fills that gap: **deterministic filtering over the structured fields that already exist on every entry**, no ranking and no abstention.
+
+- **Exact predicates, AND-combined:** `types`, `status` (active/superseded/deprecated), `origin` (user/agent/import), `tags_any`, `tags_all`, `scope` (exact, case-sensitive), `hardness` (absolute/advisory), `supersedes` / `superseded_by`, and the same `since` / `before` temporal filters as `get_context`. Every predicate is a hard match over an existing field — a query either matches or it doesn't.
+- **No relevance, no confabulation.** Results come back in stable natural-ID order with no score and no `min_relevance` floor — an empty result set is a real, honest answer, not an abstention message. The abstention machinery is for fuzzy text queries; a structured predicate doesn't need it.
+- **Same store, same budget.** It reuses the exact store-reading and entry-serialization paths `get_context` uses, and packs the matched set into the same token budget (default 4000, `token_budget` per call), so a broad query can't dump the store — `matched_entries` vs `entries_returned` and a `budget_truncated` flag tell you if the cap clipped anything.
+- **Additive and self-contained.** Zero new dependencies, stdlib only, no embeddings and no LLM call — pure in-memory filtering over JSON already on disk. `get_context`, the semantic blend, the scoring, and every hook are untouched; default behavior of every existing tool is byte-for-byte unchanged.
+
+One deliberate difference from `get_context`: **`query_entries` applies no default status filter**, so `superseded` and `deprecated` entries *are* returned unless you pass `status`. `get_context` always hides deprecated entries; the structured tool lets you ask for them on purpose.
+
+**Examples:**
+
+```jsonc
+// Absolute constraints scoped to the hooks/ directory
+{ "types": ["constraints"], "hardness": "absolute", "scope": "hooks/" }
+
+// User-stated decision that superseded dec-005
+{ "origin": "user", "supersedes": "dec-005" }
+
+// Active pipelines tagged "release"
+{ "types": ["pipelines"], "status": "active", "tags_any": ["release"] }
+
+// Everything a user asserted this month, across all types
+{ "origin": "user", "since": "2026-07-01" }
+```
 
 ## v0.12: Contradiction Detection + Cache-Stable Injection
 
