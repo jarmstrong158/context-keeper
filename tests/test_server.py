@@ -34,6 +34,7 @@ from server import (
     handle_prune_stale,
     handle_record_constraint,
     handle_record_decision,
+    handle_query_entries,
     handle_record_pipeline,
     handle_reload_constraints,
     handle_update_entry,
@@ -1607,6 +1608,199 @@ class TestOverlapClassification:
 
 
 # ===========================================================================
+# query_entries: deterministic structured field filtering (v0.13)
+# ===========================================================================
+
+
+class TestQueryEntries:
+    """A small mixed store, then one filter type per test."""
+
+    def _seed(self, tmp_path):
+        ids = {}
+        d1 = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use JSON files for the entry store",
+            problem="Need a store a human can hand-edit and diff in git without extra tooling.",
+            why_chosen="JSON is human-editable, diffable, and needs zero dependencies unlike SQLite here.",
+            tags=["storage", "architecture"],
+            origin="user",
+        ))
+        d2 = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Switch the entry store to atomic writes",
+            problem="A crash mid-write truncated the JSON store and destroyed recorded history badly.",
+            why_chosen="Atomic temp-file replace keeps the old file intact until the new one is fully written out.",
+            tags=["storage"],
+            origin="user",
+            supersedes=[d1["id"]],
+        ))
+        c1 = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Hook stdout must be ASCII only",
+            reason="Windows cp1252 stdout raises UnicodeEncodeError on non-ASCII and crashes the hook.",
+            scope="hooks/",
+            hardness="absolute",
+            tags=["hooks", "windows"],
+            origin="user",
+        ))
+        c2 = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Prefer small helper functions in the server module",
+            reason="Keeps the growing server handlers readable and independently testable over time.",
+            scope="server.py",
+            hardness="advisory",
+            tags=["style"],
+        ))
+        p1 = handle_record_pipeline(pipeline_params(
+            tmp_path,
+            name="Release flow",
+            purpose="Ship a version bump consistently across pyproject, server.json and server.py.",
+            steps=[{"order": 1, "action": "bump versions"}],
+            tags=["release"],
+        ))
+        ids.update(d1=d1["id"], d2=d2["id"], c1=c1["id"], c2=c2["id"], p1=p1["id"])
+        return ids
+
+    def _q(self, tmp_path, **preds):
+        r = handle_query_entries({"project_dir": str(tmp_path), **preds})
+        return r, [x["entry"]["id"] for x in r["results"]]
+
+    def test_type_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        r, got = self._q(tmp_path, types=["constraints"])
+        assert set(got) == {ids["c1"], ids["c2"]}
+        # Every returned entry is labeled with its singular type.
+        assert all(x["type"] == "constraint" for x in r["results"])
+
+    def test_status_filter_superseded_and_active(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, superseded = self._q(tmp_path, status="superseded")
+        assert superseded == [ids["d1"]]
+        _, active_dec = self._q(tmp_path, types=["decisions"], status="active")
+        assert active_dec == [ids["d2"]]
+
+    def test_no_status_filter_includes_superseded(self, tmp_path):
+        # Unlike get_context, query_entries applies no default status filter.
+        ids = self._seed(tmp_path)
+        _, got = self._q(tmp_path, types=["decisions"])
+        assert set(got) == {ids["d1"], ids["d2"]}
+
+    def test_deprecated_status_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": ids["c2"], "reason": "No longer a convention we keep."
+        })
+        _, dep = self._q(tmp_path, status="deprecated")
+        assert dep == [ids["c2"]]
+        # And it no longer shows under active.
+        _, active_con = self._q(tmp_path, types=["constraints"], status="active")
+        assert active_con == [ids["c1"]]
+
+    def test_origin_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, user_origin = self._q(tmp_path, origin="user")
+        assert set(user_origin) == {ids["d1"], ids["d2"], ids["c1"]}
+        # c2 and p1 default to agent origin.
+        _, agent_origin = self._q(tmp_path, origin="agent")
+        assert set(agent_origin) == {ids["c2"], ids["p1"]}
+
+    def test_scope_exact_match(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, hooks = self._q(tmp_path, scope="hooks/")
+        assert hooks == [ids["c1"]]
+        # Exact, not substring: "hooks" (no slash) matches nothing.
+        _, nope = self._q(tmp_path, scope="hooks")
+        assert nope == []
+
+    def test_hardness_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, absolute = self._q(tmp_path, hardness="absolute")
+        assert absolute == [ids["c1"]]
+        _, advisory = self._q(tmp_path, hardness="advisory")
+        assert advisory == [ids["c2"]]
+
+    def test_tags_any_and_tags_all(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, any_storage = self._q(tmp_path, tags_any=["storage", "release"])
+        assert set(any_storage) == {ids["d1"], ids["d2"], ids["p1"]}
+        _, all_two = self._q(tmp_path, tags_all=["storage", "architecture"])
+        assert all_two == [ids["d1"]]
+
+    def test_supersedes_and_superseded_by(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # The entry that supersedes d1 is d2.
+        _, sup = self._q(tmp_path, supersedes=ids["d1"])
+        assert sup == [ids["d2"]]
+        # The entries replaced by d2 is d1.
+        _, by = self._q(tmp_path, superseded_by=ids["d2"])
+        assert by == [ids["d1"]]
+
+    def test_combined_predicates_and(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # user-origin absolute constraint scoped to hooks/ -> only c1.
+        _, got = self._q(
+            tmp_path, types=["constraints"], origin="user",
+            hardness="absolute", scope="hooks/",
+        )
+        assert got == [ids["c1"]]
+        # Tightening one predicate to a non-match yields nothing.
+        _, none = self._q(
+            tmp_path, types=["constraints"], origin="user",
+            hardness="advisory", scope="hooks/",
+        )
+        assert none == []
+
+    def test_empty_result_is_clean_not_abstention(self, tmp_path):
+        self._seed(tmp_path)
+        r, got = self._q(tmp_path, tags_any=["does-not-exist"])
+        assert got == []
+        assert r["matched_entries"] == 0
+        assert r["entries_returned"] == 0
+        # No relevance/abstention machinery on a structured query.
+        assert "no_confident_match" not in r
+        assert "guidance" not in r
+        assert "top_relevance" not in r
+
+    def test_since_before_temporal_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # Everything was just created; a future `since` excludes all, a future
+        # `before` includes all — same semantics as get_context.
+        _, future = self._q(tmp_path, since="2999-01-01")
+        assert future == []
+        _, past = self._q(tmp_path, before="2999-01-01", types=["decisions"])
+        assert set(past) == {ids["d1"], ids["d2"]}
+
+    def test_stable_id_order(self, tmp_path):
+        self._seed(tmp_path)
+        _, got = self._q(tmp_path)
+        # Deterministic natural-ID order, grouped by prefix then number.
+        assert got == sorted(got, key=lambda i: (i.split("-")[0], int(i.split("-")[1])))
+
+    def test_budget_truncation_flag(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_query_entries({"project_dir": str(tmp_path), "token_budget": 1})
+        # A 1-token budget can't fit any entry; matched > returned, flagged.
+        assert r["matched_entries"] > 0
+        assert r["entries_returned"] == 0
+        assert r["budget_truncated"] is True
+
+    def test_unresolved_project_errors(self):
+        r = handle_query_entries({"status": "active"})
+        assert "error" in r
+
+    def test_get_context_still_hides_deprecated(self, tmp_path):
+        # Guard: query_entries must not have changed get_context's behavior —
+        # get_context still drops deprecated entries by default.
+        ids = self._seed(tmp_path)
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": ids["c1"], "reason": "Retired for this guard test only."
+        })
+        r = handle_get_context({"project_dir": str(tmp_path), "tags": ["hooks"]})
+        returned = [x["entry"]["id"] for x in r["results"]]
+        assert ids["c1"] not in returned
+
+
+# ===========================================================================
 # scope_guard hook (v0.6): edit-time injection of scoped constraints
 # ===========================================================================
 
@@ -2105,11 +2299,15 @@ class TestToolSchemaBudget:
         rejection messages and CLAUDE.md, not in schema descriptions.
         Measured ~2374 tokens at v0.7.1; ~2579 at v0.11.0 after adding the
         12th tool (reload_constraints) with a deliberately terse description
-        — budget raised to 2650 to accommodate one more real tool."""
+        — budget raised to 2650 to accommodate one more real tool. ~3053 at
+        v0.13.0 after adding the 13th tool (query_entries): a field-rich
+        structured-query tool with 13 predicates is inherently ~470 tokens
+        even with trimmed per-field descriptions — budget raised to 3100,
+        cost consciously accepted for a distinct query capability."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 2650, (
-            f"tools/list payload is ~{total} tokens (budget: 2650). "
+        assert total <= 3100, (
+            f"tools/list payload is ~{total} tokens (budget: 3100). "
             "Trim schema descriptions or consciously raise the budget."
         )
 

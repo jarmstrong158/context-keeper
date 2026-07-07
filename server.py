@@ -357,6 +357,62 @@ TOOLS = [
         },
     },
     {
+        "name": "query_entries",
+        "description": (
+            "Structured field filter — exact AND-combined predicates over existing "
+            "fields, NOT relevance search. Complements get_context for when you know "
+            "the field values (e.g. absolute constraints scoped to 'hooks/'). Stable "
+            "ID order, no ranking, no abstention; empty is a real answer. No default "
+            "status filter, so superseded/deprecated are included unless you pass one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "types": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["decisions", "pipelines", "constraints"]},
+                    "description": "Restrict to these entry types. Default: all.",
+                },
+                "status": {
+                    "type": ["string", "array"],
+                    "description": "active/superseded/deprecated (string or list).",
+                },
+                "origin": {
+                    "type": ["string", "array"],
+                    "description": "user/agent/import (string or list). Missing counts as 'agent'.",
+                },
+                "tags_any": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Entries with AT LEAST ONE of these tags.",
+                },
+                "tags_all": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Entries with ALL of these tags.",
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Exact, case-sensitive match on a constraint's scope (e.g. 'hooks/').",
+                },
+                "hardness": {
+                    "type": ["string", "array"],
+                    "description": "Constraint hardness absolute/advisory (string or list).",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": "The entry that superseded this id.",
+                },
+                "superseded_by": {
+                    "type": "string",
+                    "description": "Entries replaced by this id (superseded_by == id).",
+                },
+                "since": {"type": "string", "description": "Verified/created on or after this ISO date."},
+                "before": {"type": "string", "description": "Verified/created strictly before this ISO date."},
+                "token_budget": {"type": "integer", "description": "Max tokens returned (default from config)."},
+                "project_dir": {"type": "string", "description": "Absolute path to another project to query."},
+            },
+        },
+    },
+    {
         "name": "get_project_summary",
         "description": (
             "Concise overview of all active context (constraints, decisions, pipelines). "
@@ -1611,6 +1667,183 @@ def handle_get_context(params):
     return response
 
 
+# ============================================================
+# Structured field query (fact-metadata query) — a deterministic
+# complement to get_context's relevance search. This filters entries by
+# EXACT predicates over fields that already exist on the schema; it does
+# NOT rank, score, blend semantics, or apply the min_relevance abstention
+# floor. A structured query either matches or it doesn't.
+# ============================================================
+
+
+def _as_lower_set(val):
+    """Normalize a string-or-list predicate into a lowercased set, or None
+    when the predicate is absent (absent == not filtered on)."""
+    if val is None:
+        return None
+    vals = [val] if isinstance(val, str) else list(val)
+    return {str(v).strip().lower() for v in vals if str(v).strip()}
+
+
+def _query_id_sort_key(entry):
+    """Natural sort key for readable IDs like 'dec-007': group by type
+    prefix, then by numeric suffix so dec-2 precedes dec-10."""
+    eid = entry.get("id", "") or ""
+    prefix, _, num = eid.partition("-")
+    try:
+        n = int(num)
+    except ValueError:
+        n = 0
+    return (prefix, n, eid)
+
+
+def _entry_matches_query(entry, type_name, f, superseding_ids):
+    """True iff entry satisfies every active predicate in f (AND semantics).
+
+    `type_name` is the plural store name ('decisions'/'pipelines'/
+    'constraints'), matching the `types` param vocabulary get_context uses.
+    Every predicate is a hard, exact match over an existing field. Any
+    predicate left as None is simply not applied. Fields that don't exist
+    on a given entry type (e.g. hardness on a decision) never match a
+    predicate that requires them, which is the intended behavior.
+    """
+    if f["types"] is not None and type_name not in f["types"]:
+        return False
+    if f["status"] is not None and entry.get("status", "active").lower() not in f["status"]:
+        return False
+    if f["origin"] is not None and entry.get("origin", "agent").lower() not in f["origin"]:
+        return False
+    if f["hardness"] is not None and str(entry.get("hardness", "")).lower() not in f["hardness"]:
+        return False
+    if f["scope"] is not None and entry.get("scope") != f["scope"]:
+        return False
+    if f["tags_any"] is not None or f["tags_all"] is not None:
+        etags = {str(t).lower() for t in entry.get("tags", []) or []}
+        if f["tags_any"] is not None and not (etags & f["tags_any"]):
+            return False
+        if f["tags_all"] is not None and not (f["tags_all"] <= etags):
+            return False
+    if f["superseded_by"] is not None and entry.get("superseded_by") != f["superseded_by"]:
+        return False
+    # supersedes: X supersedes target T iff T.superseded_by == X.id. The set
+    # of such X ids was resolved once from the target's back-reference.
+    if f["supersedes"] is not None and entry.get("id") not in superseding_ids:
+        return False
+    return True
+
+
+def handle_query_entries(params):
+    """Deterministic structured-field filter over existing entry fields.
+
+    Complements get_context (relevance search) — it does not rank, score,
+    or abstain. Predicates AND together; results are returned in stable ID
+    order and packed to the same token budget get_context uses.
+    """
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    if not os.path.exists(base_dir):
+        return {
+            "initialized": False,
+            "message": "No context directory found. Use record_* tools to start building project memory.",
+            "results": [],
+            "entries_returned": 0,
+            "matched_entries": 0,
+        }
+
+    cfg = read_config(base_dir)
+    budget = params.get("token_budget", cfg.get("token_budget", 4000))
+    max_entry = cfg.get("max_entry_tokens", 1000)
+
+    # Normalize predicates. `types` restricts which files we read at all.
+    type_filter = _as_lower_set(params.get("types"))
+    f = {
+        "types": type_filter,
+        "status": _as_lower_set(params.get("status")),
+        "origin": _as_lower_set(params.get("origin")),
+        "hardness": _as_lower_set(params.get("hardness")),
+        "scope": params.get("scope"),  # exact match, case-sensitive (paths)
+        "tags_any": _as_lower_set(params.get("tags_any")),
+        "tags_all": _as_lower_set(params.get("tags_all")),
+        "superseded_by": params.get("superseded_by"),
+        "supersedes": params.get("supersedes"),
+    }
+
+    type_labels = {"decisions": "decision", "pipelines": "pipeline", "constraints": "constraint"}
+    paths = _resolve_paths(base_dir)
+    if paths is None:
+        return UNRESOLVED_PROJECT_ERROR
+
+    # Load once through the shared reader. Reading every type keeps the
+    # supersedes back-reference resolvable even when `types` narrows output.
+    typed_entries = []
+    id_map = {}
+    for tname, tpath in paths.items():
+        for e in read_json_file(tpath):
+            typed_entries.append((tname, e))
+            if e.get("id"):
+                id_map[e["id"]] = e
+
+    # Resolve `supersedes: T` to the id(s) that superseded T, via T's stored
+    # back-reference. Empty when T is unknown or was never superseded.
+    superseding_ids = set()
+    if f["supersedes"] is not None:
+        target = id_map.get(f["supersedes"])
+        if target and target.get("superseded_by"):
+            superseding_ids.add(target["superseded_by"])
+
+    # Temporal predicate — identical semantics to get_context's since/before:
+    # compare against the entry's verified/created timestamp; entries with an
+    # unparseable timestamp are excluded while a temporal filter is active.
+    since_dt = _parse_iso_utc(params.get("since"))
+    before_dt = _parse_iso_utc(params.get("before"))
+
+    matched = []
+    for tname, e in typed_entries:
+        if not _entry_matches_query(e, tname, f, superseding_ids):
+            continue
+        if since_dt or before_dt:
+            ts = _entry_timestamp(e)
+            if ts is None:
+                continue
+            if since_dt and ts < since_dt:
+                continue
+            if before_dt and ts >= before_dt:
+                continue
+        matched.append((type_labels.get(tname, tname), e))
+
+    # Stable order by natural ID — deterministic, no relevance involved.
+    matched.sort(key=lambda te: _query_id_sort_key(te[1]))
+
+    # Pack into the token budget exactly as get_context does: serialize with
+    # the same shaping, truncate oversized entries, skip-but-keep-packing so
+    # one large entry doesn't starve smaller matches behind it.
+    results = []
+    used_tokens = 0
+    for entry_type, entry in matched:
+        clean = entry
+        text = json.dumps(clean, indent=2)
+        cost = estimate_tokens(text)
+        if cost > max_entry:
+            clean = _truncate_entry(clean, max_entry)
+            cost = estimate_tokens(json.dumps(clean, indent=2))
+        if used_tokens + cost > budget:
+            continue
+        results.append({"type": entry_type, "entry": clean})
+        used_tokens += cost
+
+    # No abstention, no relevance floor, no guidance: a structured query that
+    # matches nothing simply returns an empty set. Emptiness is a real answer.
+    return {
+        "results": results,
+        "matched_entries": len(matched),
+        "entries_returned": len(results),
+        "tokens_used": used_tokens,
+        "token_budget": budget,
+        "budget_truncated": len(results) < len(matched),
+    }
+
+
 def _constraint_lines(constraints):
     """Format active constraints into the Absolute/Advisory line list.
 
@@ -2093,6 +2326,7 @@ HANDLERS = {
     "record_pipeline": handle_record_pipeline,
     "record_constraint": handle_record_constraint,
     "get_context": handle_get_context,
+    "query_entries": handle_query_entries,
     "get_project_summary": handle_get_project_summary,
     "update_entry": handle_update_entry,
     "export_markdown": handle_export_markdown,
@@ -2129,7 +2363,7 @@ def main():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.12.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.13.0"},
                 },
             }
         elif method == "notifications/initialized":
