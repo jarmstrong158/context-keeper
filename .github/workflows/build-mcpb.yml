@@ -1,0 +1,51 @@
+name: Build MCPB bundle
+
+# Builds the Claude Desktop .mcpb bundle and attaches it to a GitHub Release when
+# one is PUBLISHED, so distribution is "download the .mcpb from Releases".
+#
+# Deliberately triggered by `release: published` (the same event that drives the
+# PyPI publish workflow), NOT by tag push: publishing a Release stays a single
+# deliberate human action, and pushing a bare tag never auto-ships anything. The
+# bundle is uploaded to the already-created release; this workflow never creates
+# one. On manual dispatch it just uploads the bundle as a workflow artifact.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build .mcpb bundle
+        run: bash scripts/build-mcpb.sh
+
+      - name: Validate manifest
+        run: npx --yes @anthropic-ai/mcpb@2 validate mcpb/manifest.json
+
+      - name: Upload bundle as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-keeper-mcpb
+          path: dist/*.mcpb
+
+      - name: Attach bundle to the published Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/*.mcpb

@@ -219,19 +219,43 @@ Legacy entries (pre-v0.4) stay valid — they're never auto-rejected, just flagg
 
 ## Install
 
+Two ways to install, depending on your client. Claude Desktop users get the
+one-click bundle; everything else uses the standard stdio server.
+
+### Option A — Claude Desktop one-click bundle (.mcpb)
+
+Context Keeper ships as an [MCPB desktop extension](https://github.com/anthropics/mcpb):
+a single `.mcpb` file you install without touching any config.
+
+1. Download `context-keeper-<version>.mcpb` from the
+   [Releases page](https://github.com/jarmstrong158/context-keeper/releases).
+2. Double-click it (or drag it into Claude Desktop → Settings → Extensions).
+3. When prompted, choose a **Storage directory** — the folder where your project
+   memory lives (a `.context/` subfolder of readable JSON is created there). Then
+   enable the extension.
+
+That's it — no `pip`, no JSON editing. The bundle is stdlib-only Python, so it has
+no third-party dependencies to install. (Claude Desktop provides the Python
+runtime for `.mcpb` python extensions; you need Python available for it to launch.)
+
+The bundle is built reproducibly from this repo with `scripts/build-mcpb.sh`, and
+CI attaches it to each version's GitHub Release automatically.
+
+### Option B — pip + stdio (Claude Code, Cursor, Codex, any MCP client)
+
 ```bash
 pip install context-keeper-mcp
 ```
 
-### Claude Code
+#### Claude Code
 
 ```bash
 claude mcp add --scope user context-keeper -- python /path/to/context-keeper/server.py
 ```
 
-### Claude Desktop
+#### Claude Desktop (manual config)
 
-Add to your `claude_desktop_config.json`:
+Prefer editing config by hand instead of the `.mcpb` bundle? Add to your `claude_desktop_config.json`:
 
 ```json
 {
@@ -247,7 +271,7 @@ Add to your `claude_desktop_config.json`:
 }
 ```
 
-### Other MCP clients (Cursor, Codex CLI, Gemini CLI, Windsurf, ...)
+#### Other MCP clients (Cursor, Codex CLI, Gemini CLI, Windsurf, ...)
 
 The server is a standard stdio MCP server, so any MCP-capable client can use it — the hooks are Claude Code extras, not requirements. Point your client's MCP config at `python /path/to/context-keeper/server.py` and set `CONTEXT_KEEPER_PROJECT`:
 
@@ -553,3 +577,25 @@ Claude: [calls get_context with project_dir="/path/to/other-project"]
 ```
 
 Or tag entries with other project names for cross-referencing.
+
+## Privacy Policy
+
+Context Keeper is a **local-only** tool. All data — every decision, constraint,
+pipeline, and config file — is stored as plain JSON in the storage directory you
+choose (a `.context/` folder inside it), on your own machine. Concretely:
+
+- **Nothing is transmitted anywhere.** The server makes no network calls of its
+  own and sends no data to the author or any third party.
+- **No telemetry, no analytics, no tracking.** There is no usage reporting of any
+  kind.
+- **You own and can read/edit/delete your data** at any time — it's just JSON
+  files in a folder you picked.
+- **The only optional network feature is fully opt-in and points where you tell
+  it.** If you enable semantic retrieval (`semantic.enabled`, off by default), the
+  server sends entry text to the embeddings endpoint **you configure** — by design
+  a local service such as Ollama or LM Studio. It is never enabled unless you turn
+  it on, and it only contacts the URL you set. If you point it at a third-party
+  endpoint, that endpoint's own privacy policy applies to what you send it.
+
+Because the tool stores data only in your chosen local directory and transmits
+nothing on its own, there is no external service processing your data by default.
