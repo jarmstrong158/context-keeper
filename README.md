@@ -2,6 +2,8 @@
 
 # Context Keeper
 
+_Part of the [xylem](https://github.com/jarmstrong158/xylem) stack._
+
 Project memory for Claude. Records design decisions, pipeline flows, and constraints so Claude maintains context across conversations.
 
 ## The Problem
@@ -599,3 +601,7 @@ choose (a `.context/` folder inside it), on your own machine. Concretely:
 
 Because the tool stores data only in your chosen local directory and transmits
 nothing on its own, there is no external service processing your data by default.
+
+## Related
+
+- [context-keeper-remote](https://github.com/jarmstrong158/context-keeper-remote) — the hosted Cloudflare Worker transport of this server — and the [xylem](https://github.com/jarmstrong158/xylem) hub.
