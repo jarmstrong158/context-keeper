@@ -311,6 +311,74 @@ TOOLS = [
         },
     },
     {
+        "name": "record_entry",
+        "description": (
+            "Unified write tool: record a decision, constraint, or pipeline. "
+            "Consolidates record_decision / record_constraint / record_pipeline "
+            "(which remain as deprecated aliases). Required fields depend on kind "
+            "and are validated server-side: decision needs summary/problem/why_chosen; "
+            "constraint needs rule/reason; pipeline needs name/purpose/steps."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["decision", "constraint", "pipeline"],
+                    "description": "Which kind of entry to record.",
+                },
+                # decision fields
+                "summary": {"type": "string", "description": "decision: what was decided (1-2 sentences)."},
+                "problem": {"type": "string", "description": "decision: what forced it. Min 40 chars."},
+                "why_chosen": {"type": "string", "description": "decision: the reasoning. Min 60 chars."},
+                "what_we_tried": {"type": "string", "description": "decision: prior attempts. Encouraged."},
+                "tradeoffs": {"type": "string", "description": "decision: what was given up. Encouraged."},
+                "alternatives": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {
+                        "option": {"type": "string"}, "reason_rejected": {"type": "string"}}},
+                    "description": "decision: options considered and why rejected.",
+                },
+                "constraints_created": {"type": "array", "items": {"type": "string"},
+                                        "description": "decision: new constraints this introduces."},
+                "supersedes": {"type": "array", "items": {"type": "string"},
+                               "description": "decision: ids of prior decisions this replaces."},
+                # constraint fields
+                "rule": {"type": "string", "description": "constraint: the rule, imperative."},
+                "reason": {"type": "string", "description": "constraint: why it exists. Min 40 chars."},
+                "triggering_incident": {"type": "string", "description": "constraint: the incident behind it."},
+                "scope": {"type": "string", "description": "constraint: 'global' or a file/module path.",
+                          "default": "global"},
+                "hardness": {"type": "string", "enum": ["absolute", "advisory"],
+                             "description": "constraint: absolute vs advisory.", "default": "absolute"},
+                # pipeline fields
+                "name": {"type": "string", "description": "pipeline: name."},
+                "purpose": {"type": "string", "description": "pipeline: why it exists. Min 40 chars."},
+                "when_to_invoke": {"type": "string", "description": "pipeline: triggers. Encouraged."},
+                "steps": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {
+                        "order": {"type": "integer"}, "action": {"type": "string"},
+                        "output": {"type": "string"}}, "required": ["order", "action"]},
+                    "description": "pipeline: ordered steps.",
+                },
+                "constraints": {"type": "array", "items": {"type": "string"},
+                                "description": "pipeline: rules that apply."},
+                # shared fields
+                "related_to": {"type": "array", "items": {"type": "string"},
+                               "description": "ids of related entries; get_context traverses these."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "tags for retrieval."},
+                "retrieval_hints": {"type": "array", "items": {"type": "string"},
+                                    "description": "2-4 alternate phrasings for retrieval."},
+                "origin": {"type": "string", "enum": ["user", "agent", "import"],
+                           "description": "who authored this (default agent)."},
+                "project_dir": {"type": "string",
+                                "description": "Absolute path to the target project. Creates .context/ if needed."},
+            },
+            "required": ["kind"],
+        },
+    },
+    {
         "name": "get_context",
         "description": (
             "Retrieve relevant project context ranked by relevance within a token budget. "
@@ -373,6 +441,18 @@ TOOLS = [
                     "items": {"type": "string", "enum": ["decisions", "pipelines", "constraints"]},
                     "description": "Restrict to these entry types. Default: all.",
                 },
+                "kind": {
+                    "type": ["string", "array"],
+                    "description": "Singular alias for `types` (decision/constraint/pipeline). `types` wins if both given.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Free text over rationale/text fields; every term must appear (AND, substring).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Cap the number of entries returned (matched_entries still reports the total).",
+                },
                 "status": {
                     "type": ["string", "array"],
                     "description": "active/superseded/deprecated (string or list).",
@@ -415,8 +495,10 @@ TOOLS = [
     {
         "name": "get_project_summary",
         "description": (
-            "Concise overview of all active context (constraints, decisions, pipelines). "
-            "Designed for conversation start."
+            "The single orienting call: the whole lay of the land in one response — "
+            "counts by kind and status, active constraints (compact), the most recent "
+            "decisions, and the full id list, plus the human-readable summary. "
+            "Designed for conversation start; no further probing needed to orient."
         ),
         "inputSchema": {
             "type": "object",
@@ -568,6 +650,35 @@ TOOLS = [
                     "type": "string",
                     "description": "Absolute path to the target project.",
                 },
+            },
+        },
+    },
+    {
+        "name": "export_snapshot",
+        "description": (
+            "Write the whole store to a compressed, committable snapshot at "
+            ".context-keeper/memory.json.gz (next to the project) and add a "
+            ".gitattributes merge=ours guard. For sharing project memory with a team "
+            "via git. Committing it is opt-in. Non-destructive to the working store."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "description": "Absolute path to the target project."},
+            },
+        },
+    },
+    {
+        "name": "import_snapshot",
+        "description": (
+            "Import the committed .context-keeper/memory.json.gz snapshot into the "
+            "working store. Non-destructive: a store that already has entries is left "
+            "untouched. Runs automatically on first use when the store is empty."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "description": "Absolute path to the target project."},
             },
         },
     },
@@ -1317,7 +1428,7 @@ def _maybe_export_markdown(base_dir):
 # ============================================================
 
 
-def handle_record_decision(params):
+def _record_decision_impl(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -1397,7 +1508,7 @@ def handle_record_decision(params):
     return _attach_similar(result, entry, base_dir)
 
 
-def handle_record_pipeline(params):
+def _record_pipeline_impl(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -1439,7 +1550,7 @@ def handle_record_pipeline(params):
     return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
 
-def handle_record_constraint(params):
+def _record_constraint_impl(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -1475,6 +1586,54 @@ def handle_record_constraint(params):
     entries.append(entry)
     write_json_file(con_path, entries)
     return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+
+
+# Kind -> the per-kind implementation. record_entry is the canonical write tool;
+# the three record_* tools remain as thin deprecated wrappers (below) so every
+# existing caller keeps working unchanged.
+_RECORD_IMPLS = {
+    "decision": _record_decision_impl,
+    "constraint": _record_constraint_impl,
+    "pipeline": _record_pipeline_impl,
+}
+
+
+def handle_record_entry(params):
+    """Unified write tool: record_entry(kind="decision"|"constraint"|"pipeline", ...).
+
+    Dispatches to the same per-kind implementation the original record_* tools
+    use, so behavior and response shape are identical to calling them directly.
+    Kind-specific required fields (e.g. why_chosen for a decision, steps for a
+    pipeline) are validated by that implementation with the same guidance.
+    """
+    kind = params.get("kind")
+    impl = _RECORD_IMPLS.get(kind)
+    if impl is None:
+        return {
+            "error": "record_entry requires kind to be 'decision', 'constraint', or 'pipeline'.",
+            "validation_errors": [{
+                "field": "kind",
+                "guidance": "Set kind to one of: decision, constraint, pipeline.",
+            }],
+        }
+    inner = {k: v for k, v in params.items() if k != "kind"}
+    return impl(inner)
+
+
+def handle_record_decision(params):
+    """Deprecated: thin wrapper for record_entry(kind="decision"). Kept so
+    existing callers of record_decision keep working unchanged."""
+    return handle_record_entry({**params, "kind": "decision"})
+
+
+def handle_record_pipeline(params):
+    """Deprecated: thin wrapper for record_entry(kind="pipeline")."""
+    return handle_record_entry({**params, "kind": "pipeline"})
+
+
+def handle_record_constraint(params):
+    """Deprecated: thin wrapper for record_entry(kind="constraint")."""
+    return handle_record_entry({**params, "kind": "constraint"})
 
 
 def handle_get_context(params):
@@ -1737,7 +1896,24 @@ def _entry_matches_query(entry, type_name, f, superseding_ids):
     # of such X ids was resolved once from the target's back-reference.
     if f["supersedes"] is not None and entry.get("id") not in superseding_ids:
         return False
+    # Free text over the entry's rationale/text fields: every term must appear
+    # (AND). Substring match against the entry's word blob, so "auth" hits
+    # "authentication". Uses _text_words — the same fields retrieval indexes.
+    if f["text"] is not None:
+        blob = " ".join(_text_words(entry))
+        if not all(term in blob for term in f["text"]):
+            return False
     return True
+
+
+_KIND_TO_TYPE = {"decision": "decisions", "constraint": "constraints", "pipeline": "pipelines"}
+
+
+def _kind_to_types(val):
+    """Map a singular kind (or list) to the plural type name(s) `types` uses.
+    An already-plural or unknown value passes through unchanged."""
+    vals = [val] if isinstance(val, str) else list(val)
+    return [_KIND_TO_TYPE.get(str(v).strip().lower(), str(v).strip().lower()) for v in vals]
 
 
 def handle_query_entries(params):
@@ -1764,7 +1940,15 @@ def handle_query_entries(params):
     max_entry = cfg.get("max_entry_tokens", 1000)
 
     # Normalize predicates. `types` restricts which files we read at all.
-    type_filter = _as_lower_set(params.get("types"))
+    # `kind` is a convenience alias (singular) for `types` — if both are given,
+    # `types` wins. This lets query shapes stop needing new tools.
+    raw_types = params.get("types")
+    if raw_types is None and params.get("kind") is not None:
+        raw_types = _kind_to_types(params["kind"])
+    type_filter = _as_lower_set(raw_types)
+    text = params.get("text")
+    text_terms = [t for t in str(text).lower().split() if t] if text else None
+    limit = params.get("limit")
     f = {
         "types": type_filter,
         "status": _as_lower_set(params.get("status")),
@@ -1775,6 +1959,7 @@ def handle_query_entries(params):
         "tags_all": _as_lower_set(params.get("tags_all")),
         "superseded_by": params.get("superseded_by"),
         "supersedes": params.get("supersedes"),
+        "text": text_terms,
     }
 
     type_labels = {"decisions": "decision", "pipelines": "pipeline", "constraints": "constraint"}
@@ -1829,9 +2014,11 @@ def handle_query_entries(params):
     results = []
     used_tokens = 0
     for entry_type, entry in matched:
+        if limit is not None and len(results) >= limit:
+            break
         clean = entry
-        text = json.dumps(clean, indent=2)
-        cost = estimate_tokens(text)
+        text_json = json.dumps(clean, indent=2)
+        cost = estimate_tokens(text_json)
         if cost > max_entry:
             clean = _truncate_entry(clean, max_entry)
             cost = estimate_tokens(json.dumps(clean, indent=2))
@@ -1922,6 +2109,12 @@ def handle_reload_constraints(params):
 def handle_get_project_summary(params):
     base_dir = _base_dir_from_params(params)
     budget = params.get("token_budget", 2000)
+
+    # First-run hydrate: if this is a fresh clone (empty/absent working store)
+    # but a committed team snapshot is present, import it before summarizing so
+    # the agent starts oriented. No-op when a store already exists, so no
+    # current caller's behavior changes.
+    _maybe_bootstrap_from_snapshot(base_dir)
 
     if base_dir is None or not os.path.exists(base_dir):
         return {
@@ -2018,8 +2211,49 @@ def handle_get_project_summary(params):
             lines.pop()
         summary_text = "\n".join(lines)
 
+    # Additive orientation fields so get_project_summary is the single
+    # "whole lay of the land" call — an agent can orient without further
+    # probing. Every existing key above (summary, counts, stale_entries,
+    # usage_guidance) is unchanged; these are added alongside and are not
+    # subject to the summary-text token budget (they are compact by design).
+    def _status_counts(path):
+        c = {"active": 0, "superseded": 0, "deprecated": 0}
+        for e in read_json_file(path):
+            st = e.get("status", "active")
+            c[st] = c.get(st, 0) + 1
+        return c
+
+    counts_by_status = {
+        "decisions": _status_counts(os.path.join(base_dir, "decisions.json")),
+        "pipelines": _status_counts(os.path.join(base_dir, "pipelines.json")),
+        "constraints": _status_counts(os.path.join(base_dir, "constraints.json")),
+    }
+    active_constraints = [
+        {
+            "id": c.get("id"),
+            "rule": c.get("rule", ""),
+            "hardness": c.get("hardness", "absolute"),
+            "scope": c.get("scope", "global"),
+        }
+        for c in constraints
+    ]
+
+    def _recency_key(e):
+        return e.get("updated_at") or e.get("verified_at") or e.get("created_at") or ""
+
+    recent_decisions = [
+        {"id": d.get("id"), "summary": d.get("summary", "")}
+        for d in sorted(decisions, key=_recency_key, reverse=True)[:5]
+    ]
+    entry_ids = {
+        "decisions": [d.get("id") for d in decisions],
+        "pipelines": [p.get("id") for p in pipelines],
+        "constraints": [c.get("id") for c in constraints],
+    }
+
     return {
         "initialized": True,
+        "project_name": project_name,
         "summary": summary_text,
         "counts": {
             "decisions": len(decisions),
@@ -2027,6 +2261,10 @@ def handle_get_project_summary(params):
             "constraints_absolute": len(absolute),
             "constraints_advisory": len(advisory),
         },
+        "counts_by_status": counts_by_status,
+        "active_constraints": active_constraints,
+        "recent_decisions": recent_decisions,
+        "entry_ids": entry_ids,
         "stale_entries": stale if stale else None,
         "usage_guidance": USAGE_GUIDANCE,
     }
@@ -2413,7 +2651,153 @@ def handle_export_markdown(params):
     }
 
 
+# ============================================================
+# Team-shared snapshot (Item 5)
+#
+# The working store in .context/ is per-machine (and usually gitignored). The
+# snapshot is a single compressed artifact committed NEXT TO the project in
+# .context-keeper/, so a team can share project memory through git. Committing
+# it is opt-in. On first run (empty local store + snapshot present) it is
+# imported automatically so a fresh clone starts with the shared memory.
+#
+# Codec note: stdlib gzip, not zstd. A real .zst needs the third-party
+# `zstandard` package, which would break this project's zero-dependency
+# guarantee; gzip gives a comparable ratio on JSON with no dependency.
+# ============================================================
+
+SNAPSHOT_DIR_NAME = ".context-keeper"
+SNAPSHOT_FILE_NAME = "memory.json.gz"
+SNAPSHOT_SCHEMA = "context-keeper/snapshot@1"
+_SNAPSHOT_STORES = ("decisions", "pipelines", "constraints")
+
+
+def _snapshot_paths(base_dir):
+    """Return (project_root, snapshot_dir, snapshot_file) for a .context dir."""
+    project_root = os.path.dirname(os.path.abspath(base_dir))
+    snap_dir = os.path.join(project_root, SNAPSHOT_DIR_NAME)
+    return project_root, snap_dir, os.path.join(snap_dir, SNAPSHOT_FILE_NAME)
+
+
+def _ensure_snapshot_gitattributes(project_root):
+    """Add `<.context-keeper/memory.json.gz> merge=ours` to .gitattributes so the
+    committed artifact never produces a merge conflict. Idempotent."""
+    line = f"{SNAPSHOT_DIR_NAME}/{SNAPSHOT_FILE_NAME} merge=ours"
+    path = os.path.join(project_root, ".gitattributes")
+    existing = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            existing = f.read()
+        if line in existing.splitlines():
+            return "present"
+    with open(path, "a", encoding="utf-8") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")
+        f.write(line + "\n")
+    return "added"
+
+
+def handle_export_snapshot(params):
+    """Write the whole store to a compressed, committable snapshot and ensure
+    the .gitattributes merge=ours guard. Non-destructive to the working store."""
+    import gzip
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    ensure_context_dir(base_dir)
+
+    stores, counts = {}, {}
+    for name in _SNAPSHOT_STORES:
+        entries = read_json_file(os.path.join(base_dir, name + ".json"))
+        stores[name] = entries
+        counts[name] = len(entries)
+    # Deliberately no export timestamp in the payload: combined with mtime=0
+    # below, the snapshot is byte-identical when the store is unchanged, so
+    # re-exporting doesn't churn the git history (git records the commit time).
+    blob = {"schema": SNAPSHOT_SCHEMA, "stores": stores}
+    # mtime=0 keeps the gzip byte-stable across runs when content is unchanged.
+    packed = gzip.compress(json.dumps(blob, indent=2).encode("utf-8"),
+                           compresslevel=9, mtime=0)
+
+    project_root, snap_dir, snap_path = _snapshot_paths(base_dir)
+    os.makedirs(snap_dir, exist_ok=True)
+    tmp = snap_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(packed)
+    os.replace(tmp, snap_path)
+    ga = _ensure_snapshot_gitattributes(project_root)
+
+    return {
+        "success": True,
+        "path": snap_path,
+        "counts": counts,
+        "bytes": len(packed),
+        "gitattributes": ga,
+        "note": (
+            "Snapshot written. Committing it is opt-in: `git add "
+            f"{SNAPSHOT_DIR_NAME}/{SNAPSHOT_FILE_NAME} .gitattributes` to share "
+            "project memory with your team. For merge=ours to take effect, run "
+            "once per clone: `git config merge.ours.driver true`."
+        ),
+    }
+
+
+def handle_import_snapshot(params):
+    """Import the committed snapshot into the working store. Non-destructive:
+    a store that already has entries is left untouched (reported as skipped)."""
+    import gzip
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    _, _, snap_path = _snapshot_paths(base_dir)
+    if not os.path.exists(snap_path):
+        return {"error": f"No snapshot found at {snap_path}."}
+    try:
+        with gzip.open(snap_path, "rb") as f:
+            blob = json.loads(f.read().decode("utf-8"))
+    except Exception as e:
+        return {"error": f"Could not read snapshot at {snap_path}: {e}"}
+
+    stores = blob.get("stores", {}) if isinstance(blob, dict) else {}
+    ensure_context_dir(base_dir)
+    imported, skipped = {}, {}
+    for name in _SNAPSHOT_STORES:
+        path = os.path.join(base_dir, name + ".json")
+        if read_json_file(path):  # existing entries — never overwrite
+            skipped[name] = True
+            continue
+        entries = stores.get(name, [])
+        if entries:
+            write_json_file(path, entries)
+        imported[name] = len(entries)
+    return {
+        "success": True,
+        "imported": imported,
+        "skipped": skipped or None,
+    }
+
+
+def _maybe_bootstrap_from_snapshot(base_dir):
+    """First-run hydrate: when the working store is empty/absent but a committed
+    snapshot exists, import it so a fresh clone starts with the shared memory.
+    A no-op when any store already has entries or no snapshot exists. Never
+    raises — bootstrap must not break a normal call."""
+    try:
+        if base_dir is None:
+            return None
+        for name in _SNAPSHOT_STORES:
+            if read_json_file(os.path.join(base_dir, name + ".json")):
+                return None  # store already populated -> not a first run
+        _, _, snap_path = _snapshot_paths(base_dir)
+        if not os.path.exists(snap_path):
+            return None
+        return handle_import_snapshot(
+            {"project_dir": os.path.dirname(os.path.abspath(base_dir))})
+    except Exception:
+        return None
+
+
 HANDLERS = {
+    "record_entry": handle_record_entry,
     "record_decision": handle_record_decision,
     "record_pipeline": handle_record_pipeline,
     "record_constraint": handle_record_constraint,
@@ -2427,6 +2811,8 @@ HANDLERS = {
     "get_compaction_report": handle_get_compaction_report,
     "verify_quality": handle_verify_quality,
     "reload_constraints": handle_reload_constraints,
+    "export_snapshot": handle_export_snapshot,
+    "import_snapshot": handle_import_snapshot,
 }
 
 # ============================================================
@@ -2434,7 +2820,7 @@ HANDLERS = {
 # ============================================================
 
 
-def main():
+def _serve_stdio():
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2503,6 +2889,57 @@ def main():
 
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
+
+
+def _run_cli(argv):
+    """CLI parity: `context-keeper <tool> '<json-args>'`.
+
+    Dispatches to the SAME HANDLERS the MCP tools use — no duplicated logic —
+    and prints the handler's result as JSON. Exit codes: 2 for a usage error
+    (unknown tool / bad JSON), 1 if the handler returns an {"error": ...}, 0
+    otherwise. Project resolution is identical to the MCP path (CONTEXT_KEEPER_
+    PROJECT env var, cwd/.context, or a project_dir key in the JSON args).
+    """
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        names = ", ".join(sorted(HANDLERS))
+        sys.stderr.write(
+            "Usage: context-keeper <tool> '<json-args>'\n"
+            f"Tools: {names}\n"
+            'Example: context-keeper query_entries \'{"kind": "constraint"}\'\n')
+        return 0 if argv else 2
+
+    tool = argv[0]
+    handler = HANDLERS.get(tool)
+    if handler is None:
+        sys.stderr.write(
+            f"Unknown tool: {tool}\nRun 'context-keeper --help' for the list.\n")
+        return 2
+
+    raw = argv[1] if len(argv) > 1 else "{}"
+    try:
+        args = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"Invalid JSON args: {e}\n")
+        return 2
+    if not isinstance(args, dict):
+        sys.stderr.write("JSON args must be a JSON object.\n")
+        return 2
+
+    try:
+        result = handler(args)
+    except Exception as e:
+        result = {"error": f"Tool '{tool}' failed: {e}"}
+    sys.stdout.write(json.dumps(result, indent=2) + "\n")
+    return 1 if isinstance(result, dict) and result.get("error") else 0
+
+
+def main():
+    # CLI mode when args are present; otherwise the stdio MCP server (unchanged),
+    # so `context-keeper = server:main` keeps serving stdio with no args.
+    argv = sys.argv[1:]
+    if argv:
+        sys.exit(_run_cli(argv))
+    _serve_stdio()
 
 
 if __name__ == "__main__":
