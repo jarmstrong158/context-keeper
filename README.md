@@ -600,6 +600,38 @@ with `.context/`, or a `project_dir` key in the JSON). Exit codes: `0` success,
 `1` if the tool returns an error, `2` for a usage error. Run with **no
 arguments** and it serves the stdio MCP protocol exactly as before.
 
+## Team-shared memory (opt-in snapshot)
+
+The working store in `.context/` is per-machine (and usually gitignored). To
+share project memory with a team through git, export a single compressed,
+committable snapshot:
+
+```bash
+context-keeper export_snapshot '{}'
+```
+
+This writes `.context-keeper/memory.json.gz` next to your project and adds a
+`.gitattributes` line marking it `merge=ours` so the binary artifact never
+causes a merge conflict. **Committing it is opt-in:**
+
+```bash
+git add .context-keeper/memory.json.gz .gitattributes
+git commit -m "Share project memory"
+# one-time, per clone, for the merge=ours guard to take effect:
+git config merge.ours.driver true
+```
+
+On a fresh clone where the snapshot is present but the working store is empty,
+Context Keeper **imports it automatically on first use** (the first
+`get_project_summary` / session start), so a new teammate starts oriented. Import
+is **non-destructive** — a store that already has entries is never overwritten;
+run `context-keeper import_snapshot '{}'` to trigger it manually.
+
+Codec note: the snapshot uses stdlib **gzip**, not zstd — a real `.zst` would
+require the third-party `zstandard` package, which would break the project's
+zero-dependency guarantee. The snapshot is byte-stable when the store is
+unchanged, so re-exporting doesn't churn git history.
+
 ## Privacy Policy
 
 Context Keeper is a **local-only** tool. All data — every decision, constraint,

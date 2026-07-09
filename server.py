@@ -653,6 +653,35 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "export_snapshot",
+        "description": (
+            "Write the whole store to a compressed, committable snapshot at "
+            ".context-keeper/memory.json.gz (next to the project) and add a "
+            ".gitattributes merge=ours guard. For sharing project memory with a team "
+            "via git. Committing it is opt-in. Non-destructive to the working store."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "description": "Absolute path to the target project."},
+            },
+        },
+    },
+    {
+        "name": "import_snapshot",
+        "description": (
+            "Import the committed .context-keeper/memory.json.gz snapshot into the "
+            "working store. Non-destructive: a store that already has entries is left "
+            "untouched. Runs automatically on first use when the store is empty."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "description": "Absolute path to the target project."},
+            },
+        },
+    },
 ]
 
 # ============================================================
@@ -2081,6 +2110,12 @@ def handle_get_project_summary(params):
     base_dir = _base_dir_from_params(params)
     budget = params.get("token_budget", 2000)
 
+    # First-run hydrate: if this is a fresh clone (empty/absent working store)
+    # but a committed team snapshot is present, import it before summarizing so
+    # the agent starts oriented. No-op when a store already exists, so no
+    # current caller's behavior changes.
+    _maybe_bootstrap_from_snapshot(base_dir)
+
     if base_dir is None or not os.path.exists(base_dir):
         return {
             "initialized": False,
@@ -2616,6 +2651,151 @@ def handle_export_markdown(params):
     }
 
 
+# ============================================================
+# Team-shared snapshot (Item 5)
+#
+# The working store in .context/ is per-machine (and usually gitignored). The
+# snapshot is a single compressed artifact committed NEXT TO the project in
+# .context-keeper/, so a team can share project memory through git. Committing
+# it is opt-in. On first run (empty local store + snapshot present) it is
+# imported automatically so a fresh clone starts with the shared memory.
+#
+# Codec note: stdlib gzip, not zstd. A real .zst needs the third-party
+# `zstandard` package, which would break this project's zero-dependency
+# guarantee; gzip gives a comparable ratio on JSON with no dependency.
+# ============================================================
+
+SNAPSHOT_DIR_NAME = ".context-keeper"
+SNAPSHOT_FILE_NAME = "memory.json.gz"
+SNAPSHOT_SCHEMA = "context-keeper/snapshot@1"
+_SNAPSHOT_STORES = ("decisions", "pipelines", "constraints")
+
+
+def _snapshot_paths(base_dir):
+    """Return (project_root, snapshot_dir, snapshot_file) for a .context dir."""
+    project_root = os.path.dirname(os.path.abspath(base_dir))
+    snap_dir = os.path.join(project_root, SNAPSHOT_DIR_NAME)
+    return project_root, snap_dir, os.path.join(snap_dir, SNAPSHOT_FILE_NAME)
+
+
+def _ensure_snapshot_gitattributes(project_root):
+    """Add `<.context-keeper/memory.json.gz> merge=ours` to .gitattributes so the
+    committed artifact never produces a merge conflict. Idempotent."""
+    line = f"{SNAPSHOT_DIR_NAME}/{SNAPSHOT_FILE_NAME} merge=ours"
+    path = os.path.join(project_root, ".gitattributes")
+    existing = ""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            existing = f.read()
+        if line in existing.splitlines():
+            return "present"
+    with open(path, "a", encoding="utf-8") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")
+        f.write(line + "\n")
+    return "added"
+
+
+def handle_export_snapshot(params):
+    """Write the whole store to a compressed, committable snapshot and ensure
+    the .gitattributes merge=ours guard. Non-destructive to the working store."""
+    import gzip
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    ensure_context_dir(base_dir)
+
+    stores, counts = {}, {}
+    for name in _SNAPSHOT_STORES:
+        entries = read_json_file(os.path.join(base_dir, name + ".json"))
+        stores[name] = entries
+        counts[name] = len(entries)
+    # Deliberately no export timestamp in the payload: combined with mtime=0
+    # below, the snapshot is byte-identical when the store is unchanged, so
+    # re-exporting doesn't churn the git history (git records the commit time).
+    blob = {"schema": SNAPSHOT_SCHEMA, "stores": stores}
+    # mtime=0 keeps the gzip byte-stable across runs when content is unchanged.
+    packed = gzip.compress(json.dumps(blob, indent=2).encode("utf-8"),
+                           compresslevel=9, mtime=0)
+
+    project_root, snap_dir, snap_path = _snapshot_paths(base_dir)
+    os.makedirs(snap_dir, exist_ok=True)
+    tmp = snap_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(packed)
+    os.replace(tmp, snap_path)
+    ga = _ensure_snapshot_gitattributes(project_root)
+
+    return {
+        "success": True,
+        "path": snap_path,
+        "counts": counts,
+        "bytes": len(packed),
+        "gitattributes": ga,
+        "note": (
+            "Snapshot written. Committing it is opt-in: `git add "
+            f"{SNAPSHOT_DIR_NAME}/{SNAPSHOT_FILE_NAME} .gitattributes` to share "
+            "project memory with your team. For merge=ours to take effect, run "
+            "once per clone: `git config merge.ours.driver true`."
+        ),
+    }
+
+
+def handle_import_snapshot(params):
+    """Import the committed snapshot into the working store. Non-destructive:
+    a store that already has entries is left untouched (reported as skipped)."""
+    import gzip
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    _, _, snap_path = _snapshot_paths(base_dir)
+    if not os.path.exists(snap_path):
+        return {"error": f"No snapshot found at {snap_path}."}
+    try:
+        with gzip.open(snap_path, "rb") as f:
+            blob = json.loads(f.read().decode("utf-8"))
+    except Exception as e:
+        return {"error": f"Could not read snapshot at {snap_path}: {e}"}
+
+    stores = blob.get("stores", {}) if isinstance(blob, dict) else {}
+    ensure_context_dir(base_dir)
+    imported, skipped = {}, {}
+    for name in _SNAPSHOT_STORES:
+        path = os.path.join(base_dir, name + ".json")
+        if read_json_file(path):  # existing entries — never overwrite
+            skipped[name] = True
+            continue
+        entries = stores.get(name, [])
+        if entries:
+            write_json_file(path, entries)
+        imported[name] = len(entries)
+    return {
+        "success": True,
+        "imported": imported,
+        "skipped": skipped or None,
+    }
+
+
+def _maybe_bootstrap_from_snapshot(base_dir):
+    """First-run hydrate: when the working store is empty/absent but a committed
+    snapshot exists, import it so a fresh clone starts with the shared memory.
+    A no-op when any store already has entries or no snapshot exists. Never
+    raises — bootstrap must not break a normal call."""
+    try:
+        if base_dir is None:
+            return None
+        for name in _SNAPSHOT_STORES:
+            if read_json_file(os.path.join(base_dir, name + ".json")):
+                return None  # store already populated -> not a first run
+        _, _, snap_path = _snapshot_paths(base_dir)
+        if not os.path.exists(snap_path):
+            return None
+        return handle_import_snapshot(
+            {"project_dir": os.path.dirname(os.path.abspath(base_dir))})
+    except Exception:
+        return None
+
+
 HANDLERS = {
     "record_entry": handle_record_entry,
     "record_decision": handle_record_decision,
@@ -2631,6 +2811,8 @@ HANDLERS = {
     "get_compaction_report": handle_get_compaction_report,
     "verify_quality": handle_verify_quality,
     "reload_constraints": handle_reload_constraints,
+    "export_snapshot": handle_export_snapshot,
+    "import_snapshot": handle_import_snapshot,
 }
 
 # ============================================================

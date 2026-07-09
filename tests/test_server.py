@@ -2554,11 +2554,13 @@ class TestToolSchemaBudget:
         it can drop again once the aliases are eventually retired. ~4066 after
         the consolidation items: query_entries gained kind/text/limit filters and
         get_project_summary's description became the one-call orientation blurb.
-        Budget raised to 4150."""
+        Budget raised to 4150. ~4280 after adding export_snapshot /
+        import_snapshot (team-shared snapshot) — two small schemas; budget
+        raised to 4350."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 4150, (
-            f"tools/list payload is ~{total} tokens (budget: 4150). "
+        assert total <= 4350, (
+            f"tools/list payload is ~{total} tokens (budget: 4350). "
             "Trim schema descriptions or consciously raise the budget."
         )
 
@@ -2802,3 +2804,95 @@ class TestCLI:
         )
         assert proc.returncode == 0
         assert json.loads(proc.stdout.splitlines()[0])["result"]["serverInfo"]["name"] == "context-keeper"
+
+
+# ===========================================================================
+# Team-shared snapshot (Item 5): export / import / first-run bootstrap
+# ===========================================================================
+
+from server import (  # noqa: E402
+    handle_export_snapshot,
+    handle_import_snapshot,
+    SNAPSHOT_DIR_NAME,
+    SNAPSHOT_FILE_NAME,
+)
+
+
+class TestSnapshot:
+    def _seed(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Never log the signing secret in any output",
+            reason="A leaked secret in logs lets anyone forge authenticated requests here."))
+        handle_record_decision(decision_params(
+            tmp_path, summary="Use gzip snapshots for team sharing"))
+
+    def _snap_file(self, tmp_path):
+        return tmp_path / SNAPSHOT_DIR_NAME / SNAPSHOT_FILE_NAME
+
+    def test_export_writes_snapshot_and_gitattributes(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_export_snapshot({"project_dir": str(tmp_path)})
+        assert r["success"] is True
+        assert self._snap_file(tmp_path).exists()
+        assert r["counts"] == {"decisions": 1, "pipelines": 0, "constraints": 1}
+        ga = (tmp_path / ".gitattributes").read_text()
+        assert f"{SNAPSHOT_DIR_NAME}/{SNAPSHOT_FILE_NAME} merge=ours" in ga
+
+    def test_export_is_byte_stable_for_same_content(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        first = self._snap_file(tmp_path).read_bytes()
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        second = self._snap_file(tmp_path).read_bytes()
+        assert first == second  # mtime=0 -> reproducible, no git churn
+
+    def test_gitattributes_idempotent(self, tmp_path):
+        self._seed(tmp_path)
+        assert handle_export_snapshot({"project_dir": str(tmp_path)})["gitattributes"] == "added"
+        assert handle_export_snapshot({"project_dir": str(tmp_path)})["gitattributes"] == "present"
+        # not duplicated
+        ga = (tmp_path / ".gitattributes").read_text()
+        assert ga.count("merge=ours") == 1
+
+    def test_import_into_empty_store_restores(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        # simulate a fresh clone: remove the working store, keep the snapshot
+        import shutil
+        shutil.rmtree(context_dir(tmp_path))
+        r = handle_import_snapshot({"project_dir": str(tmp_path)})
+        assert r["success"] is True
+        assert r["imported"]["decisions"] == 1 and r["imported"]["constraints"] == 1
+        assert (context_dir(tmp_path) / "decisions.json").exists()
+
+    def test_import_is_non_destructive(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        # store still populated -> import must skip, not overwrite
+        r = handle_import_snapshot({"project_dir": str(tmp_path)})
+        assert r["skipped"] == {"decisions": True, "constraints": True}
+
+    def test_import_errors_without_snapshot(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        r = handle_import_snapshot({"project_dir": str(tmp_path)})
+        assert "error" in r
+
+    def test_get_project_summary_bootstraps_on_first_run(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        import shutil
+        shutil.rmtree(context_dir(tmp_path))
+        assert not context_dir(tmp_path).exists()
+        # first orienting call hydrates from the snapshot, then summarizes
+        s = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert s["initialized"] is True
+        assert s["counts"]["decisions"] == 1
+        assert len(s["active_constraints"]) == 1
+
+    def test_bootstrap_noop_when_store_present(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        # add an entry AFTER export; bootstrap must not clobber it back
+        handle_record_decision(decision_params(tmp_path, summary="Added after the snapshot export"))
+        s = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert s["counts"]["decisions"] == 2  # the post-snapshot entry survives
