@@ -580,6 +580,26 @@ Claude: [calls get_context with project_dir="/path/to/other-project"]
 
 Or tag entries with other project names for cross-referencing.
 
+## CLI
+
+Every tool is also reachable from the command line, dispatching to the same
+handlers the MCP server uses:
+
+```bash
+context-keeper <tool> '<json-args>'
+
+# examples
+context-keeper get_project_summary '{}'
+context-keeper record_entry '{"kind":"constraint","rule":"...","reason":"..."}'
+context-keeper query_entries '{"kind":"decision","text":"storage","limit":5}'
+context-keeper --help          # list tools
+```
+
+Project resolution is identical to the server (`CONTEXT_KEEPER_PROJECT`, a cwd
+with `.context/`, or a `project_dir` key in the JSON). Exit codes: `0` success,
+`1` if the tool returns an error, `2` for a usage error. Run with **no
+arguments** and it serves the stdio MCP protocol exactly as before.
+
 ## Privacy Policy
 
 Context Keeper is a **local-only** tool. All data — every decision, constraint,

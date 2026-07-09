@@ -2729,3 +2729,76 @@ class TestConstraintReinjectHook:
             "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
         out = _run_reinject(tmp_path)
         out.encode("ascii")  # raises if any non-ASCII slipped through
+
+
+# ===========================================================================
+# CLI parity (Item 6): context-keeper <tool> '<json>' -> same HANDLERS
+# ===========================================================================
+
+_SERVER = str(Path(__file__).parent.parent / "server.py")
+
+
+def _run_cli(project, *args, env_project=True):
+    env = dict(os.environ)
+    if env_project:
+        env["CONTEXT_KEEPER_PROJECT"] = str(project)
+    return subprocess.run(
+        [sys.executable, _SERVER, *args], capture_output=True, text=True,
+        env=env, timeout=30,
+    )
+
+
+class TestCLI:
+    def test_record_then_query_roundtrip(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        rec = _run_cli(tmp_path, "record_entry", json.dumps({
+            "kind": "constraint",
+            "rule": "Never log the signing secret anywhere",
+            "reason": "A leaked secret in logs lets anyone forge authenticated requests, a bypass.",
+        }))
+        assert rec.returncode == 0
+        assert json.loads(rec.stdout)["id"] == "con-001"
+
+        q = _run_cli(tmp_path, "query_entries", json.dumps({"kind": "constraint"}))
+        assert q.returncode == 0
+        assert json.loads(q.stdout)["matched_entries"] == 1
+
+    def test_project_dir_in_json_args(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        r = _run_cli(tmp_path, "get_project_summary",
+                     json.dumps({"project_dir": str(tmp_path)}), env_project=False)
+        assert r.returncode == 0
+        assert json.loads(r.stdout)["initialized"] in (True, False)
+
+    def test_unknown_tool_exit_2(self, tmp_path):
+        r = _run_cli(tmp_path, "bogus_tool", "{}")
+        assert r.returncode == 2
+        assert "Unknown tool" in r.stderr
+
+    def test_bad_json_exit_2(self, tmp_path):
+        r = _run_cli(tmp_path, "query_entries", "not json")
+        assert r.returncode == 2
+        assert "Invalid JSON" in r.stderr
+
+    def test_handler_error_exit_1(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        # get_context with an unknown id returns {"error": ...} -> exit 1
+        r = _run_cli(tmp_path, "get_context", json.dumps({"id": "dec-999"}))
+        assert r.returncode == 1
+        assert "error" in json.loads(r.stdout)
+
+    def test_help_exit_0_lists_tools(self, tmp_path):
+        r = _run_cli(tmp_path, "--help")
+        assert r.returncode == 0
+        assert "record_entry" in r.stderr and "query_entries" in r.stderr
+
+    def test_no_args_is_stdio_not_cli(self, tmp_path):
+        # With no args the process serves stdio: feed one initialize request.
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
+        proc = subprocess.run(
+            [sys.executable, _SERVER], capture_output=True, text=True, env=env,
+            input='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
+            timeout=30,
+        )
+        assert proc.returncode == 0
+        assert json.loads(proc.stdout.splitlines()[0])["result"]["serverInfo"]["name"] == "context-keeper"

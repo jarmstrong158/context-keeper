@@ -2638,7 +2638,7 @@ HANDLERS = {
 # ============================================================
 
 
-def main():
+def _serve_stdio():
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2707,6 +2707,57 @@ def main():
 
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
+
+
+def _run_cli(argv):
+    """CLI parity: `context-keeper <tool> '<json-args>'`.
+
+    Dispatches to the SAME HANDLERS the MCP tools use — no duplicated logic —
+    and prints the handler's result as JSON. Exit codes: 2 for a usage error
+    (unknown tool / bad JSON), 1 if the handler returns an {"error": ...}, 0
+    otherwise. Project resolution is identical to the MCP path (CONTEXT_KEEPER_
+    PROJECT env var, cwd/.context, or a project_dir key in the JSON args).
+    """
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        names = ", ".join(sorted(HANDLERS))
+        sys.stderr.write(
+            "Usage: context-keeper <tool> '<json-args>'\n"
+            f"Tools: {names}\n"
+            'Example: context-keeper query_entries \'{"kind": "constraint"}\'\n')
+        return 0 if argv else 2
+
+    tool = argv[0]
+    handler = HANDLERS.get(tool)
+    if handler is None:
+        sys.stderr.write(
+            f"Unknown tool: {tool}\nRun 'context-keeper --help' for the list.\n")
+        return 2
+
+    raw = argv[1] if len(argv) > 1 else "{}"
+    try:
+        args = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"Invalid JSON args: {e}\n")
+        return 2
+    if not isinstance(args, dict):
+        sys.stderr.write("JSON args must be a JSON object.\n")
+        return 2
+
+    try:
+        result = handler(args)
+    except Exception as e:
+        result = {"error": f"Tool '{tool}' failed: {e}"}
+    sys.stdout.write(json.dumps(result, indent=2) + "\n")
+    return 1 if isinstance(result, dict) and result.get("error") else 0
+
+
+def main():
+    # CLI mode when args are present; otherwise the stdio MCP server (unchanged),
+    # so `context-keeper = server:main` keeps serving stdio with no args.
+    argv = sys.argv[1:]
+    if argv:
+        sys.exit(_run_cli(argv))
+    _serve_stdio()
 
 
 if __name__ == "__main__":
