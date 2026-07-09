@@ -441,6 +441,18 @@ TOOLS = [
                     "items": {"type": "string", "enum": ["decisions", "pipelines", "constraints"]},
                     "description": "Restrict to these entry types. Default: all.",
                 },
+                "kind": {
+                    "type": ["string", "array"],
+                    "description": "Singular alias for `types` (decision/constraint/pipeline). `types` wins if both given.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Free text over rationale/text fields; every term must appear (AND, substring).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Cap the number of entries returned (matched_entries still reports the total).",
+                },
                 "status": {
                     "type": ["string", "array"],
                     "description": "active/superseded/deprecated (string or list).",
@@ -1855,7 +1867,24 @@ def _entry_matches_query(entry, type_name, f, superseding_ids):
     # of such X ids was resolved once from the target's back-reference.
     if f["supersedes"] is not None and entry.get("id") not in superseding_ids:
         return False
+    # Free text over the entry's rationale/text fields: every term must appear
+    # (AND). Substring match against the entry's word blob, so "auth" hits
+    # "authentication". Uses _text_words — the same fields retrieval indexes.
+    if f["text"] is not None:
+        blob = " ".join(_text_words(entry))
+        if not all(term in blob for term in f["text"]):
+            return False
     return True
+
+
+_KIND_TO_TYPE = {"decision": "decisions", "constraint": "constraints", "pipeline": "pipelines"}
+
+
+def _kind_to_types(val):
+    """Map a singular kind (or list) to the plural type name(s) `types` uses.
+    An already-plural or unknown value passes through unchanged."""
+    vals = [val] if isinstance(val, str) else list(val)
+    return [_KIND_TO_TYPE.get(str(v).strip().lower(), str(v).strip().lower()) for v in vals]
 
 
 def handle_query_entries(params):
@@ -1882,7 +1911,15 @@ def handle_query_entries(params):
     max_entry = cfg.get("max_entry_tokens", 1000)
 
     # Normalize predicates. `types` restricts which files we read at all.
-    type_filter = _as_lower_set(params.get("types"))
+    # `kind` is a convenience alias (singular) for `types` — if both are given,
+    # `types` wins. This lets query shapes stop needing new tools.
+    raw_types = params.get("types")
+    if raw_types is None and params.get("kind") is not None:
+        raw_types = _kind_to_types(params["kind"])
+    type_filter = _as_lower_set(raw_types)
+    text = params.get("text")
+    text_terms = [t for t in str(text).lower().split() if t] if text else None
+    limit = params.get("limit")
     f = {
         "types": type_filter,
         "status": _as_lower_set(params.get("status")),
@@ -1893,6 +1930,7 @@ def handle_query_entries(params):
         "tags_all": _as_lower_set(params.get("tags_all")),
         "superseded_by": params.get("superseded_by"),
         "supersedes": params.get("supersedes"),
+        "text": text_terms,
     }
 
     type_labels = {"decisions": "decision", "pipelines": "pipeline", "constraints": "constraint"}
@@ -1947,9 +1985,11 @@ def handle_query_entries(params):
     results = []
     used_tokens = 0
     for entry_type, entry in matched:
+        if limit is not None and len(results) >= limit:
+            break
         clean = entry
-        text = json.dumps(clean, indent=2)
-        cost = estimate_tokens(text)
+        text_json = json.dumps(clean, indent=2)
+        cost = estimate_tokens(text_json)
         if cost > max_entry:
             clean = _truncate_entry(clean, max_entry)
             cost = estimate_tokens(json.dumps(clean, indent=2))

@@ -1866,6 +1866,46 @@ class TestQueryEntries:
         r = handle_query_entries({"project_dir": str(tmp_path), **preds})
         return r, [x["entry"]["id"] for x in r["results"]]
 
+    def test_kind_alias_maps_to_types(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, got = self._q(tmp_path, kind="constraint")
+        assert set(got) == {ids["c1"], ids["c2"]}
+        # list form works too
+        _, got2 = self._q(tmp_path, kind=["decision", "pipeline"])
+        assert set(got2) == {ids["d1"], ids["d2"], ids["p1"]}
+        # explicit `types` wins over `kind` when both are given
+        _, got3 = self._q(tmp_path, kind="constraint", types=["pipelines"])
+        assert set(got3) == {ids["p1"]}
+
+    def test_text_filter_and_terms(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # "atomic" appears only in d2's summary/rationale
+        _, got = self._q(tmp_path, text="atomic")
+        assert got == [ids["d2"]]
+        # all terms must appear (AND): "atomic" and "json" both in d2
+        _, both = self._q(tmp_path, text="atomic json")
+        assert both == [ids["d2"]]
+        # a term present nowhere -> empty
+        _, none = self._q(tmp_path, text="kubernetes")
+        assert none == []
+
+    def test_text_combines_with_other_predicates(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # text + kind AND together
+        _, got = self._q(tmp_path, kind="constraint", text="ascii")
+        assert got == [ids["c1"]]
+
+    def test_limit_caps_returned_but_reports_total(self, tmp_path):
+        self._seed(tmp_path)
+        r, got = self._q(tmp_path, limit=2)
+        assert len(got) == 2
+        assert r["entries_returned"] == 2
+        assert r["matched_entries"] == 5      # total matched, not the limited count
+        assert r["budget_truncated"] is True
+        # no limit -> all five
+        r2, got2 = self._q(tmp_path)
+        assert len(got2) == 5 and r2["matched_entries"] == 5
+
     def test_type_filter(self, tmp_path):
         ids = self._seed(tmp_path)
         r, got = self._q(tmp_path, types=["constraints"])
@@ -2511,11 +2551,14 @@ class TestToolSchemaBudget:
         three record_* schemas, and during the deprecation window we
         deliberately keep BOTH record_entry and the three aliases so no caller
         breaks — that transitional overlap is the cost. Budget raised to 4000;
-        it can drop again once the aliases are eventually retired."""
+        it can drop again once the aliases are eventually retired. ~4066 after
+        the consolidation items: query_entries gained kind/text/limit filters and
+        get_project_summary's description became the one-call orientation blurb.
+        Budget raised to 4150."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 4000, (
-            f"tools/list payload is ~{total} tokens (budget: 4000). "
+        assert total <= 4150, (
+            f"tools/list payload is ~{total} tokens (budget: 4150). "
             "Trim schema descriptions or consciously raise the budget."
         )
 
