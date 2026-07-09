@@ -34,6 +34,7 @@ from server import (
     handle_prune_stale,
     handle_record_constraint,
     handle_record_decision,
+    handle_record_entry,
     handle_query_entries,
     handle_record_pipeline,
     handle_reload_constraints,
@@ -464,6 +465,59 @@ class TestRecordConstraint:
         assert entry["status"] == "active"
         assert "created_at" in entry
         assert "verified_at" in entry
+
+
+class TestRecordEntry:
+    """Unified record_entry(kind=...) dispatches to the same impls; the three
+    record_* tools are now thin wrappers producing identical results."""
+
+    def _strip_volatile(self, entry):
+        # created_at/verified_at are wall-clock and differ between two calls.
+        return {k: v for k, v in entry.items() if k not in ("created_at", "verified_at", "id")}
+
+    def test_kind_decision_matches_record_decision(self, tmp_path):
+        p = decision_params(tmp_path, summary="Use JSON storage for entries",
+                            tags=["storage"])
+        via_entry = handle_record_entry({**p, "kind": "decision"})
+        assert via_entry["success"] is True and via_entry["id"].startswith("dec-")
+        # A second store: record_decision (the wrapper) yields the same shape.
+        direct = handle_record_decision(decision_params(
+            tmp_path, summary="Use JSON storage for entries", tags=["storage"]))
+        assert self._strip_volatile(via_entry["entry"]) == self._strip_volatile(direct["entry"])
+
+    def test_kind_constraint_writes_constraints_json(self, tmp_path):
+        r = handle_record_entry(constraint_params(
+            tmp_path, kind="constraint", rule="Never call eval on user input",
+            reason="Executing user input is a remote code execution vector, full compromise."))
+        assert r["success"] is True and r["id"].startswith("con-")
+        assert (context_dir(tmp_path) / "constraints.json").exists()
+
+    def test_kind_pipeline_writes_pipelines_json(self, tmp_path):
+        r = handle_record_entry(pipeline_params(tmp_path, kind="pipeline"))
+        assert r["success"] is True and r["id"].startswith("pipe-")
+        assert (context_dir(tmp_path) / "pipelines.json").exists()
+
+    def test_missing_kind_errors(self, tmp_path):
+        r = handle_record_entry(decision_params(tmp_path))  # no kind
+        assert "error" in r and "kind" in r["error"]
+
+    def test_bad_kind_errors(self, tmp_path):
+        r = handle_record_entry(decision_params(tmp_path, kind="gizmo"))
+        assert "error" in r
+
+    def test_kind_specific_validation_still_enforced(self, tmp_path):
+        # decision requires why_chosen >= 60 chars; a too-short one is rejected
+        # through record_entry exactly as through record_decision.
+        r = handle_record_entry({
+            "project_dir": str(tmp_path), "kind": "decision",
+            "summary": "x", "problem": "y", "why_chosen": "too short",
+        })
+        assert "validation_errors" in r or "error" in r
+
+    def test_wrappers_still_registered(self):
+        from server import HANDLERS
+        for name in ("record_entry", "record_decision", "record_pipeline", "record_constraint"):
+            assert name in HANDLERS
 
 
 # ===========================================================================
@@ -2415,11 +2469,16 @@ class TestToolSchemaBudget:
         even with trimmed per-field descriptions — budget raised to 3100,
         cost consciously accepted for a distinct query capability. ~3121 at
         v0.14.0 after adding the merge_into param to deprecate_entry (dedup
-        merge) — one param, no new tool; budget raised to 3150."""
+        merge) — one param, no new tool; budget raised to 3150. ~3923 after
+        adding record_entry, the unified write tool: it carries the union of the
+        three record_* schemas, and during the deprecation window we
+        deliberately keep BOTH record_entry and the three aliases so no caller
+        breaks — that transitional overlap is the cost. Budget raised to 4000;
+        it can drop again once the aliases are eventually retired."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 3150, (
-            f"tools/list payload is ~{total} tokens (budget: 3150). "
+        assert total <= 4000, (
+            f"tools/list payload is ~{total} tokens (budget: 4000). "
             "Trim schema descriptions or consciously raise the budget."
         )
 

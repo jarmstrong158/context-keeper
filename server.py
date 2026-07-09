@@ -311,6 +311,74 @@ TOOLS = [
         },
     },
     {
+        "name": "record_entry",
+        "description": (
+            "Unified write tool: record a decision, constraint, or pipeline. "
+            "Consolidates record_decision / record_constraint / record_pipeline "
+            "(which remain as deprecated aliases). Required fields depend on kind "
+            "and are validated server-side: decision needs summary/problem/why_chosen; "
+            "constraint needs rule/reason; pipeline needs name/purpose/steps."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["decision", "constraint", "pipeline"],
+                    "description": "Which kind of entry to record.",
+                },
+                # decision fields
+                "summary": {"type": "string", "description": "decision: what was decided (1-2 sentences)."},
+                "problem": {"type": "string", "description": "decision: what forced it. Min 40 chars."},
+                "why_chosen": {"type": "string", "description": "decision: the reasoning. Min 60 chars."},
+                "what_we_tried": {"type": "string", "description": "decision: prior attempts. Encouraged."},
+                "tradeoffs": {"type": "string", "description": "decision: what was given up. Encouraged."},
+                "alternatives": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {
+                        "option": {"type": "string"}, "reason_rejected": {"type": "string"}}},
+                    "description": "decision: options considered and why rejected.",
+                },
+                "constraints_created": {"type": "array", "items": {"type": "string"},
+                                        "description": "decision: new constraints this introduces."},
+                "supersedes": {"type": "array", "items": {"type": "string"},
+                               "description": "decision: ids of prior decisions this replaces."},
+                # constraint fields
+                "rule": {"type": "string", "description": "constraint: the rule, imperative."},
+                "reason": {"type": "string", "description": "constraint: why it exists. Min 40 chars."},
+                "triggering_incident": {"type": "string", "description": "constraint: the incident behind it."},
+                "scope": {"type": "string", "description": "constraint: 'global' or a file/module path.",
+                          "default": "global"},
+                "hardness": {"type": "string", "enum": ["absolute", "advisory"],
+                             "description": "constraint: absolute vs advisory.", "default": "absolute"},
+                # pipeline fields
+                "name": {"type": "string", "description": "pipeline: name."},
+                "purpose": {"type": "string", "description": "pipeline: why it exists. Min 40 chars."},
+                "when_to_invoke": {"type": "string", "description": "pipeline: triggers. Encouraged."},
+                "steps": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {
+                        "order": {"type": "integer"}, "action": {"type": "string"},
+                        "output": {"type": "string"}}, "required": ["order", "action"]},
+                    "description": "pipeline: ordered steps.",
+                },
+                "constraints": {"type": "array", "items": {"type": "string"},
+                                "description": "pipeline: rules that apply."},
+                # shared fields
+                "related_to": {"type": "array", "items": {"type": "string"},
+                               "description": "ids of related entries; get_context traverses these."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "tags for retrieval."},
+                "retrieval_hints": {"type": "array", "items": {"type": "string"},
+                                    "description": "2-4 alternate phrasings for retrieval."},
+                "origin": {"type": "string", "enum": ["user", "agent", "import"],
+                           "description": "who authored this (default agent)."},
+                "project_dir": {"type": "string",
+                                "description": "Absolute path to the target project. Creates .context/ if needed."},
+            },
+            "required": ["kind"],
+        },
+    },
+    {
         "name": "get_context",
         "description": (
             "Retrieve relevant project context ranked by relevance within a token budget. "
@@ -1317,7 +1385,7 @@ def _maybe_export_markdown(base_dir):
 # ============================================================
 
 
-def handle_record_decision(params):
+def _record_decision_impl(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -1397,7 +1465,7 @@ def handle_record_decision(params):
     return _attach_similar(result, entry, base_dir)
 
 
-def handle_record_pipeline(params):
+def _record_pipeline_impl(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -1439,7 +1507,7 @@ def handle_record_pipeline(params):
     return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
 
-def handle_record_constraint(params):
+def _record_constraint_impl(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -1475,6 +1543,54 @@ def handle_record_constraint(params):
     entries.append(entry)
     write_json_file(con_path, entries)
     return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+
+
+# Kind -> the per-kind implementation. record_entry is the canonical write tool;
+# the three record_* tools remain as thin deprecated wrappers (below) so every
+# existing caller keeps working unchanged.
+_RECORD_IMPLS = {
+    "decision": _record_decision_impl,
+    "constraint": _record_constraint_impl,
+    "pipeline": _record_pipeline_impl,
+}
+
+
+def handle_record_entry(params):
+    """Unified write tool: record_entry(kind="decision"|"constraint"|"pipeline", ...).
+
+    Dispatches to the same per-kind implementation the original record_* tools
+    use, so behavior and response shape are identical to calling them directly.
+    Kind-specific required fields (e.g. why_chosen for a decision, steps for a
+    pipeline) are validated by that implementation with the same guidance.
+    """
+    kind = params.get("kind")
+    impl = _RECORD_IMPLS.get(kind)
+    if impl is None:
+        return {
+            "error": "record_entry requires kind to be 'decision', 'constraint', or 'pipeline'.",
+            "validation_errors": [{
+                "field": "kind",
+                "guidance": "Set kind to one of: decision, constraint, pipeline.",
+            }],
+        }
+    inner = {k: v for k, v in params.items() if k != "kind"}
+    return impl(inner)
+
+
+def handle_record_decision(params):
+    """Deprecated: thin wrapper for record_entry(kind="decision"). Kept so
+    existing callers of record_decision keep working unchanged."""
+    return handle_record_entry({**params, "kind": "decision"})
+
+
+def handle_record_pipeline(params):
+    """Deprecated: thin wrapper for record_entry(kind="pipeline")."""
+    return handle_record_entry({**params, "kind": "pipeline"})
+
+
+def handle_record_constraint(params):
+    """Deprecated: thin wrapper for record_entry(kind="constraint")."""
+    return handle_record_entry({**params, "kind": "constraint"})
 
 
 def handle_get_context(params):
@@ -2414,6 +2530,7 @@ def handle_export_markdown(params):
 
 
 HANDLERS = {
+    "record_entry": handle_record_entry,
     "record_decision": handle_record_decision,
     "record_pipeline": handle_record_pipeline,
     "record_constraint": handle_record_constraint,
