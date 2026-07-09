@@ -677,6 +677,43 @@ class TestGetProjectSummary:
         result = handle_get_project_summary(project_params(tmp_path))
         assert "Use JSON storage" in result["summary"]
 
+    def test_orientation_fields_present_and_shaped(self, tmp_path):
+        self._populate(tmp_path)
+        r = handle_get_project_summary(project_params(tmp_path))
+        # existing keys preserved (SessionStart hook + current callers rely on these)
+        for k in ("initialized", "summary", "counts", "stale_entries", "usage_guidance"):
+            assert k in r
+        # additive orientation fields
+        assert r["counts_by_status"]["decisions"] == {"active": 1, "superseded": 0, "deprecated": 0}
+        assert r["counts_by_status"]["constraints"]["active"] == 2
+        rules = {c["rule"] for c in r["active_constraints"]}
+        assert rules == {"Never use eval()", "Prefer list comps"}
+        assert all({"id", "rule", "hardness", "scope"} <= set(c) for c in r["active_constraints"])
+        assert r["recent_decisions"] == [{"id": "dec-001", "summary": "Use JSON storage"}]
+        assert r["entry_ids"] == {
+            "decisions": ["dec-001"], "pipelines": ["pipe-001"],
+            "constraints": ["con-001", "con-002"]}
+
+    def test_recent_decisions_capped_and_ordered(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        for i in range(7):
+            handle_record_decision(decision_params(
+                tmp_path, summary=f"Decision number {i} about the storage layer design"))
+        r = handle_get_project_summary(project_params(tmp_path))
+        assert len(r["recent_decisions"]) == 5           # capped at 5
+        assert r["recent_decisions"][0]["id"] == "dec-007"  # most recent first
+        assert len(r["entry_ids"]["decisions"]) == 7      # id list is complete
+
+    def test_counts_by_status_includes_superseded_and_deprecated(self, tmp_path):
+        d1 = handle_record_decision(decision_params(tmp_path, summary="Original storage decision here"))
+        handle_record_decision(decision_params(
+            tmp_path, summary="Replacement storage decision", supersedes=[d1["id"]]))
+        c1 = handle_record_constraint(constraint_params(tmp_path, rule="A rule to be retired soon"))
+        handle_deprecate_entry({"project_dir": str(tmp_path), "id": c1["id"], "reason": "no longer needed"})
+        r = handle_get_project_summary(project_params(tmp_path))
+        assert r["counts_by_status"]["decisions"] == {"active": 1, "superseded": 1, "deprecated": 0}
+        assert r["counts_by_status"]["constraints"]["deprecated"] == 1
+
     def test_summary_contains_pipeline(self, tmp_path):
         self._populate(tmp_path)
         result = handle_get_project_summary(project_params(tmp_path))

@@ -483,8 +483,10 @@ TOOLS = [
     {
         "name": "get_project_summary",
         "description": (
-            "Concise overview of all active context (constraints, decisions, pipelines). "
-            "Designed for conversation start."
+            "The single orienting call: the whole lay of the land in one response — "
+            "counts by kind and status, active constraints (compact), the most recent "
+            "decisions, and the full id list, plus the human-readable summary. "
+            "Designed for conversation start; no further probing needed to orient."
         ),
         "inputSchema": {
             "type": "object",
@@ -2134,8 +2136,49 @@ def handle_get_project_summary(params):
             lines.pop()
         summary_text = "\n".join(lines)
 
+    # Additive orientation fields so get_project_summary is the single
+    # "whole lay of the land" call — an agent can orient without further
+    # probing. Every existing key above (summary, counts, stale_entries,
+    # usage_guidance) is unchanged; these are added alongside and are not
+    # subject to the summary-text token budget (they are compact by design).
+    def _status_counts(path):
+        c = {"active": 0, "superseded": 0, "deprecated": 0}
+        for e in read_json_file(path):
+            st = e.get("status", "active")
+            c[st] = c.get(st, 0) + 1
+        return c
+
+    counts_by_status = {
+        "decisions": _status_counts(os.path.join(base_dir, "decisions.json")),
+        "pipelines": _status_counts(os.path.join(base_dir, "pipelines.json")),
+        "constraints": _status_counts(os.path.join(base_dir, "constraints.json")),
+    }
+    active_constraints = [
+        {
+            "id": c.get("id"),
+            "rule": c.get("rule", ""),
+            "hardness": c.get("hardness", "absolute"),
+            "scope": c.get("scope", "global"),
+        }
+        for c in constraints
+    ]
+
+    def _recency_key(e):
+        return e.get("updated_at") or e.get("verified_at") or e.get("created_at") or ""
+
+    recent_decisions = [
+        {"id": d.get("id"), "summary": d.get("summary", "")}
+        for d in sorted(decisions, key=_recency_key, reverse=True)[:5]
+    ]
+    entry_ids = {
+        "decisions": [d.get("id") for d in decisions],
+        "pipelines": [p.get("id") for p in pipelines],
+        "constraints": [c.get("id") for c in constraints],
+    }
+
     return {
         "initialized": True,
+        "project_name": project_name,
         "summary": summary_text,
         "counts": {
             "decisions": len(decisions),
@@ -2143,6 +2186,10 @@ def handle_get_project_summary(params):
             "constraints_absolute": len(absolute),
             "constraints_advisory": len(advisory),
         },
+        "counts_by_status": counts_by_status,
+        "active_constraints": active_constraints,
+        "recent_decisions": recent_decisions,
+        "entry_ids": entry_ids,
         "stale_entries": stale if stale else None,
         "usage_guidance": USAGE_GUIDANCE,
     }
