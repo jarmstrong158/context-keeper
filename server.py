@@ -7,6 +7,7 @@ so Claude maintains context across conversations. Zero external dependencies.
 
 import json
 import os
+import secrets
 import sys
 from datetime import datetime, timezone
 
@@ -572,73 +573,65 @@ def read_config(base_dir=None):
         return dict(DEFAULT_CONFIG)
 
 
-def _id_namespace():
-    """The origin namespace this store mints IDs in (default: "" = canonical).
+def _leading_int(eid, prefix):
+    """Parse the numeric part of an id, tolerating an Option-B suffix.
 
-    ID-collision safety (chosen approach = Option A, "namespace by origin",
-    applied ASYMMETRICALLY so it stays backward compatible):
-
-      Two stores writing sequential IDs independently WILL collide
-      (local mints dec-063, remote mints dec-063, different entries). The
-      fix is to give each independent writer its own disjoint namespace.
-
-      The LOCAL canonical store keeps the *bare* namespace it has always
-      used -- dec-001, con-001, pipe-001 -- so every existing id
-      (dec-001..dec-062, con-001..con-018) stays valid and readable, and
-      the existing test-suite expectations (dec-001, dec-002, ...) hold.
-
-      Any SECONDARY store (the remote Worker, a phone) sets
-      CONTEXT_KEEPER_ID_NAMESPACE to a short tag -- "r" for remote -- and
-      mints dec-r001, con-r001, ... Because "" and "r" are disjoint and
-      each side only counts IDs in its OWN namespace when computing the
-      next number, the two sequences can never collide. next_id below is
-      namespace-aware; foreign-namespace IDs pulled in from the remote are
-      simply skipped when numbering (they never inflate the local counter).
-
-    Rejected alternatives:
-      - Random suffix (dec-001-a7f3): breaks the human-readable, sortable,
-        stable ids that DECISIONS.md and every existing reference rely on,
-        and would have to rewrite 80 live ids to be consistent.
-      - Timestamp ids (dec-20260710T1055): same readability/stability loss,
-        and collisions are still possible within a second on one store.
-    """
-    return (os.environ.get("CONTEXT_KEEPER_ID_NAMESPACE") or "").strip()
-
-
-def _split_id(eid, prefix):
-    """Split an id 'dec-r012' into (namespace, number) -> ('r', 12).
-
-    Returns (None, None) if the id doesn't belong to `prefix` or has no
-    trailing number. The namespace is the non-digit run between the prefix
-    dash and the number, so bare 'dec-012' -> ('', 12).
+    'dec-012' -> 12, 'dec-012-a7f3' -> 12, non-matching -> None. Reads the
+    run of digits right after the prefix dash and stops at the first
+    non-digit, so a suffixed id still contributes its sequence number.
     """
     if not eid.startswith(prefix + "-"):
-        return None, None
+        return None
     rest = eid[len(prefix) + 1:]
-    i = 0
-    while i < len(rest) and not rest[i].isdigit():
-        i += 1
-    ns, num_part = rest[:i], rest[i:]
-    if not num_part:
-        return None, None
-    try:
-        return ns, int(num_part)
-    except ValueError:
-        return None, None
+    digits = ""
+    for ch in rest:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return int(digits) if digits else None
 
 
 def next_id(entries, prefix):
-    ns = _id_namespace()
+    """Mint the next id for a store.
+
+    ID-collision safety (chosen approach = Option B, "short random suffix
+    on new ids", per the mirror design):
+
+      Two stores that mint sequential ids independently collide: the local
+      desktop store and the remote Worker both hand out 'dec-013' for
+      different decisions, and import_entries -- which skips existing
+      (project, id) rather than overwriting -- would then silently drop
+      whichever arrived second. The fix is to make every NEW id unique
+      across stores by appending a short random hex suffix: 'dec-013-a7f3'.
+
+      Two properties this preserves:
+        - Old ids stay stable and readable. dec-001..dec-062 /
+          con-001..con-018 are never rewritten; the number still leads, so
+          they remain sortable and greppable, and DECISIONS.md is unchanged.
+        - The suffix is only added when a SECOND store actually exists --
+          i.e. when mirroring is configured (CONTEXT_KEEPER_REMOTE_URL set).
+          With mirroring off there is exactly one writer, no collision is
+          possible, and ids stay bare 'dec-013' (so single-store use and the
+          existing test-suite expectations are untouched). A local suffixed
+          id ('dec-013-a7f3') can never equal a remote-minted bare id
+          ('dec-013') or another store's differently-suffixed id, so
+          independent creation on both sides no longer collides.
+
+    Rejected alternatives: origin-namespaced ids (dec-r013) require the
+    remote to cooperate on a namespace tag it does not emit; timestamp ids
+    lose readability and can still collide within a second.
+    """
     max_num = 0
     for e in entries:
-        entry_ns, num = _split_id(e.get("id", ""), prefix)
-        # Only count IDs minted in OUR namespace. A canonical store ("")
-        # ignores pulled-in remote ids (dec-r005); a remote store ("r")
-        # ignores the local dec-005 series. Disjoint -> collision-free.
-        if entry_ns != ns or num is None:
-            continue
-        max_num = max(max_num, num)
-    return f"{prefix}-{ns}{max_num + 1:03d}"
+        num = _leading_int(e.get("id", ""), prefix)
+        if num is not None:
+            max_num = max(max_num, num)
+    base = f"{prefix}-{max_num + 1:03d}"
+    # Add the collision-avoidance suffix only when a second store exists.
+    if _mirror is not None and _mirror.mirror_enabled():
+        base += "-" + secrets.token_hex(2)
+    return base
 
 
 def now_iso():

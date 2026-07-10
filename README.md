@@ -30,25 +30,25 @@ All data stored as human-editable JSON files in `.context/` inside your project 
 
 ## v0.11: Two-Way Mirror (local <-> remote)
 
-Optional, fail-soft mirroring so a second device — e.g. a phone recording decisions on the go — can both **receive** the desktop's memory and **contribute** its own. The local `.context/` JSON store stays **canonical**; the remote (a Cloudflare Worker in the reference deployment) is a sync surface, never the source of truth.
+Optional, fail-soft mirroring so a second device — e.g. a phone recording decisions on the go — can both **receive** the desktop's memory and **contribute** its own. The local `.context/` JSON store stays **canonical**; the [context-keeper-remote](https://github.com/jarmstrong158/context-keeper-remote) Cloudflare Worker is a sync surface, never the source of truth.
 
-- **Mirror out (local -> remote).** After every `record_*`, `update_entry`, and `deprecate_entry`, the entry is POSTed to the remote. If the remote is unreachable the entry is queued to `.context/.mirror_queue.json` and flushed on the next successful push. A push failure **never** blocks or fails the local write.
-- **Mirror in (remote -> local).** `pull_remote` fetches entries newer than a local watermark (`.context/.mirror_watermark`) and merges them **additively** — a remote entry whose id already exists locally never overwrites the local copy. Wired into the SessionStart hook (so desktop sessions start with phone-recorded entries present) and exposed as the `pull_remote` MCP tool.
-- **`backfill_remote`** pushes the entire local store to the remote in one batch (upsert) — for seeding a fresh remote.
-- **Collision-safe IDs.** Two stores minting sequential ids independently would collide (`dec-063` on both). Fix: **namespace by origin.** The local canonical store keeps its bare sequence (`dec-001`…, every existing id stays valid). A secondary store sets `CONTEXT_KEEPER_ID_NAMESPACE=r` and mints `dec-r001`… — disjoint namespaces, each counting only its own, so sequential minting can never collide.
-- **Zero new dependencies** (stdlib `urllib` only), **no secrets in code** (remote URL/token from env vars only).
+- **Mirror out (local -> remote).** After every `record_*`, `update_entry`, and `deprecate_entry`, the entry is pushed to the remote via its `import_entries` MCP tool. If the remote is unreachable the entry is queued to `.context/.mirror_queue.json` and flushed on the next successful push. A push failure **never** blocks or fails the local write.
+- **Mirror in (remote -> local).** `pull_remote` calls the remote's `query_entries`, keeps entries newer than a local watermark (`.context/.mirror_watermark`), and merges them **additively** — a remote entry whose id already exists locally never overwrites the local copy. Wired into the SessionStart hook (so desktop sessions start with phone-recorded entries present) and exposed as the `pull_remote` MCP tool.
+- **`backfill_remote`** pushes the entire local store to the remote (one `import_entries` call per kind) — for seeding a fresh remote.
+- **Additive-only, by design.** `import_entries` *skips* ids already present on the remote rather than overwriting, and pull never overwrites a local id. Consequence: an **edit or deprecation of an already-synced entry does not propagate** — edits only reach the remote if made before the entry's first sync (the offline queue dedupes to the latest state). This is what keeps the mirror non-destructive; cross-device *edits* are out of scope.
+- **Collision-safe IDs (Option B: random suffix).** Two stores minting sequential ids independently would collide (`dec-013` on both, dropped by `import_entries`' skip-existing). Fix: when mirroring is enabled, new ids get a short random hex suffix — `dec-013-a7f3`. The number still leads (sortable, greppable); **old ids are never rewritten**; and with mirroring *off* ids stay bare `dec-013` (single writer, no collision possible). A suffixed local id can never equal the remote's bare `dec-013`, so independent creation on both sides no longer collides.
+- **Zero new dependencies** (stdlib `urllib` only), **no secrets in code**: the remote URL contains the auth token as its final path segment (`/mcp/<token>`) and comes from an env var only.
 
-Enable by setting env vars where the MCP server runs:
+Enable by setting one env var where the MCP server runs:
 
 ```bash
-CONTEXT_KEEPER_REMOTE_URL=https://your-worker.example.workers.dev
-CONTEXT_KEEPER_REMOTE_TOKEN=…        # optional bearer token
+CONTEXT_KEEPER_REMOTE_URL=https://context-keeper-remote.<acct>.workers.dev/mcp/<AUTH_TOKEN>
 # CONTEXT_KEEPER_REMOTE_TIMEOUT=5    # optional per-request seconds
 ```
 
 With no `CONTEXT_KEEPER_REMOTE_URL` set, every mirror path is a silent no-op — behavior is identical to pre-v0.11.
 
-**Remote API contract** (what the Worker implements): `POST /import` upserts `{"project", "records":[{"type","entry"}]}` by entry id; `GET /entries?project=&since=<iso>` returns `{"records":[…]}` newer than `since`, scoped to the project. `type` travels in the wire wrapper only — stored entries keep their exact on-disk shape.
+**Transport:** stateless JSON-RPC over Streamable HTTP. Each write is one `POST` to the `/mcp/<token>` URL with `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"import_entries","arguments":{"project","kind","entries":[…]}}}`; `pull_remote` calls `query_entries`. No initialize/session handshake (the server is stateless), and the response is a single `application/json` body.
 
 ## v0.10: Abstention + Supersession-as-Ranking
 
