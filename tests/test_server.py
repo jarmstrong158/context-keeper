@@ -472,8 +472,9 @@ class TestRecordEntry:
     record_* tools are now thin wrappers producing identical results."""
 
     def _strip_volatile(self, entry):
-        # created_at/verified_at are wall-clock and differ between two calls.
-        return {k: v for k, v in entry.items() if k not in ("created_at", "verified_at", "id")}
+        # created_at/updated_at/verified_at are wall-clock and differ between calls.
+        return {k: v for k, v in entry.items()
+                if k not in ("created_at", "updated_at", "verified_at", "id")}
 
     def test_kind_decision_matches_record_decision(self, tmp_path):
         p = decision_params(tmp_path, summary="Use JSON storage for entries",

@@ -2,7 +2,7 @@
 
 Strategy: stand up a tiny in-process HTTP server that speaks the same
 JSON-RPC / Streamable-HTTP MCP dialect as context-keeper-remote
-(import_entries upsert-skip, query_entries), point
+(import_entries skip-existing, upsert_entries newest-wins, query_entries), point
 CONTEXT_KEEPER_REMOTE_URL at its /mcp/<token> URL, and exercise the real
 code paths -- no network, no mocking of urllib. Everything is stdlib.
 """
@@ -75,6 +75,44 @@ class FakeRemote:
                 "imported_count": len(imported), "skipped_count": len(skipped),
                 "imported": imported, "skipped": skipped}
 
+    def upsert_entries(self, args):
+        # Mirrors context-keeper-remote/src/tools/upsert.ts: insert a new id;
+        # replace an existing id only when the incoming updated_at is strictly
+        # newer (returning the overwritten row as `previous`); else skip.
+        project, kind, entries = args["project"], args["kind"], args["entries"]
+        created = updated = skipped = 0
+        results = []
+        for e in entries:
+            eid = e.get("id")
+            key = (project, eid)
+            payload = {k: v for k, v in e.items()
+                       if k not in ("project", "status", "id", "kind", "superseded_by")}
+            row = {
+                "id": eid, "kind": kind, "project": project,
+                "status": e.get("status", "active"),
+                "created_at": e.get("created_at"),
+                "updated_at": e.get("updated_at") or e.get("created_at"),
+                "superseded_by": e.get("superseded_by"),
+                "payload": payload,
+            }
+            existing = self.rows.get(key)
+            if existing is None:
+                self.rows[key] = row
+                created += 1
+                results.append({"id": eid, "action": "created"})
+                continue
+            incoming_ts = row["updated_at"] or ""
+            if incoming_ts and incoming_ts > (existing["updated_at"] or ""):
+                self.rows[key] = row
+                updated += 1
+                results.append({"id": eid, "action": "updated", "previous": existing})
+            else:
+                skipped += 1
+                results.append({"id": eid, "action": "skipped_older"})
+        return {"project": project, "kind": kind, "total": len(entries),
+                "created_count": created, "updated_count": updated,
+                "skipped_count": skipped, "results": results}
+
     def query_entries(self, args):
         project = args["project"]
         results = [r for (p, _i), r in self.rows.items() if p == project]
@@ -85,6 +123,8 @@ class FakeRemote:
         self.tool_calls.append(name)
         if name == "import_entries":
             return self.import_entries(args)
+        if name == "upsert_entries":
+            return self.upsert_entries(args)
         if name == "query_entries":
             return self.query_entries(args)
         raise ValueError(f"unknown tool {name}")
@@ -246,17 +286,46 @@ class TestMirrorOut:
         row = remote.rows[("offedit", d["id"])]
         assert row["payload"]["summary"] == "edited while offline"
 
-    def test_post_sync_edits_are_additive_only(self, tmp_path, remote):
-        # Once an id is on the remote, import_entries SKIPS it, so an edit or
-        # deprecation does not overwrite the remote copy (additive-only, con-006).
-        proj = _project(tmp_path, "additive")
+    def test_post_sync_deprecation_propagates(self, tmp_path, remote):
+        # Once an id is on the remote, a later deprecation must OVERWRITE the
+        # remote copy via upsert (newer updated_at wins) -- the whole point of
+        # the upsert mirror. Previously import_entries skipped it and the remote
+        # stayed stale-active.
+        proj = _project(tmp_path, "propagate")
         d = handle_record_decision({
             "project_dir": proj, "summary": "original",
             "problem": _LONG, "why_chosen": _LONG})
+        assert remote.rows[("propagate", d["id"])]["status"] == "active"
         handle_deprecate_entry({"project_dir": proj, "id": d["id"], "reason": "obsolete now"})
-        row = remote.rows[("additive", d["id"])]
-        assert row["status"] == "active"  # deprecation did NOT overwrite remote
-        assert row["payload"]["summary"] == "original"
+        row = remote.rows[("propagate", d["id"])]
+        assert row["status"] == "deprecated"  # deprecation reached the remote
+
+    def test_post_sync_edit_propagates(self, tmp_path, remote):
+        proj = _project(tmp_path, "editprop")
+        d = handle_record_decision({
+            "project_dir": proj, "summary": "original",
+            "problem": _LONG, "why_chosen": _LONG})
+        handle_update_entry({"project_dir": proj, "id": d["id"],
+                             "updates": {"summary": "revised"}})
+        assert remote.rows[("editprop", d["id"])]["payload"]["summary"] == "revised"
+
+    def test_overwrite_of_differing_content_is_logged_as_conflict(self, tmp_path, remote):
+        # An outbound upsert that replaces a remote row whose content differed
+        # in substance preserves the losing version to .mirror_conflicts.json.
+        proj = _project(tmp_path, "conflictlog")
+        d = handle_record_decision({
+            "project_dir": proj, "summary": "original",
+            "problem": _LONG, "why_chosen": _LONG})
+        # Simulate the remote having drifted to different content under the same
+        # id with an OLDER timestamp, so our newer local edit wins and logs it.
+        remote.rows[("conflictlog", d["id"])]["payload"]["summary"] = "remote drift"
+        remote.rows[("conflictlog", d["id"])]["updated_at"] = "2000-01-01T00:00:00+00:00"
+        handle_update_entry({"project_dir": proj, "id": d["id"],
+                             "updates": {"summary": "local newer"}})
+        conflicts = json.loads(
+            (tmp_path / ".context" / mirror.CONFLICTS_NAME).read_text())
+        assert any(c["id"] == d["id"] and c["direction"] == "mirror_out"
+                   and c["loser"]["summary"] == "remote drift" for c in conflicts)
 
 
 # ===========================================================================
@@ -293,7 +362,9 @@ class TestPullRoundTrip:
         assert got["tags"] == ["a", "b"]
         assert got["status"] == "active"
 
-    def test_pull_is_additive_never_overwrites(self, tmp_path, remote):
+    def test_pull_keeps_newer_local_over_older_remote(self, tmp_path, remote):
+        # Local copy is NEWER than the remote row -> pull keeps local (it will
+        # push back on its next write). Replaces the old additive-only rule.
         src = _project(tmp_path / "src", "noover")
         d = handle_record_decision({
             "project_dir": src, "summary": "remote version",
@@ -301,6 +372,7 @@ class TestPullRoundTrip:
         dst = _project(tmp_path / "dst", "noover")
         local_entry = dict(d["entry"])
         local_entry["summary"] = "LOCAL WINS"
+        local_entry["updated_at"] = "2999-01-01T00:00:00+00:00"  # strictly newer
         (tmp_path / "dst" / ".context" / "decisions.json").write_text(
             json.dumps([local_entry]), encoding="utf-8")
         res = handle_pull_remote({"project_dir": dst})
@@ -309,6 +381,31 @@ class TestPullRoundTrip:
         disk = read_json_file(str(tmp_path / "dst" / ".context" / "decisions.json"))
         assert len(disk) == 1
         assert disk[0]["summary"] == "LOCAL WINS"
+
+    def test_pull_overwrites_older_local_with_newer_remote(self, tmp_path, remote):
+        # Remote row is NEWER than the local copy -> pull replaces local, and
+        # logs the overwritten (substantively different) local version.
+        src = _project(tmp_path / "src", "remwins")
+        d = handle_record_decision({
+            "project_dir": src, "summary": "remote newer",
+            "problem": _LONG, "why_chosen": _LONG})
+        # Make the remote row strictly newer than any local copy.
+        remote.rows[("remwins", d["id"])]["updated_at"] = "2999-01-01T00:00:00+00:00"
+        dst = _project(tmp_path / "dst", "remwins")
+        local_entry = dict(d["entry"])
+        local_entry["summary"] = "stale local"
+        local_entry["updated_at"] = "2000-01-01T00:00:00+00:00"
+        (tmp_path / "dst" / ".context" / "decisions.json").write_text(
+            json.dumps([local_entry]), encoding="utf-8")
+        res = handle_pull_remote({"project_dir": dst})
+        assert res["pulled"] == 0
+        assert res["updated"] == 1
+        disk = read_json_file(str(tmp_path / "dst" / ".context" / "decisions.json"))
+        assert disk[0]["summary"] == "remote newer"
+        conflicts = json.loads(
+            (tmp_path / "dst" / ".context" / mirror.CONFLICTS_NAME).read_text())
+        assert any(c["id"] == d["id"] and c["direction"] == "mirror_in"
+                   and c["loser"]["summary"] == "stale local" for c in conflicts)
 
     def test_second_pull_is_noop_via_watermark(self, tmp_path, remote):
         src = _project(tmp_path / "src", "wm")

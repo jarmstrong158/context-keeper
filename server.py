@@ -682,7 +682,7 @@ TOOLS = [
     },
     {
         "name": "pull_remote",
-        "description": "Merge remote-recorded entries into the local store (additive). No-op if remote unconfigured.",
+        "description": "Merge remote-recorded entries into the local store (newest wins). No-op if remote unconfigured.",
         "inputSchema": {
             "type": "object",
             "properties": {"project_dir": {"type": "string"}},
@@ -754,7 +754,27 @@ def _load_entries_for_write(path):
                 f"already in the file. Fix or restore the file, then retry."
             )
         }
+    # Heal any pre-updated_at entries in passing: this is a read-modify-write
+    # cycle, so the backfilled timestamps persist on the coming write. The
+    # mirror keys its two-way merge on updated_at, so every entry needs one.
+    _backfill_updated_at(entries)
     return entries, None
+
+
+def _backfill_updated_at(entries):
+    """Give every entry an updated_at, backfilling from created_at (else now).
+
+    Mutates the list in place; returns True if anything changed. Older stores
+    only stamped updated_at on update/deprecate, so entries that were only ever
+    recorded lack it — without a value the mirror's newest-wins comparison has
+    nothing to compare, so we backfill their creation time as the baseline.
+    """
+    changed = False
+    for e in entries:
+        if isinstance(e, dict) and not e.get("updated_at"):
+            e["updated_at"] = e.get("created_at") or now_iso()
+            changed = True
+    return changed
 
 
 def write_json_file(path, data):
@@ -1544,6 +1564,7 @@ def _record_decision_impl(params):
         "status": "active",
         "superseded_by": None,
         "created_at": now_iso(),
+        "updated_at": now_iso(),
         "verified_at": now_iso(),
     }
     # Preserve the deprecated `rationale` field on disk if the caller
@@ -1624,6 +1645,7 @@ def _record_pipeline_impl(params):
         "schema_version": 4,
         "status": "active",
         "created_at": now_iso(),
+        "updated_at": now_iso(),
         "verified_at": now_iso(),
     }
     entries.append(entry)
@@ -1663,6 +1685,7 @@ def _record_constraint_impl(params):
         "schema_version": 4,
         "status": "active",
         "created_at": now_iso(),
+        "updated_at": now_iso(),
         "verified_at": now_iso(),
     }
     entries.append(entry)
@@ -2500,6 +2523,12 @@ def handle_deprecate_entry(params):
         write_json_file(file_path, entries)
         if type_name == "decisions":
             _maybe_export_markdown(base_dir)
+        # Mirror BOTH sides of the merge: the deprecation on `dep` and the
+        # survivor's folded-in content on `keep`. Without this the remote keeps
+        # showing the merged-away entry as active -- the exact stale-status
+        # drift the upsert mirror exists to prevent.
+        _mirror_out(dep, type_name, base_dir)
+        _mirror_out(keep, type_name, base_dir)
         return {
             "success": True,
             "id": entry_id,

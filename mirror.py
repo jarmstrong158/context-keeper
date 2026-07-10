@@ -17,26 +17,35 @@ Two halves:
 
   MIRROR OUT (local -> remote): after every local write the server calls
   `mirror_out(entry, type_name, base_dir)`, which calls the remote
-  `import_entries` tool. import_entries preserves incoming ids and SKIPS
-  (never overwrites) any id already present -- exactly the additive
-  semantics we want. If the remote is unreachable the entry is appended to
-  a local queue (.context/.mirror_queue.json) and flushed on the next
-  successful push. A push failure NEVER propagates -- the local write
-  already succeeded and must not be undone by a network problem.
+  `upsert_entries` tool. upsert_entries preserves incoming ids and REPLACES
+  an existing id only when the pushed entry's updated_at is newer
+  (last-writer-wins by timestamp), so an edit or deprecation actually
+  propagates instead of being skipped as an already-present id. If the
+  remote is unreachable the entry is appended to a local queue
+  (.context/.mirror_queue.json) and flushed on the next successful push. A
+  push failure NEVER propagates -- the local write already succeeded and
+  must not be undone by a network problem.
 
   MIRROR IN (remote -> local): `pull_remote(base_dir)` calls the remote
   `query_entries` tool, keeps entries newer than a local watermark
-  (.context/.mirror_watermark), and merges them ADDITIVELY -- a remote
-  entry whose id already exists locally is never allowed to overwrite the
-  local copy. Wired into the SessionStart hook and exposed as the
+  (.context/.mirror_watermark), and merges them by TIMESTAMP -- a remote
+  entry whose id exists locally overwrites the local copy only when the
+  remote's updated_at is newer; a newer local copy is kept and pushes back
+  on its next write. Wired into the SessionStart hook and exposed as the
   `pull_remote` MCP tool.
+
+  CONFLICTS: when either direction overwrites a copy that differed in
+  substance (not just timestamps), the losing version is appended to
+  .context/.mirror_conflicts.json. Last-writer-wins already resolved it;
+  this just preserves what was overwritten. No resolution UI.
 
 Design constraints (see dec-012 / con-006 and CLAUDE.md):
   - stdlib only (urllib.request for HTTP) -- zero new dependencies.
   - no secrets in code -- the remote URL (which contains the token) comes
     from CONTEXT_KEEPER_REMOTE_URL only.
   - fail soft always -- a mirror problem must never break local operation.
-  - additive-only on the local merge; import/upsert-skip on the remote.
+  - timestamp-based newest-wins on both the local merge and the remote
+    upsert; neither side ever deletes (deprecation is a status change).
 
 The remote stores each entry as {id, kind, status, created_at, updated_at,
 superseded_by, payload}, where `payload` holds every other local field.
@@ -70,9 +79,55 @@ _TYPE_FILES = {
 
 QUEUE_NAME = ".mirror_queue.json"
 WATERMARK_NAME = ".mirror_watermark"
+CONFLICTS_NAME = ".mirror_conflicts.json"
 LOG_NAME = "mirror.log"
 
 _DEFAULT_TIMEOUT = 5.0
+
+# Timestamp fields are bookkeeping, not substance: two entries that differ only
+# in these are the same content written at different times, not a real conflict.
+_TS_KEYS = frozenset({"updated_at", "verified_at", "created_at"})
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _entry_ts(entry):
+    """The entry's newest timestamp for last-writer-wins comparison.
+
+    Prefer updated_at; fall back to created_at so a legacy entry that predates
+    updated_at still compares sanely. ISO-8601 strings order correctly
+    lexically.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    return entry.get("updated_at") or entry.get("created_at") or ""
+
+
+def _with_ts(entry):
+    """Return the entry guaranteed to carry an updated_at for the push.
+
+    Entries written by the current server always have one, but entries read
+    straight off disk from an older store may not; the remote upsert keys its
+    newest-wins decision on updated_at, so synthesize one from created_at (else
+    now) without mutating the caller's dict.
+    """
+    if entry.get("updated_at"):
+        return entry
+    healed = dict(entry)
+    healed["updated_at"] = entry.get("created_at") or _now_iso()
+    return healed
+
+
+def _strip_ts(entry):
+    """The entry's substantive fields only (timestamps removed)."""
+    return {k: v for k, v in entry.items() if k not in _TS_KEYS}
+
+
+def _differs_in_substance(a, b):
+    """True if a and b differ in something other than their timestamps."""
+    return _strip_ts(a) != _strip_ts(b)
 
 
 # ------------------------------------------------------------------
@@ -209,6 +264,75 @@ def _queue_clear(base_dir):
 
 
 # ------------------------------------------------------------------
+# Conflict log (losing versions preserved when an upsert overwrites)
+# ------------------------------------------------------------------
+
+
+def _conflicts_path(base_dir):
+    return os.path.join(base_dir, CONFLICTS_NAME)
+
+
+def _append_conflicts(base_dir, conflicts):
+    """Append losing entry versions to .mirror_conflicts.json, fail-soft.
+
+    We do NOT build resolution UI -- last-writer-wins already resolved the
+    conflict. This just preserves the overwritten version (with the winner's
+    timestamp) so nothing substantive is silently lost. Never raises.
+    """
+    if not conflicts:
+        return
+    try:
+        existing = []
+        path = _conflicts_path(base_dir)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                existing = data
+        existing.extend(conflicts)
+        os.makedirs(base_dir, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, path)
+        _log(base_dir, f"logged {len(conflicts)} mirror conflict(s) to {CONFLICTS_NAME}")
+    except Exception:
+        pass
+
+
+def _record_push_conflicts(base_dir, kind, pushed_entries, res):
+    """Log any remote rows an outbound upsert overwrote with different content.
+
+    The remote's upsert_entries returns per-id results; on an "updated" action
+    it hands back `previous` -- the row it replaced. If that loser differed
+    from what we pushed in more than timestamps, preserve it locally.
+    """
+    results = res.get("results") if isinstance(res, dict) else None
+    if not isinstance(results, list):
+        return
+    by_id = {e.get("id"): e for e in pushed_entries}
+    losers = []
+    for r in results:
+        if not isinstance(r, dict) or r.get("action") != "updated":
+            continue
+        prev = r.get("previous")
+        winner = by_id.get(r.get("id"))
+        if not isinstance(prev, dict) or not isinstance(winner, dict):
+            continue
+        loser = _row_to_entry(prev)
+        if _differs_in_substance(loser, winner):
+            losers.append({
+                "logged_at": _now_iso(),
+                "direction": "mirror_out",
+                "kind": kind,
+                "id": r.get("id"),
+                "loser": loser,
+                "winner": winner,
+            })
+    _append_conflicts(base_dir, losers)
+
+
+# ------------------------------------------------------------------
 # JSON-RPC MCP transport (stdlib urllib only)
 # ------------------------------------------------------------------
 
@@ -293,11 +417,13 @@ def _rpc_call(cfg, tool_name, arguments):
 
 
 def _push_records(cfg, base_dir, records):
-    """import_entries one call per kind (the tool takes a single kind).
+    """upsert_entries one call per kind (the tool takes a single kind).
 
-    Raises on the first failing call so the caller can persist the queue.
-    Partial success is safe: import_entries skips ids already present, so a
-    re-push of an already-imported kind is a harmless no-op.
+    Upsert (not import) so an edit or deprecation actually overwrites the
+    remote's stale copy instead of being skipped as an existing id. Raises on
+    the first failing call so the caller can persist the queue. Partial success
+    is safe: upsert is idempotent (an equal-or-older re-push is skipped
+    server-side), so re-pushing an already-synced kind is a harmless no-op.
     """
     project = _project_name(base_dir)
     by_kind = {}
@@ -305,10 +431,11 @@ def _push_records(cfg, base_dir, records):
         kind = rec.get("kind")
         entry = rec.get("entry")
         if kind in _KIND_TO_TYPE and isinstance(entry, dict) and entry.get("id"):
-            by_kind.setdefault(kind, []).append(entry)
+            by_kind.setdefault(kind, []).append(_with_ts(entry))
     pushed = 0
     for kind, entries in by_kind.items():
-        _rpc_call(cfg, "import_entries", {"project": project, "kind": kind, "entries": entries})
+        res = _rpc_call(cfg, "upsert_entries", {"project": project, "kind": kind, "entries": entries})
+        _record_push_conflicts(base_dir, kind, entries, res)
         pushed += len(entries)
     return pushed
 
@@ -419,11 +546,20 @@ def _row_to_entry(row):
 
 
 def _merge_rows(base_dir, rows):
-    """Merge remote rows into the local store, ADDITIVELY.
+    """Merge remote rows into the local store by TIMESTAMP (newest wins).
 
-    A row whose id already exists locally is skipped -- the local copy is
-    canonical and is never overwritten by a pulled entry. Returns
-    (added, skipped).
+    For each remote row:
+      - id absent locally               -> add it.
+      - remote updated_at newer          -> replace the local copy (and, if the
+                                            two differed in substance, preserve
+                                            the overwritten local version to the
+                                            conflict log).
+      - local equal-or-newer             -> skip; the local edit is newer and
+                                            will push back on its next write.
+
+    This replaces the old additive-only merge, which left a locally-stale entry
+    frozen even after the remote deprecated or edited it. Returns
+    (added, updated, skipped).
     """
     import server  # lazy: avoids import-time circularity
 
@@ -433,26 +569,51 @@ def _merge_rows(base_dir, rows):
         type_name = _KIND_TO_TYPE.get(kind)
         if type_name is None or not row.get("id"):
             continue
-        by_type.setdefault(type_name, []).append(_row_to_entry(row))
+        by_type.setdefault(type_name, []).append(row)
 
     added = 0
+    updated = 0
     skipped = 0
-    for type_name, incoming in by_type.items():
+    conflicts = []
+    for type_name, incoming_rows in by_type.items():
+        kind = _TYPE_TO_KIND[type_name]
         path = os.path.join(base_dir, _TYPE_FILES[type_name])
         existing = server.read_json_file(path)
-        existing_ids = {e.get("id") for e in existing}
+        index = {e.get("id"): i for i, e in enumerate(existing)}
         changed = False
-        for entry in incoming:
-            if entry.get("id") in existing_ids:
-                skipped += 1
+        for row in incoming_rows:
+            entry = _row_to_entry(row)
+            rid = entry.get("id")
+            if rid not in index:
+                existing.append(entry)
+                index[rid] = len(existing) - 1
+                added += 1
+                changed = True
                 continue
-            existing.append(entry)
-            existing_ids.add(entry.get("id"))
-            added += 1
-            changed = True
+            local = existing[index[rid]]
+            remote_ts = _entry_ts(entry)
+            local_ts = _entry_ts(local)
+            if remote_ts and remote_ts > local_ts:
+                if _differs_in_substance(local, entry):
+                    conflicts.append({
+                        "logged_at": _now_iso(),
+                        "direction": "mirror_in",
+                        "kind": kind,
+                        "id": rid,
+                        "loser": local,
+                        "winner": entry,
+                    })
+                existing[index[rid]] = entry
+                updated += 1
+                changed = True
+            else:
+                # Local is equal-or-newer: keep it; it pushes back on next write.
+                skipped += 1
         if changed:
             server.write_json_file(path, existing)
-    return added, skipped
+    if conflicts:
+        _append_conflicts(base_dir, conflicts)
+    return added, updated, skipped
 
 
 def pull_remote(base_dir=None):
@@ -503,7 +664,7 @@ def pull_remote(base_dir=None):
         to_merge.append(row)
 
     try:
-        added, skipped = _merge_rows(base_dir, to_merge)
+        added, updated, skipped = _merge_rows(base_dir, to_merge)
     except Exception as e:
         _log(base_dir, f"pull_remote merge failed: {e}")
         return {"pulled": 0, "error": str(e)}
@@ -511,9 +672,9 @@ def pull_remote(base_dir=None):
     if max_ts and (watermark is None or max_ts > watermark):
         _watermark_write(base_dir, max_ts)
 
-    if added:
-        _log(base_dir, f"pull_remote merged {added} new entries ({skipped} already present)")
-    return {"pulled": added, "skipped": skipped, "watermark": max_ts or watermark}
+    if added or updated:
+        _log(base_dir, f"pull_remote merged {added} new, {updated} updated ({skipped} kept local)")
+    return {"pulled": added, "updated": updated, "skipped": skipped, "watermark": max_ts or watermark}
 
 
 # ------------------------------------------------------------------
@@ -524,8 +685,9 @@ def pull_remote(base_dir=None):
 def backfill_remote(base_dir=None):
     """Push ALL local entries for the project to the remote.
 
-    One import_entries call per kind. Idempotent (import skips ids already
-    present). Fail-soft: a failing kind is logged and the others still run.
+    One upsert_entries call per kind. Idempotent (upsert skips an
+    equal-or-older id, updates a newer one). Fail-soft: a failing kind is
+    logged and the others still run.
     """
     cfg = mirror_config()
     if cfg is None:
@@ -543,26 +705,29 @@ def backfill_remote(base_dir=None):
     import server
     project = _project_name(base_dir)
     counts = {}
-    imported = 0
+    created = 0
+    updated = 0
     skipped = 0
     errors = {}
     for type_name, kind in _TYPE_TO_KIND.items():
-        entries = [e for e in server.read_json_file(
+        entries = [_with_ts(e) for e in server.read_json_file(
             os.path.join(base_dir, _TYPE_FILES[type_name])) if e.get("id")]
         counts[type_name] = len(entries)
         if not entries:
             continue
         try:
-            res = _rpc_call(cfg, "import_entries", {
+            res = _rpc_call(cfg, "upsert_entries", {
                 "project": project, "kind": kind, "entries": entries})
-            imported += int(res.get("imported_count") or 0)
+            created += int(res.get("created_count") or 0)
+            updated += int(res.get("updated_count") or 0)
             skipped += int(res.get("skipped_count") or 0)
+            _record_push_conflicts(base_dir, kind, entries, res)
         except Exception as e:
             errors[kind] = str(e)
             _log(base_dir, f"backfill_remote {kind} failed ({len(entries)} entries): {e}")
 
-    out = {"backfilled": imported, "skipped": skipped, "counts": counts}
+    out = {"backfilled": created, "updated": updated, "skipped": skipped, "counts": counts}
     if errors:
         out["errors"] = errors
-    _log(base_dir, f"backfill_remote imported {imported}, skipped {skipped}")
+    _log(base_dir, f"backfill_remote created {created}, updated {updated}, skipped {skipped}")
     return out
