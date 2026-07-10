@@ -1,3 +1,500 @@
 {
-  "items": []
+  "items": [
+    {
+      "id": "k-1e908139",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.5 data integrity: entry files are written atomically (temp + os.replace), and write paths refuse to proceed when an existing entry file fails to parse, instead of treating it as empty.",
+      "why": "Two mechanisms with distinct jobs: os.replace after writing a temp file makes corruption-by-crash nearly impossible (old file stays intact until the new one is complete), and _load_entries_for_write distinguishes missing (fresh store, fine) from corrupt (refuse with an error naming the file) so history is never overwritten even if corruption arrives some other way. Read-only paths keep the soft [] fallback so retrieval degrades gracefully.",
+      "tags": [
+        "data-integrity",
+        "storage",
+        "atomic-write",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-004"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 12,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-17ea9882",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.6: constraints with a file/dir scope are re-injected at edit time by the scope_guard hook (PostToolUse on Edit|Write), once per constraint per session.",
+      "why": "The scope field already existed on constraints and PostToolUse additionalContext is one of the few hook surfaces the model actually sees (con-002). Matching the edited file path against constraint scopes turns a passive memo into an active guardrail delivered at the exact moment it matters. Once-per-session dedupe (state file in .context/) keeps repeated edits from spamming context.",
+      "tags": [
+        "hooks",
+        "constraints",
+        "scope",
+        "guardrails",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-005"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 3,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-70afe3ab",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.6: record_* responses surface similar_entries (word-set Jaccard vs the store, default threshold 0.30) so duplicates and contradictions get caught at capture time, not retrieval time.",
+      "why": "Prevention beats mitigation: comparing the new entry against all active entries at write time reuses the existing _text_words and _jaccard code with zero new dependencies. The check is advisory (write always proceeds, warnings ride the success response) so capture is never blocked, and related_to-linked entries are exempt because the caller already acknowledged the relation. CLAUDE.md tells the agent how to resolve each case: deprecate the restatement, supersede the contradicted entry, or link genuinely distinct ones.",
+      "tags": [
+        "capture",
+        "dedup",
+        "quality",
+        "retrieval",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-006"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 6,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-78d8753d",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.8: DECISIONS.md is an opt-in derived projection, regenerated whole from decisions.json on the write path of every decision mutation - never appended to, merged, or parsed back.",
+      "why": "Render on the write path: regenerate the entire file after the JSON write completes and before the tool returns, so markdown and JSON land on disk together and any subsequent git commit captures both atomically. Full regeneration from canonical JSON means the projection has no independent state and therefore no drift surface - hand edits are deliberately clobbered. Opt-in flag (markdown_export.enabled, default off) keeps default behavior byte-for-byte unchanged; export_markdown backfills existing repos without the flag.",
+      "tags": [
+        "markdown-export",
+        "projection",
+        "capture",
+        "git",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-008"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 6,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-29e156c3",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.9: fixed the summary-truncation loop that injected an EMPTY summary for any store over the token budget; added topic clustering to get_project_summary, OpenAI-compatible embedding backends, trust-labeled similar_entries, and a published token-reduction measurement.",
+      "why": "Found by measurement, not inspection: the token-reduction script (built to fill a comparison-table box) showed Balatron injecting ~128 tokens for a 75k-token store, which was impossibly low. Fix recomputes the estimate from the remaining lines each iteration. Regression test locks it: an over-budget store must produce a non-empty summary within budget. The companion clustering change (group decisions by most-frequent shared tag above 8 decisions) makes the now-actually-injected large-store summary scannable.",
+      "tags": [
+        "bugfix",
+        "session-start",
+        "summary",
+        "retrieval",
+        "evals",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-009"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 6,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-82c0c4c1",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.10: record_decision accepts supersedes=[ids] to mark prior decisions 'superseded' - demoted in ranking but still recallable - as a distinct lifecycle state from deprecated (removed from retrieval entirely).",
+      "why": "Adapted from Curion's 'current-vs-previous truth, demote don't delete' but implemented dependency-free by reusing infrastructure already present: score_entry already demoted status=='superseded' (+5 vs +20 for active), and get_context already filtered only 'deprecated', so superseded entries already flowed through and ranked low. The only missing piece was that nothing ever SET the status. supersedes marks the referenced decisions in the SAME atomic write as the new one, so the store is never momentarily inconsistent. Superseded entries are skipped by prune_stale/verify_quality (intentional history, not stale work) and marked **SUPERSEDED by dec-NNN** in DECISIONS.md.",
+      "tags": [
+        "lifecycle",
+        "supersession",
+        "ranking",
+        "curion",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-011"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 3,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-82875f98",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Dual-write mirror for context-keeper, local store canonical",
+      "why": "Dual-write mirror with the LOCAL store as single source of truth. Transport is the context-keeper-remote Cloudflare Worker's stateless JSON-RPC MCP endpoint (POST /mcp/<token>): mirror-out calls its import_entries tool (preserves ids, SKIPS existing ones = additive), pull calls query_entries and merges additively. Local-canonical keeps the offline path unchanged and avoids conflict resolution \u00e2\u20ac\u201d the remote is a sync surface, never the authority. Push is fire-and-forget with a local queue fallback so the network can never affect a local write. stdlib urllib only; the auth token is the final URL path segment so there is no secret in code and no auth header.",
+      "tags": [
+        "mirror",
+        "architecture",
+        "sync",
+        "remote",
+        "mcp",
+        "json-rpc",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-012"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 12,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-4de53fc0",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Mirror propagates edits/deprecations both ways via a remote upsert_entries tool + timestamp-based (newest-wins) merge, replacing the old additive-only sync.",
+      "why": "Last-writer-wins keyed on updated_at is the minimum mechanism that lets a lifecycle change cross the mirror without a central lock or clock. A new remote upsert_entries tool (same input shape as import_entries) inserts new ids and replaces an existing id only when the incoming updated_at is strictly newer, else skips; it never deletes, so deprecation rides across naturally as a status change. pull_remote mirrors the same rule locally: a newer remote row replaces the local copy, a newer local copy is kept and pushes back on its next write. To keep the data-loss guarantee that the old additive rule provided by refusing to overwrite, an overwrite whose loser differed in substance (not just timestamps) is appended to .context/.mirror_conflicts.json \u00e2\u20ac\u201d the information is preserved even though last-writer-wins already resolved the winner.",
+      "tags": [
+        "mirror",
+        "sync",
+        "upsert",
+        "architecture",
+        "reliability",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-013-4eb5"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 6,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-26d14063",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Bought back tools/list schema budget: retired 3 record_* aliases, folded mirror tools into mirror(op=...), trimmed descriptions.",
+      "why": "Removing record_decision/record_pipeline/record_constraint from TOOLS (keeping their handlers in HANDLERS as hidden back-compat) is safe because dispatch routes via HANDLERS, tests call handlers directly, and no hook/command/config invokes the aliases by MCP name - only CLAUDE.md prose, which was updated to record_entry. Folding pull_remote+backfill_remote into one mirror(op=pull|backfill) tool cut two schemas to one. Net: 4347 -> 2927 tokens (1423 headroom).",
+      "tags": [
+        "schema",
+        "budget",
+        "mirror",
+        "tools",
+        "consolidation",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-014"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 9,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-0ad3d770",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Hook scripts must use ASCII-only in print() output -- no Unicode arrows, em-dashes, or special characters",
+      "why": "Windows cp1252 encoding raises UnicodeEncodeError on characters like U+2192 (arrow) and U+2014 (em-dash). Claude Code captures hook stdout through the system shell, which uses cp1252 on Windows.",
+      "tags": [
+        "hooks",
+        "windows",
+        "encoding",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-001"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 3,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-319ef59e",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Model-visible hook output must go through SessionStart/UserPromptSubmit stdout or PostToolUse hookSpecificOutput.additionalContext. Never rely on PreCompact or Stop hook stdout/stderr to prompt Claude - those are shown to the user only.",
+      "why": "Claude Code only injects hook stdout into model context for SessionStart and UserPromptSubmit (plus the additionalContext field on PostToolUse). Output printed from PreCompact or Stop appears in the transcript for the user but the model never sees it, so any capture prompt or nudge placed there is a silent no-op.",
+      "tags": [
+        "hooks",
+        "claude-code",
+        "context-injection",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-002"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 3,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-ff68622a",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Keep server.json's top-level description at 100 characters or fewer - the MCP registry rejects longer ones at publish time.",
+      "why": "The official MCP registry (registry.modelcontextprotocol.io) validates body.description with expected length <= 100 and returns HTTP 422, so a longer description blocks the entire version publish.",
+      "tags": [
+        "mcp-registry",
+        "release",
+        "publishing",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-003"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 3,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-2f83b041",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Keep the tools/list schema payload at or under 2500 estimated tokens (enforced by TestToolSchemaBudget). Rich guidance goes in _FIELD_GUIDANCE rejection messages and CLAUDE.md, not in schema descriptions.",
+      "why": "Every connected MCP client loads all tool descriptions into model context at every session start, so schema verbosity is a per-session token tax on every user. Guidance in rejection messages is lazy-loaded - it only costs tokens when a thin entry actually gets rejected.",
+      "tags": [
+        "token-budget",
+        "mcp",
+        "schemas",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-004"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 6,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-1dc2239c",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Never bulk-edit repo text files with PowerShell Get-Content/Set-Content. Use the Edit tool or a Python script for text transformations.",
+      "why": "Windows PowerShell 5.1 reads BOM-less UTF-8 files as cp1252 and Set-Content -Encoding utf8 writes a BOM, so a simple find-replace bakes mojibake into every non-ASCII character (em-dash becomes a-circumflex euro quote) and the BOM breaks json.load on data files.",
+      "tags": [
+        "windows",
+        "encoding",
+        "powershell",
+        "tooling",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-005"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 15,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-be5a4af1",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Mirror must fail soft (never block or fail a local write), never delete, and contain no secrets in code. The merge is timestamp-based newest-wins (was additive-only): an overwrite is allowed only when the incoming updated_at is strictly newer, and the losing version of any substantive overwrite is preserved to .context/.mirror_conflicts.json.",
+      "why": "The local store is canonical and must keep working offline. If a mirror push could raise, a remote outage would break record_*/update_entry/deprecate_entry \u00e2\u20ac\u201d the exact operations that must always succeed, so push failures queue and log but never propagate. The old rule forbade overwriting a local id at all, which guaranteed no data loss but also froze edits/deprecations out of the mirror (see dec-013). It is replaced by newest-wins: a stale or malicious remote still cannot clobber a newer local entry (its older updated_at loses), and any overwrite that changes substance is logged to .mirror_conflicts.json so nothing is silently lost. The mirror never deletes (deprecation is a status change). Remote URL and token come from env vars only, so publishing the repo leaks nothing.",
+      "tags": [
+        "mirror",
+        "sync",
+        "security",
+        "reliability",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-006"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 9,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-350b8d7a",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Mirror HTTP requests to the remote Worker must send an explicit User-Agent header (never urllib's default)",
+      "why": "Cloudflare fronts the context-keeper-remote Worker and its bot-fight rules block urllib's default User-Agent (Python-urllib/x.y) with HTTP 403 \"error 1010\" (browser/bot signature ban). Without an explicit User-Agent, every mirror request \u00e2\u20ac\u201d import_entries, query_entries, backfill \u00e2\u20ac\u201d fails, so mirroring silently degrades to queue-only and no data ever reaches the remote. Setting any normal-looking User-Agent on the single _rpc_call request path fixes it.",
+      "tags": [
+        "mirror",
+        "cloudflare",
+        "http",
+        "gotcha",
+        "context-keeper"
+      ],
+      "scope": "team",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-007"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:02:16.377163+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 6,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    }
+  ]
 }
