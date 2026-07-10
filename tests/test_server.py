@@ -23,7 +23,10 @@ from server import (
     CONTEXT_DIR_NAME,
     UNRESOLVED_PROJECT_ERROR,
     _base_dir_from_params,
+    _classify_overlap,
     _resolve_project_dir,
+    _text_words,
+    build_constraints_block,
     handle_deprecate_entry,
     handle_get_compaction_report,
     handle_get_context,
@@ -31,7 +34,10 @@ from server import (
     handle_prune_stale,
     handle_record_constraint,
     handle_record_decision,
+    handle_record_entry,
+    handle_query_entries,
     handle_record_pipeline,
+    handle_reload_constraints,
     handle_update_entry,
     next_id,
     read_json_file,
@@ -461,6 +467,59 @@ class TestRecordConstraint:
         assert "verified_at" in entry
 
 
+class TestRecordEntry:
+    """Unified record_entry(kind=...) dispatches to the same impls; the three
+    record_* tools are now thin wrappers producing identical results."""
+
+    def _strip_volatile(self, entry):
+        # created_at/verified_at are wall-clock and differ between two calls.
+        return {k: v for k, v in entry.items() if k not in ("created_at", "verified_at", "id")}
+
+    def test_kind_decision_matches_record_decision(self, tmp_path):
+        p = decision_params(tmp_path, summary="Use JSON storage for entries",
+                            tags=["storage"])
+        via_entry = handle_record_entry({**p, "kind": "decision"})
+        assert via_entry["success"] is True and via_entry["id"].startswith("dec-")
+        # A second store: record_decision (the wrapper) yields the same shape.
+        direct = handle_record_decision(decision_params(
+            tmp_path, summary="Use JSON storage for entries", tags=["storage"]))
+        assert self._strip_volatile(via_entry["entry"]) == self._strip_volatile(direct["entry"])
+
+    def test_kind_constraint_writes_constraints_json(self, tmp_path):
+        r = handle_record_entry(constraint_params(
+            tmp_path, kind="constraint", rule="Never call eval on user input",
+            reason="Executing user input is a remote code execution vector, full compromise."))
+        assert r["success"] is True and r["id"].startswith("con-")
+        assert (context_dir(tmp_path) / "constraints.json").exists()
+
+    def test_kind_pipeline_writes_pipelines_json(self, tmp_path):
+        r = handle_record_entry(pipeline_params(tmp_path, kind="pipeline"))
+        assert r["success"] is True and r["id"].startswith("pipe-")
+        assert (context_dir(tmp_path) / "pipelines.json").exists()
+
+    def test_missing_kind_errors(self, tmp_path):
+        r = handle_record_entry(decision_params(tmp_path))  # no kind
+        assert "error" in r and "kind" in r["error"]
+
+    def test_bad_kind_errors(self, tmp_path):
+        r = handle_record_entry(decision_params(tmp_path, kind="gizmo"))
+        assert "error" in r
+
+    def test_kind_specific_validation_still_enforced(self, tmp_path):
+        # decision requires why_chosen >= 60 chars; a too-short one is rejected
+        # through record_entry exactly as through record_decision.
+        r = handle_record_entry({
+            "project_dir": str(tmp_path), "kind": "decision",
+            "summary": "x", "problem": "y", "why_chosen": "too short",
+        })
+        assert "validation_errors" in r or "error" in r
+
+    def test_wrappers_still_registered(self):
+        from server import HANDLERS
+        for name in ("record_entry", "record_decision", "record_pipeline", "record_constraint"):
+            assert name in HANDLERS
+
+
 # ===========================================================================
 # 5. get_context
 # ===========================================================================
@@ -617,6 +676,43 @@ class TestGetProjectSummary:
         self._populate(tmp_path)
         result = handle_get_project_summary(project_params(tmp_path))
         assert "Use JSON storage" in result["summary"]
+
+    def test_orientation_fields_present_and_shaped(self, tmp_path):
+        self._populate(tmp_path)
+        r = handle_get_project_summary(project_params(tmp_path))
+        # existing keys preserved (SessionStart hook + current callers rely on these)
+        for k in ("initialized", "summary", "counts", "stale_entries", "usage_guidance"):
+            assert k in r
+        # additive orientation fields
+        assert r["counts_by_status"]["decisions"] == {"active": 1, "superseded": 0, "deprecated": 0}
+        assert r["counts_by_status"]["constraints"]["active"] == 2
+        rules = {c["rule"] for c in r["active_constraints"]}
+        assert rules == {"Never use eval()", "Prefer list comps"}
+        assert all({"id", "rule", "hardness", "scope"} <= set(c) for c in r["active_constraints"])
+        assert r["recent_decisions"] == [{"id": "dec-001", "summary": "Use JSON storage"}]
+        assert r["entry_ids"] == {
+            "decisions": ["dec-001"], "pipelines": ["pipe-001"],
+            "constraints": ["con-001", "con-002"]}
+
+    def test_recent_decisions_capped_and_ordered(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        for i in range(7):
+            handle_record_decision(decision_params(
+                tmp_path, summary=f"Decision number {i} about the storage layer design"))
+        r = handle_get_project_summary(project_params(tmp_path))
+        assert len(r["recent_decisions"]) == 5           # capped at 5
+        assert r["recent_decisions"][0]["id"] == "dec-007"  # most recent first
+        assert len(r["entry_ids"]["decisions"]) == 7      # id list is complete
+
+    def test_counts_by_status_includes_superseded_and_deprecated(self, tmp_path):
+        d1 = handle_record_decision(decision_params(tmp_path, summary="Original storage decision here"))
+        handle_record_decision(decision_params(
+            tmp_path, summary="Replacement storage decision", supersedes=[d1["id"]]))
+        c1 = handle_record_constraint(constraint_params(tmp_path, rule="A rule to be retired soon"))
+        handle_deprecate_entry({"project_dir": str(tmp_path), "id": c1["id"], "reason": "no longer needed"})
+        r = handle_get_project_summary(project_params(tmp_path))
+        assert r["counts_by_status"]["decisions"] == {"active": 1, "superseded": 1, "deprecated": 0}
+        assert r["counts_by_status"]["constraints"]["deprecated"] == 1
 
     def test_summary_contains_pipeline(self, tmp_path):
         self._populate(tmp_path)
@@ -864,6 +960,116 @@ class TestDeprecateEntry:
         }))
         data = read_json_file(str(context_dir(tmp_path) / "decisions.json"))
         assert "updated_at" in data[0]
+
+
+class TestDeprecateMerge:
+    """deprecate_entry(merge_into=...) — dedup merge into a surviving entry."""
+
+    def _two_decisions(self, tmp_path):
+        a = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use JSON files for the entry store",
+            problem="Need a store a human can hand-edit and diff in git without extra tooling here.",
+            why_chosen="JSON is human-editable and diffable and needs zero dependencies unlike SQLite for this.",
+            tags=["storage"],
+            retrieval_hints=["json store"],
+        ))
+        b = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Entry store is plain JSON on disk",
+            problem="Same storage question, phrased differently by a later session that forgot A existed.",
+            why_chosen="Plain JSON keeps the store transparent, greppable, and dependency-free for contributors here.",
+            tags=["storage", "architecture"],
+            retrieval_hints=["flat file db"],
+            what_we_tried="Considered SQLite but rejected it for opacity.",
+        ))
+        return a["id"], b["id"]
+
+    def test_merge_unions_lists_and_backfills_text(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": f"Restatement of {a_id}", "merge_into": a_id,
+        })
+        assert r["success"] is True
+        assert r["merged_into"] == a_id
+        assert r["merged"]["tags_added"] == ["architecture"]
+        assert r["merged"]["fields_backfilled"] == ["what_we_tried"]
+        keep = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        assert keep["tags"] == ["storage", "architecture"]
+        assert keep["retrieval_hints"] == ["json store", "flat file db"]
+        assert keep["what_we_tried"] == "Considered SQLite but rejected it for opacity."
+
+    def test_merge_deprecates_source_with_superseded_by(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": "dupe", "merge_into": a_id,
+        })
+        dep = handle_get_context({"project_dir": str(tmp_path), "id": b_id})["entry"]
+        assert dep["status"] == "deprecated"
+        assert dep["superseded_by"] == a_id
+
+    def test_merge_never_overwrites_target_text(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        before = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        why_before = before["why_chosen"]
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": "dupe", "merge_into": a_id,
+        })
+        after = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        # Target's own non-empty why_chosen is preserved, not clobbered by B's.
+        assert after["why_chosen"] == why_before
+
+    def test_merge_into_self_errors(self, tmp_path):
+        a_id, _ = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a_id,
+            "reason": "x", "merge_into": a_id,
+        })
+        assert "error" in r
+
+    def test_merge_into_missing_target_errors_without_deprecating(self, tmp_path):
+        a_id, b_id = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id,
+            "reason": "x", "merge_into": "dec-999",
+        })
+        assert "error" in r
+        # B must NOT have been deprecated — the bad merge failed cleanly.
+        b = handle_get_context({"project_dir": str(tmp_path), "id": b_id})["entry"]
+        assert b.get("status", "active") == "active"
+
+    def test_merge_into_cross_type_errors(self, tmp_path):
+        a_id, _ = self._two_decisions(tmp_path)
+        con = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="API responses must be camelCase",
+            reason="Consumers expect camelCase keys and break on snake_case in the payload.",
+        ))
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": con["id"],
+            "reason": "x", "merge_into": a_id,
+        })
+        assert "error" in r
+        # The constraint was not deprecated by the failed cross-type merge.
+        c = handle_get_context({"project_dir": str(tmp_path), "id": con["id"]})["entry"]
+        assert c.get("status", "active") == "active"
+
+    def test_plain_deprecate_unchanged_without_merge_into(self, tmp_path):
+        # Guard: default deprecate path is byte-for-byte the old behavior.
+        a_id, b_id = self._two_decisions(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": b_id, "reason": "gone",
+        })
+        assert r["success"] is True and r["status"] == "deprecated"
+        assert "merged_into" not in r
+        b = handle_get_context({"project_dir": str(tmp_path), "id": b_id})["entry"]
+        assert b["status"] == "deprecated"
+        # A untouched — no merge happened.
+        a = handle_get_context({"project_dir": str(tmp_path), "id": a_id})["entry"]
+        assert a["tags"] == ["storage"]
 
 
 # ===========================================================================
@@ -1540,6 +1746,302 @@ class TestSimilarEntrySurfacing:
 
 
 # ===========================================================================
+# Restatement vs contradiction classification on overlapping entries
+# ===========================================================================
+
+
+class TestOverlapClassification:
+    def test_classify_negation_asymmetry_is_contradiction(self):
+        a = _text_words({"rule": "api responses must be camelCase required"})
+        b = _text_words({"rule": "api responses must not be camelCase"})
+        assert _classify_overlap(a, b) == "likely_contradiction"
+
+    def test_classify_polarity_pair_is_contradiction(self):
+        a = _text_words({"rule": "always run conductor from the packaged exe"})
+        b = _text_words({"rule": "never run conductor from the packaged exe"})
+        assert _classify_overlap(a, b) == "likely_contradiction"
+
+    def test_classify_same_polarity_is_restatement(self):
+        a = _text_words({"summary": "all api responses use camelCase keys"})
+        b = _text_words({"summary": "api responses should use camelCase keys everywhere"})
+        assert _classify_overlap(a, b) == "likely_restatement"
+
+    def test_classify_both_negate_same_thing_is_restatement(self):
+        # Both carry a negation marker -> no asymmetry -> restatement, not a
+        # spurious contradiction.
+        a = _text_words({"rule": "never run the scheduler from source"})
+        b = _text_words({"rule": "do not run the scheduler from source, avoid it"})
+        assert _classify_overlap(a, b) == "likely_restatement"
+
+    def test_contradiction_surfaced_at_record_time(self, tmp_path):
+        first = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Always run the scheduler binary from the packaged exe",
+            reason="The packaged exe carries the environment the scheduler needs to find jobs.",
+            tags=["scheduler"],
+        ))
+        second = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Never run the scheduler binary from the packaged exe",
+            reason="The packaged exe pins a stale environment that hides newly added jobs.",
+            tags=["scheduler"],
+        ))
+        assert second["success"] is True  # advisory only, write proceeds
+        matches = second.get("similar_entries", [])
+        flagged = [m for m in matches if m["id"] == first["id"]]
+        assert flagged and flagged[0]["relation"] == "likely_contradiction"
+        assert "contradiction_note" in second
+
+    def test_restatement_has_no_contradiction_note(self, tmp_path):
+        handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use atomic writes with temp file and os.replace for entry files",
+            tags=["storage", "data-integrity"],
+        ))
+        second = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Entry files use atomic writes via temp file and os.replace",
+            tags=["storage", "data-integrity"],
+        ))
+        relations = [m["relation"] for m in second.get("similar_entries", [])]
+        assert relations and all(r == "likely_restatement" for r in relations)
+        assert "contradiction_note" not in second
+
+
+# ===========================================================================
+# query_entries: deterministic structured field filtering (v0.13)
+# ===========================================================================
+
+
+class TestQueryEntries:
+    """A small mixed store, then one filter type per test."""
+
+    def _seed(self, tmp_path):
+        ids = {}
+        d1 = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Use JSON files for the entry store",
+            problem="Need a store a human can hand-edit and diff in git without extra tooling.",
+            why_chosen="JSON is human-editable, diffable, and needs zero dependencies unlike SQLite here.",
+            tags=["storage", "architecture"],
+            origin="user",
+        ))
+        d2 = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Switch the entry store to atomic writes",
+            problem="A crash mid-write truncated the JSON store and destroyed recorded history badly.",
+            why_chosen="Atomic temp-file replace keeps the old file intact until the new one is fully written out.",
+            tags=["storage"],
+            origin="user",
+            supersedes=[d1["id"]],
+        ))
+        c1 = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Hook stdout must be ASCII only",
+            reason="Windows cp1252 stdout raises UnicodeEncodeError on non-ASCII and crashes the hook.",
+            scope="hooks/",
+            hardness="absolute",
+            tags=["hooks", "windows"],
+            origin="user",
+        ))
+        c2 = handle_record_constraint(constraint_params(
+            tmp_path,
+            rule="Prefer small helper functions in the server module",
+            reason="Keeps the growing server handlers readable and independently testable over time.",
+            scope="server.py",
+            hardness="advisory",
+            tags=["style"],
+        ))
+        p1 = handle_record_pipeline(pipeline_params(
+            tmp_path,
+            name="Release flow",
+            purpose="Ship a version bump consistently across pyproject, server.json and server.py.",
+            steps=[{"order": 1, "action": "bump versions"}],
+            tags=["release"],
+        ))
+        ids.update(d1=d1["id"], d2=d2["id"], c1=c1["id"], c2=c2["id"], p1=p1["id"])
+        return ids
+
+    def _q(self, tmp_path, **preds):
+        r = handle_query_entries({"project_dir": str(tmp_path), **preds})
+        return r, [x["entry"]["id"] for x in r["results"]]
+
+    def test_kind_alias_maps_to_types(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, got = self._q(tmp_path, kind="constraint")
+        assert set(got) == {ids["c1"], ids["c2"]}
+        # list form works too
+        _, got2 = self._q(tmp_path, kind=["decision", "pipeline"])
+        assert set(got2) == {ids["d1"], ids["d2"], ids["p1"]}
+        # explicit `types` wins over `kind` when both are given
+        _, got3 = self._q(tmp_path, kind="constraint", types=["pipelines"])
+        assert set(got3) == {ids["p1"]}
+
+    def test_text_filter_and_terms(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # "atomic" appears only in d2's summary/rationale
+        _, got = self._q(tmp_path, text="atomic")
+        assert got == [ids["d2"]]
+        # all terms must appear (AND): "atomic" and "json" both in d2
+        _, both = self._q(tmp_path, text="atomic json")
+        assert both == [ids["d2"]]
+        # a term present nowhere -> empty
+        _, none = self._q(tmp_path, text="kubernetes")
+        assert none == []
+
+    def test_text_combines_with_other_predicates(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # text + kind AND together
+        _, got = self._q(tmp_path, kind="constraint", text="ascii")
+        assert got == [ids["c1"]]
+
+    def test_limit_caps_returned_but_reports_total(self, tmp_path):
+        self._seed(tmp_path)
+        r, got = self._q(tmp_path, limit=2)
+        assert len(got) == 2
+        assert r["entries_returned"] == 2
+        assert r["matched_entries"] == 5      # total matched, not the limited count
+        assert r["budget_truncated"] is True
+        # no limit -> all five
+        r2, got2 = self._q(tmp_path)
+        assert len(got2) == 5 and r2["matched_entries"] == 5
+
+    def test_type_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        r, got = self._q(tmp_path, types=["constraints"])
+        assert set(got) == {ids["c1"], ids["c2"]}
+        # Every returned entry is labeled with its singular type.
+        assert all(x["type"] == "constraint" for x in r["results"])
+
+    def test_status_filter_superseded_and_active(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, superseded = self._q(tmp_path, status="superseded")
+        assert superseded == [ids["d1"]]
+        _, active_dec = self._q(tmp_path, types=["decisions"], status="active")
+        assert active_dec == [ids["d2"]]
+
+    def test_no_status_filter_includes_superseded(self, tmp_path):
+        # Unlike get_context, query_entries applies no default status filter.
+        ids = self._seed(tmp_path)
+        _, got = self._q(tmp_path, types=["decisions"])
+        assert set(got) == {ids["d1"], ids["d2"]}
+
+    def test_deprecated_status_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": ids["c2"], "reason": "No longer a convention we keep."
+        })
+        _, dep = self._q(tmp_path, status="deprecated")
+        assert dep == [ids["c2"]]
+        # And it no longer shows under active.
+        _, active_con = self._q(tmp_path, types=["constraints"], status="active")
+        assert active_con == [ids["c1"]]
+
+    def test_origin_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, user_origin = self._q(tmp_path, origin="user")
+        assert set(user_origin) == {ids["d1"], ids["d2"], ids["c1"]}
+        # c2 and p1 default to agent origin.
+        _, agent_origin = self._q(tmp_path, origin="agent")
+        assert set(agent_origin) == {ids["c2"], ids["p1"]}
+
+    def test_scope_exact_match(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, hooks = self._q(tmp_path, scope="hooks/")
+        assert hooks == [ids["c1"]]
+        # Exact, not substring: "hooks" (no slash) matches nothing.
+        _, nope = self._q(tmp_path, scope="hooks")
+        assert nope == []
+
+    def test_hardness_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, absolute = self._q(tmp_path, hardness="absolute")
+        assert absolute == [ids["c1"]]
+        _, advisory = self._q(tmp_path, hardness="advisory")
+        assert advisory == [ids["c2"]]
+
+    def test_tags_any_and_tags_all(self, tmp_path):
+        ids = self._seed(tmp_path)
+        _, any_storage = self._q(tmp_path, tags_any=["storage", "release"])
+        assert set(any_storage) == {ids["d1"], ids["d2"], ids["p1"]}
+        _, all_two = self._q(tmp_path, tags_all=["storage", "architecture"])
+        assert all_two == [ids["d1"]]
+
+    def test_supersedes_and_superseded_by(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # The entry that supersedes d1 is d2.
+        _, sup = self._q(tmp_path, supersedes=ids["d1"])
+        assert sup == [ids["d2"]]
+        # The entries replaced by d2 is d1.
+        _, by = self._q(tmp_path, superseded_by=ids["d2"])
+        assert by == [ids["d1"]]
+
+    def test_combined_predicates_and(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # user-origin absolute constraint scoped to hooks/ -> only c1.
+        _, got = self._q(
+            tmp_path, types=["constraints"], origin="user",
+            hardness="absolute", scope="hooks/",
+        )
+        assert got == [ids["c1"]]
+        # Tightening one predicate to a non-match yields nothing.
+        _, none = self._q(
+            tmp_path, types=["constraints"], origin="user",
+            hardness="advisory", scope="hooks/",
+        )
+        assert none == []
+
+    def test_empty_result_is_clean_not_abstention(self, tmp_path):
+        self._seed(tmp_path)
+        r, got = self._q(tmp_path, tags_any=["does-not-exist"])
+        assert got == []
+        assert r["matched_entries"] == 0
+        assert r["entries_returned"] == 0
+        # No relevance/abstention machinery on a structured query.
+        assert "no_confident_match" not in r
+        assert "guidance" not in r
+        assert "top_relevance" not in r
+
+    def test_since_before_temporal_filter(self, tmp_path):
+        ids = self._seed(tmp_path)
+        # Everything was just created; a future `since` excludes all, a future
+        # `before` includes all — same semantics as get_context.
+        _, future = self._q(tmp_path, since="2999-01-01")
+        assert future == []
+        _, past = self._q(tmp_path, before="2999-01-01", types=["decisions"])
+        assert set(past) == {ids["d1"], ids["d2"]}
+
+    def test_stable_id_order(self, tmp_path):
+        self._seed(tmp_path)
+        _, got = self._q(tmp_path)
+        # Deterministic natural-ID order, grouped by prefix then number.
+        assert got == sorted(got, key=lambda i: (i.split("-")[0], int(i.split("-")[1])))
+
+    def test_budget_truncation_flag(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_query_entries({"project_dir": str(tmp_path), "token_budget": 1})
+        # A 1-token budget can't fit any entry; matched > returned, flagged.
+        assert r["matched_entries"] > 0
+        assert r["entries_returned"] == 0
+        assert r["budget_truncated"] is True
+
+    def test_unresolved_project_errors(self):
+        r = handle_query_entries({"status": "active"})
+        assert "error" in r
+
+    def test_get_context_still_hides_deprecated(self, tmp_path):
+        # Guard: query_entries must not have changed get_context's behavior —
+        # get_context still drops deprecated entries by default.
+        ids = self._seed(tmp_path)
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": ids["c1"], "reason": "Retired for this guard test only."
+        })
+        r = handle_get_context({"project_dir": str(tmp_path), "tags": ["hooks"]})
+        returned = [x["entry"]["id"] for x in r["results"]]
+        assert ids["c1"] not in returned
+
+
+# ===========================================================================
 # scope_guard hook (v0.6): edit-time injection of scoped constraints
 # ===========================================================================
 
@@ -2036,10 +2538,361 @@ class TestToolSchemaBudget:
         wordier description must fit the budget or consciously raise it here,
         with the cost acknowledged. Rich guidance belongs in _FIELD_GUIDANCE
         rejection messages and CLAUDE.md, not in schema descriptions.
-        Measured ~2374 tokens at v0.7.1."""
+        Measured ~2374 tokens at v0.7.1; ~2579 at v0.11.0 after adding the
+        12th tool (reload_constraints) with a deliberately terse description
+        — budget raised to 2650 to accommodate one more real tool. ~3053 at
+        v0.13.0 after adding the 13th tool (query_entries): a field-rich
+        structured-query tool with 13 predicates is inherently ~470 tokens
+        even with trimmed per-field descriptions — budget raised to 3100,
+        cost consciously accepted for a distinct query capability. ~3121 at
+        v0.14.0 after adding the merge_into param to deprecate_entry (dedup
+        merge) — one param, no new tool; budget raised to 3150. ~3923 after
+        adding record_entry, the unified write tool: it carries the union of the
+        three record_* schemas, and during the deprecation window we
+        deliberately keep BOTH record_entry and the three aliases so no caller
+        breaks — that transitional overlap is the cost. Budget raised to 4000;
+        it can drop again once the aliases are eventually retired. ~4066 after
+        the consolidation items: query_entries gained kind/text/limit filters and
+        get_project_summary's description became the one-call orientation blurb.
+        Budget raised to 4150. ~4280 after adding export_snapshot /
+        import_snapshot (team-shared snapshot) — two small schemas; budget
+        raised to 4350."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 2500, (
-            f"tools/list payload is ~{total} tokens (budget: 2500). "
+        assert total <= 4350, (
+            f"tools/list payload is ~{total} tokens (budget: 4350). "
             "Trim schema descriptions or consciously raise the budget."
         )
+
+
+# ===========================================================================
+# Constraint re-injection (v0.11): mid-session rules refresh
+# ===========================================================================
+
+_REINJECT_HOOK = str(Path(__file__).parent.parent / "hooks" / "constraint_reinject.py")
+
+
+def _write_config(project: Path, cfg: dict):
+    ctx = project / CONTEXT_DIR_NAME
+    ctx.mkdir(parents=True, exist_ok=True)
+    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+
+def _run_reinject(project: Path, session_id: str = "s1"):
+    payload = json.dumps({"session_id": session_id, "tool_name": "Bash"})
+    env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
+    proc = subprocess.run(
+        [sys.executable, _REINJECT_HOOK], input=payload, capture_output=True,
+        text=True, env=env, timeout=30,
+    )
+    return proc.stdout.strip()
+
+
+class TestBuildConstraintsBlock:
+    """The constraints-only block builder and the reload_constraints tool."""
+
+    def test_block_contains_only_constraints(self, tmp_path):
+        # Record one of each entry type; the block must surface only the
+        # constraint, not the decision or pipeline.
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Never bypass the auth middleware", hardness="absolute"))
+        handle_record_decision(decision_params(
+            tmp_path, summary="Adopt JSON store for memory"))
+        handle_record_pipeline(pipeline_params(tmp_path, name="Deploy flow"))
+
+        block = build_constraints_block(str(tmp_path / CONTEXT_DIR_NAME))
+        assert block["initialized"] is True
+        assert block["count"] == 1
+        assert "Never bypass the auth middleware" in block["text"]
+        assert "Absolute Constraints (1):" in block["text"]
+        # No decision / pipeline leakage.
+        assert "JSON store" not in block["text"]
+        assert "Deploy flow" not in block["text"]
+        assert "Decisions" not in block["text"]
+        assert "Pipelines" not in block["text"]
+
+    def test_block_format_matches_session_start(self, tmp_path):
+        # The re-injected block must render constraints identically to the
+        # session-start summary. Extract the constraint lines from the full
+        # summary and assert they appear verbatim in the block.
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Absolute one here", hardness="absolute"))
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Advisory two here", hardness="advisory"))
+        base = str(tmp_path / CONTEXT_DIR_NAME)
+        block = build_constraints_block(base)
+        summary = handle_get_project_summary({"project_dir": str(tmp_path)})["summary"]
+        assert block["text"] in summary
+
+    def test_deprecated_constraints_excluded(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, rule="Soon to be deprecated rule"))
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": rec["id"], "reason": "no longer true"})
+        block = build_constraints_block(str(tmp_path / CONTEXT_DIR_NAME))
+        assert block["count"] == 0
+        assert block["text"] == ""
+
+    def test_no_context_dir_uninitialized(self, tmp_path):
+        block = build_constraints_block(str(tmp_path / "does_not_exist"))
+        assert block["initialized"] is False
+        assert block["count"] == 0
+        assert block["text"] == ""
+
+    def test_reload_tool_returns_current_constraints(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Rule surfaced on demand"))
+        out = handle_reload_constraints({"project_dir": str(tmp_path)})
+        assert out["initialized"] is True
+        assert out["count"] == 1
+        assert "Rule surfaced on demand" in out["constraints"]
+
+    def test_reload_tool_reflects_updates(self, tmp_path):
+        # Recording another constraint changes what reload returns — it reads
+        # live, not a snapshot.
+        handle_record_constraint(constraint_params(tmp_path, rule="First rule here"))
+        first = handle_reload_constraints({"project_dir": str(tmp_path)})
+        assert first["count"] == 1
+        handle_record_constraint(constraint_params(tmp_path, rule="Second rule here"))
+        second = handle_reload_constraints({"project_dir": str(tmp_path)})
+        assert second["count"] == 2
+        assert "Second rule here" in second["constraints"]
+
+    def test_reload_tool_uninitialized_when_no_store(self, tmp_path):
+        out = handle_reload_constraints({"project_dir": str(tmp_path / "nope")})
+        assert out["initialized"] is False
+        assert out["count"] == 0
+
+
+class TestConstraintReinjectHook:
+    """The PostToolUse periodic re-injection hook: opt-in, default off."""
+
+    def _record(self, tmp_path):
+        return handle_record_constraint(constraint_params(
+            tmp_path, rule="Re-injected rule that must persist"))
+
+    def test_disabled_by_default(self, tmp_path):
+        # No config.json at all -> feature off -> never fires.
+        self._record(tmp_path)
+        for _ in range(6):
+            assert _run_reinject(tmp_path) == ""
+
+    def test_explicit_disabled_never_fires(self, tmp_path):
+        self._record(tmp_path)
+        _write_config(tmp_path, {"constraint_reinjection": {"enabled": False}})
+        for _ in range(6):
+            assert _run_reinject(tmp_path) == ""
+
+    def test_fires_every_n_tools(self, tmp_path):
+        rec = self._record(tmp_path)
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 3}})
+        fired = [bool(_run_reinject(tmp_path)) for _ in range(7)]
+        # Silent for the first 2, fires on the 3rd, then every 3rd after.
+        assert fired == [False, False, True, False, False, True, False]
+
+    def test_injected_payload_is_constraints_only(self, tmp_path):
+        rec = self._record(tmp_path)
+        handle_record_decision(decision_params(
+            tmp_path, summary="A decision that must not appear"))
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
+        out = _run_reinject(tmp_path)
+        data = json.loads(out)
+        ctx = data["hookSpecificOutput"]["additionalContext"]
+        assert data["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+        assert rec["id"] in ctx
+        assert "Re-injected rule that must persist" in ctx
+        assert "A decision that must not appear" not in ctx
+
+    def test_counter_resets_per_session(self, tmp_path):
+        self._record(tmp_path)
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 3}})
+        # Two calls in session A (no fire yet), then a new session B restarts
+        # the count, so B also needs 3 calls before its first fire.
+        assert _run_reinject(tmp_path, "sess-a") == ""
+        assert _run_reinject(tmp_path, "sess-a") == ""
+        assert _run_reinject(tmp_path, "sess-b") == ""
+        assert _run_reinject(tmp_path, "sess-b") == ""
+        assert _run_reinject(tmp_path, "sess-b") != ""
+
+    def test_no_constraints_stays_silent(self, tmp_path):
+        # Feature on, but nothing recorded yet -> nothing to surface.
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
+        # Need a .context/ dir for the hook to resolve the project.
+        assert _run_reinject(tmp_path) == ""
+
+    def test_output_is_ascii(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Rule with unicode: cafe resume naive"))
+        _write_config(tmp_path, {
+            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
+        out = _run_reinject(tmp_path)
+        out.encode("ascii")  # raises if any non-ASCII slipped through
+
+
+# ===========================================================================
+# CLI parity (Item 6): context-keeper <tool> '<json>' -> same HANDLERS
+# ===========================================================================
+
+_SERVER = str(Path(__file__).parent.parent / "server.py")
+
+
+def _run_cli(project, *args, env_project=True):
+    env = dict(os.environ)
+    if env_project:
+        env["CONTEXT_KEEPER_PROJECT"] = str(project)
+    return subprocess.run(
+        [sys.executable, _SERVER, *args], capture_output=True, text=True,
+        env=env, timeout=30,
+    )
+
+
+class TestCLI:
+    def test_record_then_query_roundtrip(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        rec = _run_cli(tmp_path, "record_entry", json.dumps({
+            "kind": "constraint",
+            "rule": "Never log the signing secret anywhere",
+            "reason": "A leaked secret in logs lets anyone forge authenticated requests, a bypass.",
+        }))
+        assert rec.returncode == 0
+        assert json.loads(rec.stdout)["id"] == "con-001"
+
+        q = _run_cli(tmp_path, "query_entries", json.dumps({"kind": "constraint"}))
+        assert q.returncode == 0
+        assert json.loads(q.stdout)["matched_entries"] == 1
+
+    def test_project_dir_in_json_args(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        r = _run_cli(tmp_path, "get_project_summary",
+                     json.dumps({"project_dir": str(tmp_path)}), env_project=False)
+        assert r.returncode == 0
+        assert json.loads(r.stdout)["initialized"] in (True, False)
+
+    def test_unknown_tool_exit_2(self, tmp_path):
+        r = _run_cli(tmp_path, "bogus_tool", "{}")
+        assert r.returncode == 2
+        assert "Unknown tool" in r.stderr
+
+    def test_bad_json_exit_2(self, tmp_path):
+        r = _run_cli(tmp_path, "query_entries", "not json")
+        assert r.returncode == 2
+        assert "Invalid JSON" in r.stderr
+
+    def test_handler_error_exit_1(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        # get_context with an unknown id returns {"error": ...} -> exit 1
+        r = _run_cli(tmp_path, "get_context", json.dumps({"id": "dec-999"}))
+        assert r.returncode == 1
+        assert "error" in json.loads(r.stdout)
+
+    def test_help_exit_0_lists_tools(self, tmp_path):
+        r = _run_cli(tmp_path, "--help")
+        assert r.returncode == 0
+        assert "record_entry" in r.stderr and "query_entries" in r.stderr
+
+    def test_no_args_is_stdio_not_cli(self, tmp_path):
+        # With no args the process serves stdio: feed one initialize request.
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
+        proc = subprocess.run(
+            [sys.executable, _SERVER], capture_output=True, text=True, env=env,
+            input='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
+            timeout=30,
+        )
+        assert proc.returncode == 0
+        assert json.loads(proc.stdout.splitlines()[0])["result"]["serverInfo"]["name"] == "context-keeper"
+
+
+# ===========================================================================
+# Team-shared snapshot (Item 5): export / import / first-run bootstrap
+# ===========================================================================
+
+from server import (  # noqa: E402
+    handle_export_snapshot,
+    handle_import_snapshot,
+    SNAPSHOT_DIR_NAME,
+    SNAPSHOT_FILE_NAME,
+)
+
+
+class TestSnapshot:
+    def _seed(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Never log the signing secret in any output",
+            reason="A leaked secret in logs lets anyone forge authenticated requests here."))
+        handle_record_decision(decision_params(
+            tmp_path, summary="Use gzip snapshots for team sharing"))
+
+    def _snap_file(self, tmp_path):
+        return tmp_path / SNAPSHOT_DIR_NAME / SNAPSHOT_FILE_NAME
+
+    def test_export_writes_snapshot_and_gitattributes(self, tmp_path):
+        self._seed(tmp_path)
+        r = handle_export_snapshot({"project_dir": str(tmp_path)})
+        assert r["success"] is True
+        assert self._snap_file(tmp_path).exists()
+        assert r["counts"] == {"decisions": 1, "pipelines": 0, "constraints": 1}
+        ga = (tmp_path / ".gitattributes").read_text()
+        assert f"{SNAPSHOT_DIR_NAME}/{SNAPSHOT_FILE_NAME} merge=ours" in ga
+
+    def test_export_is_byte_stable_for_same_content(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        first = self._snap_file(tmp_path).read_bytes()
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        second = self._snap_file(tmp_path).read_bytes()
+        assert first == second  # mtime=0 -> reproducible, no git churn
+
+    def test_gitattributes_idempotent(self, tmp_path):
+        self._seed(tmp_path)
+        assert handle_export_snapshot({"project_dir": str(tmp_path)})["gitattributes"] == "added"
+        assert handle_export_snapshot({"project_dir": str(tmp_path)})["gitattributes"] == "present"
+        # not duplicated
+        ga = (tmp_path / ".gitattributes").read_text()
+        assert ga.count("merge=ours") == 1
+
+    def test_import_into_empty_store_restores(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        # simulate a fresh clone: remove the working store, keep the snapshot
+        import shutil
+        shutil.rmtree(context_dir(tmp_path))
+        r = handle_import_snapshot({"project_dir": str(tmp_path)})
+        assert r["success"] is True
+        assert r["imported"]["decisions"] == 1 and r["imported"]["constraints"] == 1
+        assert (context_dir(tmp_path) / "decisions.json").exists()
+
+    def test_import_is_non_destructive(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        # store still populated -> import must skip, not overwrite
+        r = handle_import_snapshot({"project_dir": str(tmp_path)})
+        assert r["skipped"] == {"decisions": True, "constraints": True}
+
+    def test_import_errors_without_snapshot(self, tmp_path):
+        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
+        r = handle_import_snapshot({"project_dir": str(tmp_path)})
+        assert "error" in r
+
+    def test_get_project_summary_bootstraps_on_first_run(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        import shutil
+        shutil.rmtree(context_dir(tmp_path))
+        assert not context_dir(tmp_path).exists()
+        # first orienting call hydrates from the snapshot, then summarizes
+        s = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert s["initialized"] is True
+        assert s["counts"]["decisions"] == 1
+        assert len(s["active_constraints"]) == 1
+
+    def test_bootstrap_noop_when_store_present(self, tmp_path):
+        self._seed(tmp_path)
+        handle_export_snapshot({"project_dir": str(tmp_path)})
+        # add an entry AFTER export; bootstrap must not clobber it back
+        handle_record_decision(decision_params(tmp_path, summary="Added after the snapshot export"))
+        s = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert s["counts"]["decisions"] == 2  # the post-snapshot entry survives

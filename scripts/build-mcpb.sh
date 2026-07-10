@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# Build the Context Keeper MCPB desktop bundle (.mcpb) reproducibly.
+#
+# The bundle is a zip with manifest.json at its root plus the Python server
+# under server/. This server has ZERO third-party dependencies (stdlib only),
+# so there is no server/lib to vendor — we ship just the two source modules.
+#
+# Packs with the official mcpb CLI when available (it validates the manifest);
+# otherwise falls back to a deterministic `zip`. Both produce a valid bundle.
+#
+# Usage: scripts/build-mcpb.sh [output-dir]   (default: dist/)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT_DIR="${1:-$ROOT/dist}"
+STAGE="$ROOT/dist/mcpb-stage"
+
+VERSION="$(python3 -c "import json,sys; print(json.load(open('$ROOT/mcpb/manifest.json'))['version'])")"
+BUNDLE="$OUT_DIR/context-keeper-$VERSION.mcpb"
+
+echo "==> Building Context Keeper MCPB v$VERSION"
+
+# --- stage a clean tree: manifest + icon at root, server modules under server/
+rm -rf "$STAGE"
+mkdir -p "$STAGE/server" "$OUT_DIR"
+cp "$ROOT/mcpb/manifest.json" "$STAGE/manifest.json"
+cp "$ROOT/mcpb/icon.png"      "$STAGE/icon.png"
+cp "$ROOT/server.py"          "$STAGE/server/server.py"
+cp "$ROOT/semantic_index.py"  "$STAGE/server/semantic_index.py"
+
+rm -f "$BUNDLE"
+
+if command -v mcpb >/dev/null 2>&1; then
+  PACK=(mcpb pack "$STAGE" "$BUNDLE")
+elif command -v npx >/dev/null 2>&1; then
+  PACK=(npx --yes @anthropic-ai/mcpb@2 pack "$STAGE" "$BUNDLE")
+else
+  PACK=()
+fi
+
+if [ "${#PACK[@]}" -gt 0 ]; then
+  echo "==> Packing with mcpb CLI: ${PACK[*]}"
+  "${PACK[@]}"
+else
+  echo "==> mcpb CLI not found; packing deterministically with zip"
+  # -X strips extra file attributes; sorted input keeps entry order stable.
+  ( cd "$STAGE" && find . -type f | LC_ALL=C sort | zip -X -q "$BUNDLE" -@ )
+fi
+
+echo "==> Built: $BUNDLE"
+ls -l "$BUNDLE"

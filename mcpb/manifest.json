@@ -1,0 +1,71 @@
+{
+  "manifest_version": "0.3",
+  "name": "context-keeper",
+  "display_name": "Context Keeper",
+  "version": "0.14.0",
+  "description": "Local, zero-dependency project memory for AI assistants: decisions, constraints, and workflows with the rationale behind them.",
+  "long_description": "Context Keeper is a local MCP server that gives AI coding assistants persistent project memory — the decisions, constraints, and workflows of a project and the reasoning behind them — so a new session doesn't start from zero or confidently redo what you already ruled out. Structured, rationale-first memory with schema-enforced \"why,\" origin-based trust, hybrid retrieval (full-text + optional local semantic) with honest abstention, a knowledge lifecycle (supersede, contradiction detection, dedup-and-merge, decay, explicit forget), and a structured field query alongside relevance search. Everything is stored as readable JSON in a folder you choose. Zero dependencies by default; nothing leaves your machine.",
+  "author": {
+    "name": "Jonathan Armstrong",
+    "email": "jarmstrong158@gmail.com",
+    "url": "https://github.com/jarmstrong158"
+  },
+  "homepage": "https://github.com/jarmstrong158/context-keeper",
+  "documentation": "https://github.com/jarmstrong158/context-keeper#readme",
+  "support": "https://github.com/jarmstrong158/context-keeper/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jarmstrong158/context-keeper"
+  },
+  "icon": "icon.png",
+  "license": "MIT",
+  "keywords": ["mcp", "memory", "context", "decisions", "constraints", "claude", "project-memory"],
+  "server": {
+    "type": "python",
+    "entry_point": "server/server.py",
+    "mcp_config": {
+      "command": "python",
+      "args": ["${__dirname}/server/server.py"],
+      "env": {
+        "CONTEXT_KEEPER_PROJECT": "${user_config.context_directory}",
+        "PYTHONPATH": "${__dirname}/server",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  },
+  "user_config": {
+    "context_directory": {
+      "type": "directory",
+      "title": "Storage directory",
+      "description": "Folder where Context Keeper keeps your project memory. A .context/ subfolder of readable JSON is created here on first write. Everything stays local — nothing is uploaded.",
+      "required": true,
+      "default": "${HOME}/context-keeper"
+    }
+  },
+  "tools_generated": false,
+  "tools": [
+    { "name": "record_decision", "description": "Save a design decision with structured rationale (problem, why_chosen, tradeoffs)." },
+    { "name": "record_pipeline", "description": "Save an ordered, multi-step workflow with its purpose." },
+    { "name": "record_constraint", "description": "Save a rule/invariant with scope, hardness, and reason." },
+    { "name": "get_context", "description": "Relevance-ranked retrieval by query/tags/scope, within a token budget, with honest abstention." },
+    { "name": "query_entries", "description": "Deterministic structured-field filtering (status, origin, tags, scope, hardness, supersession, dates)." },
+    { "name": "get_project_summary", "description": "Concise overview of active decisions, pipelines, and constraints." },
+    { "name": "update_entry", "description": "Update an existing entry by ID; refreshes verified_at." },
+    { "name": "deprecate_entry", "description": "Retire an entry; optionally merge a duplicate into a surviving entry." },
+    { "name": "prune_stale", "description": "Find entries not verified recently, for review." },
+    { "name": "get_compaction_report", "description": "Report whether the last context compaction lost or modified entries." },
+    { "name": "verify_quality", "description": "Scan entries for thin rationale, missing tags, and isolated arcs." },
+    { "name": "export_markdown", "description": "Regenerate DECISIONS.md as a read-only projection of the decisions store." },
+    { "name": "reload_constraints", "description": "Re-surface the constraints-only block on demand mid-session." }
+  ],
+  "privacy_policies": [
+    "https://github.com/jarmstrong158/context-keeper#privacy-policy"
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  }
+}

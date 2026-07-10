@@ -2,6 +2,8 @@
 
 # Context Keeper
 
+_Part of the [xylem](https://github.com/jarmstrong158/xylem) stack._
+
 Project memory for Claude. Records design decisions, pipeline flows, and constraints so Claude maintains context across conversations.
 
 ## The Problem
@@ -10,14 +12,15 @@ As conversations get long, Claude loses the "why" behind earlier decisions. New 
 
 ## The Solution
 
-Context Keeper gives Claude 11 tools to record and retrieve structured project context:
+Context Keeper gives Claude 13 tools to record and retrieve structured project context:
 
 | Tool | Purpose |
 |------|---------|
 | `record_decision` | Save a decision with structured rationale (problem, why_chosen, what_we_tried, tradeoffs) |
 | `record_pipeline` | Save a multi-step workflow with ordering and `purpose` |
 | `record_constraint` | Save a rule with scope, enforcement level, and `triggering_incident` |
-| `get_context` | Retrieve relevant entries by query, tags, scope, or ID — pulls `related_to` links by default |
+| `get_context` | Retrieve relevant entries by query, tags, scope, or ID — relevance-ranked, pulls `related_to` links by default |
+| `query_entries` | **Exact structured-field filtering** (status, origin, tags, scope, hardness, supersession, dates) — deterministic, no ranking; distinct from `get_context`'s relevance search |
 | `get_project_summary` | Compact overview for conversation start |
 | `update_entry` | Update any entry by ID |
 | `deprecate_entry` | Retire an entry with reason |
@@ -25,18 +28,48 @@ Context Keeper gives Claude 11 tools to record and retrieve structured project c
 | `get_compaction_report` | Check if last compaction lost any context |
 | `verify_quality` | Scan entries for thin rationale, missing tags, isolated arcs (auto-called by PreCompact hook) |
 | `export_markdown` | Regenerate `DECISIONS.md` from the decisions store — a derived, read-only projection |
+| `reload_constraints` | Re-surface the constraints-only block on demand mid-session (rules refresh, not the full store) |
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
 
-## v0.11: Two-Way Mirror (local <-> remote)
+## Capabilities at a glance
 
-Optional, fail-soft mirroring so a second device — e.g. a phone recording decisions on the go — can both **receive** the desktop's memory and **contribute** its own. The local `.context/` JSON store stays **canonical**; the [context-keeper-remote](https://github.com/jarmstrong158/context-keeper-remote) Cloudflare Worker is a sync surface, never the source of truth.
+Context Keeper is a small, offline-first memory layer; several of its capabilities are easy to miss because they live inside existing tools rather than as separate features. The map below names them in memory-system terms:
 
-- **Mirror out (local -> remote).** After every `record_*`, `update_entry`, and `deprecate_entry`, the entry is pushed to the remote via its `import_entries` MCP tool. If the remote is unreachable the entry is queued to `.context/.mirror_queue.json` and flushed on the next successful push. A push failure **never** blocks or fails the local write.
+| Capability | How Context Keeper does it |
+|------------|----------------------------|
+| **Procedural memory** | `record_pipeline` stores ordered, dependency-aware workflows (build/deploy/data flows) with `purpose` + `when_to_invoke` — reusable "how we do X", not just facts. |
+| **Deduplication** | Every `record_*` runs a word-set Jaccard pass against the store and returns `similar_entries` when a new entry restates an existing one, so duplicates are caught at capture; `deprecate_entry(merge_into=...)` then folds the duplicate's unique content into the survivor and retires it in one non-destructive step. |
+| **Contradiction detection** | Those same overlaps are classified `likely_restatement` vs `likely_contradiction` (negation/antonym polarity), and a reversal raises a `contradiction_note` telling the agent to resolve the conflict rather than leave two live rules disagreeing. |
+| **Quality refinement** | `verify_quality` scans for thin rationale, missing tags, legacy-schema entries, and isolated (unlinked) arcs; the PreCompact hook runs it automatically so entries get enriched before context is compressed. |
+| **Supersede / decay / forget** | `supersedes` demotes-but-keeps prior decisions (recallable history); `prune_stale` surfaces unverified entries for review; `deprecate_entry` removes an entry from retrieval entirely. |
+| **Origin + trust / source attribution** | Every entry records `origin` (`user` / `agent` / `import`); retrieval gives user-stated entries a trust boost and it decides the default winner when entries conflict. |
+| **Anticipated queries** | `retrieval_hints` stores alternate phrasings a future session might search for, so vocabulary-mismatch queries hit without embeddings. |
+| **Hybrid retrieval** | Lexical (tag + word overlap) by default; an opt-in embedding-cosine blend (`semantic.enabled`) adds vector recall, with lexical fallback when the embedder is offline. |
+| **Fact-metadata query** | `query_entries` filters entries by exact predicates over structured fields (status, origin, tags-any/all, scope, hardness, supersession, dates), AND-combined and deterministic — a precise lookup path distinct from `get_context`'s fuzzy relevance ranking. |
+| **Cache-friendly injection** | The session-start memory block is deterministically ordered with a stable prefix and the only per-session-volatile line (quality-scan IDs) emitted last, so an unchanged store injects byte-identical text across sessions. |
+| **Narrative + clustering** | `get_project_summary` clusters decisions by topic above a threshold and renders a compact narrative; the `DECISIONS.md` projection mirrors the store as human-readable prose. |
+| **Data export / offline / privacy** | Plain JSON in `.context/` you can read, edit, grep, and commit; runs fully offline with zero required dependencies and no data leaving the machine. |
+
+### Evaluation & benchmarks (open methodology)
+
+The retrieval and honesty properties are measured, not asserted — the harness is in [`evals/`](evals/) and reproducible with no network required:
+
+- **Token reduction** — session-start injection vs. dumping the full store: **97.3% / 94.1% / 85.5% / 73.3%** across four real stores ([`evals/token_reduction.py`](evals/token_reduction.py)). The meaningful property is that injected cost stays roughly flat as the store grows.
+- **Retrieval quality** — on a held-out 3-store set, the opt-in semantic blend lifts **hit@5 from 80% → 93% and MRR 0.63 → 0.88** ([`evals/retrieval_eval.py`](evals/retrieval_eval.py)).
+- **Abstention** — measures whether `get_context` says "nothing relevant" instead of confabulating on no-answer queries; the 0.20 relevance floor is the highest with zero false-abstention on the eval set ([`evals/abstention.py`](evals/abstention.py)).
+
+Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md).
+
+## v0.15: Two-Way Mirror (local <-> remote)
+
+Optional, fail-soft mirroring so a second device — e.g. a phone recording decisions on the go — can both **receive** the desktop's memory and **contribute** its own. The local `.context/` JSON store stays **canonical**; the [context-keeper-remote](https://github.com/jarmstrong158/context-keeper-remote) Cloudflare Worker is a sync surface, never the source of truth. (Distinct from the git-committed `export_snapshot` mechanism — the mirror is live and cross-device, the snapshot is a versioned bundle in the repo.)
+
+- **Mirror out (local -> remote).** After every write (`record_entry`/`record_*`, `update_entry`, `deprecate_entry`) the entry is pushed via the remote's `import_entries` MCP tool. If the remote is unreachable the entry is queued to `.context/.mirror_queue.json` and flushed on the next successful push. A push failure **never** blocks or fails the local write.
 - **Mirror in (remote -> local).** `pull_remote` calls the remote's `query_entries`, keeps entries newer than a local watermark (`.context/.mirror_watermark`), and merges them **additively** — a remote entry whose id already exists locally never overwrites the local copy. Wired into the SessionStart hook (so desktop sessions start with phone-recorded entries present) and exposed as the `pull_remote` MCP tool.
 - **`backfill_remote`** pushes the entire local store to the remote (one `import_entries` call per kind) — for seeding a fresh remote.
-- **Additive-only, by design.** `import_entries` *skips* ids already present on the remote rather than overwriting, and pull never overwrites a local id. Consequence: an **edit or deprecation of an already-synced entry does not propagate** — edits only reach the remote if made before the entry's first sync (the offline queue dedupes to the latest state). This is what keeps the mirror non-destructive; cross-device *edits* are out of scope.
-- **Collision-safe IDs (Option B: random suffix).** Two stores minting sequential ids independently would collide (`dec-013` on both, dropped by `import_entries`' skip-existing). Fix: when mirroring is enabled, new ids get a short random hex suffix — `dec-013-a7f3`. The number still leads (sortable, greppable); **old ids are never rewritten**; and with mirroring *off* ids stay bare `dec-013` (single writer, no collision possible). A suffixed local id can never equal the remote's bare `dec-013`, so independent creation on both sides no longer collides.
+- **Additive-only, by design.** `import_entries` *skips* ids already present on the remote rather than overwriting, and pull never overwrites a local id. Consequence: an **edit or deprecation of an already-synced entry does not propagate** — edits only reach the remote if made before the entry's first sync (the offline queue dedupes to the latest state). This is what keeps the mirror non-destructive.
+- **Collision-safe IDs (Option B: random suffix).** Two stores minting sequential ids independently would collide (`dec-013` on both, dropped by `import_entries`' skip-existing). Fix: when mirroring is enabled, new ids get a short random hex suffix — `dec-013-a7f3`. The number still leads (sortable, greppable); **old ids are never rewritten**; and with mirroring *off* ids stay bare `dec-013` (single writer, no collision possible).
 - **Zero new dependencies** (stdlib `urllib` only), **no secrets in code**: the remote URL contains the auth token as its final path segment (`/mcp/<token>`) and comes from an env var only.
 
 Enable by setting one env var where the MCP server runs:
@@ -46,9 +79,95 @@ CONTEXT_KEEPER_REMOTE_URL=https://context-keeper-remote.<acct>.workers.dev/mcp/<
 # CONTEXT_KEEPER_REMOTE_TIMEOUT=5    # optional per-request seconds
 ```
 
-With no `CONTEXT_KEEPER_REMOTE_URL` set, every mirror path is a silent no-op — behavior is identical to pre-v0.11.
+With no `CONTEXT_KEEPER_REMOTE_URL` set, every mirror path is a silent no-op — behavior is identical to pre-v0.15.
 
-**Transport:** stateless JSON-RPC over Streamable HTTP. Each write is one `POST` to the `/mcp/<token>` URL with `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"import_entries","arguments":{"project","kind","entries":[…]}}}`; `pull_remote` calls `query_entries`. No initialize/session handshake (the server is stateless), and the response is a single `application/json` body.
+**Transport:** stateless JSON-RPC over Streamable HTTP. Each write is one `POST` to the `/mcp/<token>` URL (`tools/call` → `import_entries`); `pull_remote` calls `query_entries`. No initialize/session handshake (the server is stateless); the response is a single `application/json` body.
+
+## v0.14: Dedup Merge (`deprecate_entry(merge_into=...)`)
+
+Capture-time detection already caught near-duplicates (`similar_entries` with a `likely_restatement` relation), but *resolving* one was a manual two-step: deprecate the duplicate, then `update_entry` the original to fold in anything it was missing. v0.14 collapses that into one atomic, non-destructive operation.
+
+- **Opt-in param on the existing tool, not a new tool.** `deprecate_entry(id=<dupe>, reason=..., merge_into=<survivor>)` folds the duplicate's unique content into the survivor, then deprecates the duplicate with `superseded_by=<survivor>`. When `merge_into` is absent, `deprecate_entry` behaves exactly as before — byte-for-byte.
+- **Additive and non-destructive.** The survivor can only *gain* content: list fields (`tags`, `retrieval_hints`, `related_to`, `constraints`/`constraints_created`) are unioned, and empty text fields are backfilled from the duplicate — a non-empty field on the survivor is **never** overwritten. The duplicate isn't hard-deleted; it stays on disk as a deprecated entry pointing at the survivor, so the merge is fully auditable and reversible.
+- **Same-type, single-write, validated first.** Merge requires both entries to be the same type (so their schemas line up), resolves and validates the target before any write, and mutates both entries in one file write so the two updates can't clobber each other. A bad `merge_into` (missing target, cross-type, or self) errors cleanly and deprecates nothing.
+- **Roots held.** Explicit and agent-invoked (like every other lifecycle tool), zero new dependencies, no LLM call, deterministic. It streamlines the restatement workflow the capture loop already prescribes rather than adding a background process.
+
+```jsonc
+// dec-002 restates dec-001 — merge and retire it in one call
+{ "id": "dec-002", "reason": "Restatement of dec-001", "merge_into": "dec-001" }
+// -> dec-001 gains dec-002's unique tags/hints/related_to + any text it lacked;
+//    dec-002 becomes deprecated with superseded_by = dec-001
+```
+
+## v0.13: Structured Field Query (`query_entries`)
+
+`get_context` answers *"what's relevant to what I'm working on?"* — it ranks by relevance, blends optional semantics, and flags low-relevance results with an abstention signal. That's the right tool for fuzzy recall, but the wrong one when you already know the exact field values you want. `query_entries` fills that gap: **deterministic filtering over the structured fields that already exist on every entry**, no ranking and no abstention.
+
+- **Exact predicates, AND-combined:** `types`, `status` (active/superseded/deprecated), `origin` (user/agent/import), `tags_any`, `tags_all`, `scope` (exact, case-sensitive), `hardness` (absolute/advisory), `supersedes` / `superseded_by`, and the same `since` / `before` temporal filters as `get_context`. Every predicate is a hard match over an existing field — a query either matches or it doesn't.
+- **No relevance, no confabulation.** Results come back in stable natural-ID order with no score and no `min_relevance` floor — an empty result set is a real, honest answer, not an abstention message. The abstention machinery is for fuzzy text queries; a structured predicate doesn't need it.
+- **Same store, same budget.** It reuses the exact store-reading and entry-serialization paths `get_context` uses, and packs the matched set into the same token budget (default 4000, `token_budget` per call), so a broad query can't dump the store — `matched_entries` vs `entries_returned` and a `budget_truncated` flag tell you if the cap clipped anything.
+- **Additive and self-contained.** Zero new dependencies, stdlib only, no embeddings and no LLM call — pure in-memory filtering over JSON already on disk. `get_context`, the semantic blend, the scoring, and every hook are untouched; default behavior of every existing tool is byte-for-byte unchanged.
+
+One deliberate difference from `get_context`: **`query_entries` applies no default status filter**, so `superseded` and `deprecated` entries *are* returned unless you pass `status`. `get_context` always hides deprecated entries; the structured tool lets you ask for them on purpose.
+
+**Examples:**
+
+```jsonc
+// Absolute constraints scoped to the hooks/ directory
+{ "types": ["constraints"], "hardness": "absolute", "scope": "hooks/" }
+
+// User-stated decision that superseded dec-005
+{ "origin": "user", "supersedes": "dec-005" }
+
+// Active pipelines tagged "release"
+{ "types": ["pipelines"], "status": "active", "tags_any": ["release"] }
+
+// Everything a user asserted this month, across all types
+{ "origin": "user", "since": "2026-07-01" }
+```
+
+## v0.12: Contradiction Detection + Cache-Stable Injection
+
+- **Restatement vs contradiction, at capture time.** The similar-entry pass already caught heavy overlaps; now it classifies each one. Two dependency-free signals — negation asymmetry ("X is required" vs "X is *not* required") and antonym polarity ("always" here / "never" there, "enable" / "disable") — label a match `likely_restatement` or `likely_contradiction`. A restatement nudges you to merge; a contradiction raises a `contradiction_note` telling the agent to resolve which rule is current (`deprecate_entry` with `superseded_by`) instead of silently leaving two live rules that disagree. Advisory only, and only evaluated on pairs Jaccard already flagged as overlapping — the write always proceeds. Zero new dependencies, no LLM call, no added tokens at record time.
+- **Cache-stable session-start injection.** The injected memory block is ordered so its large stable portion — constraints, decisions, pipelines, and the fixed capture guidance — forms a prefix that repeats byte-for-byte across sessions when the store hasn't changed, while the one volatile line (the quality scan's flagged IDs) is emitted last. This keeps the memory block inside the model's cacheable prompt prefix rather than busting the cache each session. It also *reduces* tokens rather than adding them.
+
+## v0.11: Mid-Session Constraint Re-Injection (opt-in)
+
+The SessionStart hook injects your constraints once, at turn one. As a long
+session fills with tool output, those rules scroll out of the model's working
+attention and effectively decay — the model can violate a constraint it was
+briefed on an hour ago simply because it is buried. v0.11 re-surfaces the
+constraints **during** a long session, not just at the start.
+
+Two ways in, both **constraints-only** — they re-inject the exact
+Absolute/Advisory block SessionStart shows, and nothing else from the store
+(no decisions, no pipelines). It's a lightweight rules refresh, not a second
+full dump.
+
+- **`reload_constraints` tool** — returns the current constraints block on
+  demand. Always available; call it whenever you want the rules back in
+  context.
+- **`constraint_reinject.py` hook (PostToolUse)** — **opt-in, default off.**
+  When enabled, it counts tool calls per session and re-injects the
+  constraints block every *N* calls (`every_n_tools`, default 25) via
+  `additionalContext`.
+
+**What triggers it, honestly.** The automatic path is the **PostToolUse**
+hook — that surface *is* injected into the model, and its firing rate tracks
+tool-output volume, which is the thing actually burying the rules. It is **not
+a timer**: an MCP server has no wall-clock inside the context window, so
+re-injection is driven by counting tool calls, not elapsed seconds. It is
+**not PreCompact** either — PreCompact stdout is shown only to the user, never
+injected into the model (the compaction boundary is already re-covered by the
+SessionStart hook, which re-fires with source `compact`).
+
+**Default behavior is unchanged.** With no config (or `enabled: false`), the
+hook is inert and SessionStart works exactly as before. Enable it in
+`.context/config.json`:
+
+```json
+{ "constraint_reinjection": { "enabled": true, "every_n_tools": 25 } }
+```
 
 ## v0.10: Abstention + Supersession-as-Ranking
 
@@ -124,19 +243,43 @@ Legacy entries (pre-v0.4) stay valid — they're never auto-rejected, just flagg
 
 ## Install
 
+Two ways to install, depending on your client. Claude Desktop users get the
+one-click bundle; everything else uses the standard stdio server.
+
+### Option A — Claude Desktop one-click bundle (.mcpb)
+
+Context Keeper ships as an [MCPB desktop extension](https://github.com/anthropics/mcpb):
+a single `.mcpb` file you install without touching any config.
+
+1. Download `context-keeper-<version>.mcpb` from the
+   [Releases page](https://github.com/jarmstrong158/context-keeper/releases).
+2. Double-click it (or drag it into Claude Desktop → Settings → Extensions).
+3. When prompted, choose a **Storage directory** — the folder where your project
+   memory lives (a `.context/` subfolder of readable JSON is created there). Then
+   enable the extension.
+
+That's it — no `pip`, no JSON editing. The bundle is stdlib-only Python, so it has
+no third-party dependencies to install. (Claude Desktop provides the Python
+runtime for `.mcpb` python extensions; you need Python available for it to launch.)
+
+The bundle is built reproducibly from this repo with `scripts/build-mcpb.sh`, and
+CI attaches it to each version's GitHub Release automatically.
+
+### Option B — pip + stdio (Claude Code, Cursor, Codex, any MCP client)
+
 ```bash
 pip install context-keeper-mcp
 ```
 
-### Claude Code
+#### Claude Code
 
 ```bash
 claude mcp add --scope user context-keeper -- python /path/to/context-keeper/server.py
 ```
 
-### Claude Desktop
+#### Claude Desktop (manual config)
 
-Add to your `claude_desktop_config.json`:
+Prefer editing config by hand instead of the `.mcpb` bundle? Add to your `claude_desktop_config.json`:
 
 ```json
 {
@@ -152,7 +295,7 @@ Add to your `claude_desktop_config.json`:
 }
 ```
 
-### Other MCP clients (Cursor, Codex CLI, Gemini CLI, Windsurf, ...)
+#### Other MCP clients (Cursor, Codex CLI, Gemini CLI, Windsurf, ...)
 
 The server is a standard stdio MCP server, so any MCP-capable client can use it — the hooks are Claude Code extras, not requirements. Point your client's MCP config at `python /path/to/context-keeper/server.py` and set `CONTEXT_KEEPER_PROJECT`:
 
@@ -331,11 +474,25 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
             "command": "python /path/to/context-keeper/hooks/scope_guard.py"
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/context-keeper/hooks/constraint_reinject.py"
+          }
+        ]
       }
     ]
   }
 }
 ```
+
+The `constraint_reinject.py` entry is only active when
+`constraint_reinjection.enabled` is set in `.context/config.json` (default
+off) — wiring it up is harmless until you opt in. Its matcher is `""` (every
+tool call) so the per-session counter advances on all activity.
 
 Replace `/path/to/context-keeper` with the actual install path. Set `CONTEXT_KEEPER_PROJECT` env var if your project isn't in the current working directory.
 
@@ -346,6 +503,7 @@ The hooks form a complete capture-and-retrieval loop:
 - **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report and a one-line quality-scan nudge) straight to stdout, which Claude Code injects into context at turn one. It also runs the post-compaction snapshot comparison itself before reading the report — SessionStart fires with source `compact` immediately after compaction, before any Stop hook, so this keeps the injected report fresh. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
 - **PostToolUse (Bash)** — fires after every Bash tool call; when the command contains `git commit`, it injects a reminder to record the matching decision/constraint/gotcha **in the same work cycle**. A commit is the single best capture trigger — it's the exact moment something became real enough to persist in version control. Born from field use: during incident-heavy sessions the agent batched capture "for later," and the user had to ask "update context keeper" three times in one night while a dozen commits shipped
 - **PostToolUse (Edit|Write)** — `scope_guard.py`: when the agent edits a file covered by a constraint's `scope` (e.g. a constraint scoped to `hooks/` and an edit to `hooks/session_start.py`), that constraint is injected right then via `additionalContext`. Session start briefs the rules; this enforces them at the moment of edit. Once per constraint per session
+- **PostToolUse (any tool)** — `constraint_reinject.py`: **opt-in, default off.** When `constraint_reinjection.enabled` is set, it counts tool calls per session and re-injects the constraints-only block every `every_n_tools` calls via `additionalContext`, so rules injected at session start don't decay as tool output buries them. PostToolUse is chosen deliberately: it's a model-visible surface (unlike PreCompact) and its firing rate tracks tool-output volume. Not a timer — an MCP server has no wall-clock in the context window
 - **PreCompact** — snapshots all active `.context/` entries and runs a quality scan (`verify_quality`), printing flagged entries (thin reasoning, missing tags, isolated arcs) to the transcript. Note: PreCompact stdout is user-visible only — Claude Code does not inject it into the model's context, which is why the model-visible quality nudge lives in the SessionStart hook instead
 - **Stop** — safety-net run of the same snapshot comparison SessionStart performs, in case the session ends without a new session starting (idempotent — skips if the snapshot hasn't changed since last comparison)
 
@@ -362,6 +520,7 @@ your-project/
     config.json              # Token budget, stale threshold
     compaction_snapshot.json  # Pre-compaction snapshot (auto-generated)
     compaction_report.json   # Post-compaction diff report (auto-generated)
+    reinject_state.json      # Per-session tool counter for constraint re-injection (auto-generated)
     hook.log                 # Hook activity log
 ```
 
@@ -381,6 +540,10 @@ Create `.context/config.json` to customize:
   "markdown_export": {
     "enabled": false,
     "path": "DECISIONS.md"
+  },
+  "constraint_reinjection": {
+    "enabled": false,
+    "every_n_tools": 25
   },
   "semantic": {
     "enabled": false,
@@ -438,3 +601,81 @@ Claude: [calls get_context with project_dir="/path/to/other-project"]
 ```
 
 Or tag entries with other project names for cross-referencing.
+
+## CLI
+
+Every tool is also reachable from the command line, dispatching to the same
+handlers the MCP server uses:
+
+```bash
+context-keeper <tool> '<json-args>'
+
+# examples
+context-keeper get_project_summary '{}'
+context-keeper record_entry '{"kind":"constraint","rule":"...","reason":"..."}'
+context-keeper query_entries '{"kind":"decision","text":"storage","limit":5}'
+context-keeper --help          # list tools
+```
+
+Project resolution is identical to the server (`CONTEXT_KEEPER_PROJECT`, a cwd
+with `.context/`, or a `project_dir` key in the JSON). Exit codes: `0` success,
+`1` if the tool returns an error, `2` for a usage error. Run with **no
+arguments** and it serves the stdio MCP protocol exactly as before.
+
+## Team-shared memory (opt-in snapshot)
+
+The working store in `.context/` is per-machine (and usually gitignored). To
+share project memory with a team through git, export a single compressed,
+committable snapshot:
+
+```bash
+context-keeper export_snapshot '{}'
+```
+
+This writes `.context-keeper/memory.json.gz` next to your project and adds a
+`.gitattributes` line marking it `merge=ours` so the binary artifact never
+causes a merge conflict. **Committing it is opt-in:**
+
+```bash
+git add .context-keeper/memory.json.gz .gitattributes
+git commit -m "Share project memory"
+# one-time, per clone, for the merge=ours guard to take effect:
+git config merge.ours.driver true
+```
+
+On a fresh clone where the snapshot is present but the working store is empty,
+Context Keeper **imports it automatically on first use** (the first
+`get_project_summary` / session start), so a new teammate starts oriented. Import
+is **non-destructive** — a store that already has entries is never overwritten;
+run `context-keeper import_snapshot '{}'` to trigger it manually.
+
+Codec note: the snapshot uses stdlib **gzip**, not zstd — a real `.zst` would
+require the third-party `zstandard` package, which would break the project's
+zero-dependency guarantee. The snapshot is byte-stable when the store is
+unchanged, so re-exporting doesn't churn git history.
+
+## Privacy Policy
+
+Context Keeper is a **local-only** tool. All data — every decision, constraint,
+pipeline, and config file — is stored as plain JSON in the storage directory you
+choose (a `.context/` folder inside it), on your own machine. Concretely:
+
+- **Nothing is transmitted anywhere.** The server makes no network calls of its
+  own and sends no data to the author or any third party.
+- **No telemetry, no analytics, no tracking.** There is no usage reporting of any
+  kind.
+- **You own and can read/edit/delete your data** at any time — it's just JSON
+  files in a folder you picked.
+- **The only optional network feature is fully opt-in and points where you tell
+  it.** If you enable semantic retrieval (`semantic.enabled`, off by default), the
+  server sends entry text to the embeddings endpoint **you configure** — by design
+  a local service such as Ollama or LM Studio. It is never enabled unless you turn
+  it on, and it only contacts the URL you set. If you point it at a third-party
+  endpoint, that endpoint's own privacy policy applies to what you send it.
+
+Because the tool stores data only in your chosen local directory and transmits
+nothing on its own, there is no external service processing your data by default.
+
+## Related
+
+- [context-keeper-remote](https://github.com/jarmstrong158/context-keeper-remote) — the hosted Cloudflare Worker transport of this server — and the [xylem](https://github.com/jarmstrong158/xylem) hub.
