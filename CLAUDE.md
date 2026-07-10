@@ -34,7 +34,7 @@ Both halves must work for the system to be useful. Retrieval without capture mea
 - A library, pattern, or architecture is selected
 - The user says "let's go with X" after discussing options
 
-Call `record_decision` with the v0.4 structured fields:
+Call `record_entry` with `kind="decision"` and the v0.4 structured fields:
 - `summary` — short label (1-2 sentences)
 - `problem` (required, ≥40 chars) — what forced this decision, what was at stake
 - `why_chosen` (required, ≥60 chars) — actual reasoning, evidence, principle behind the choice
@@ -56,7 +56,7 @@ Call `record_decision` with the v0.4 structured fields:
 - Steps have ordering dependencies (A must happen before B)
 - The user describes "the flow" or "the process"
 
-Call `record_pipeline` with:
+Call `record_entry` with `kind="pipeline"` and:
 - `name`, ordered `steps`, optional `constraints`
 - `purpose` (required, ≥40 chars) — why this pipeline exists, what it accomplishes that ad-hoc steps couldn't
 - `when_to_invoke` (optional but encouraged) — triggers/conditions that should make a future session reach for this pipeline (the reusable knowledge)
@@ -68,7 +68,7 @@ Call `record_pipeline` with:
 - A project convention is established ("all API responses use camelCase")
 - An external requirement exists ("must support Python 3.12+")
 
-Call `record_constraint` with:
+Call `record_entry` with `kind="constraint"` and:
 - `rule`, `scope`, `hardness` (absolute for true invariants, advisory for preferences)
 - Set `scope` to a real file/directory path (e.g. `hooks/`, `server.py`) whenever the rule is localized — the scope_guard hook re-injects scoped constraints at the moment a covered file is edited, so a precise scope turns the rule into an active guardrail instead of a session-start memo
 - `reason` (required, ≥40 chars) — what goes wrong if it's violated, concretely
@@ -101,7 +101,7 @@ When `get_context` returns `no_confident_match: true`, the top entry's lexical r
 
 ## Superseding vs deprecating a decision (v0.10+)
 Two different lifecycle actions:
-- **`record_decision(..., supersedes=[old_id])`** — the new decision *replaces* an older one that was correct at the time. The old entry becomes `superseded`: demoted in ranking but still recallable, so "why did we change from X to Y?" still works. Use this for the normal evolution of a decision.
+- **`record_entry(kind="decision", ..., supersedes=[old_id])`** — the new decision *replaces* an older one that was correct at the time. The old entry becomes `superseded`: demoted in ranking but still recallable, so "why did we change from X to Y?" still works. Use this for the normal evolution of a decision.
 - **`deprecate_entry(id, reason)`** — the entry was wrong, obsolete, or removed. It is filtered out of retrieval entirely. Use this when the history should *not* surface.
 
 ## When NOT to Record

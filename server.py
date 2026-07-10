@@ -117,205 +117,12 @@ USAGE_GUIDANCE = (
 
 TOOLS = [
     {
-        "name": "record_decision",
-        "description": (
-            "Record an architectural or design decision with structured rationale. "
-            "Min lengths enforced server-side; thin entries are rejected with guidance."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string", "description": "What was decided (1-2 sentences)."},
-                "problem": {
-                    "type": "string",
-                    "description": "What forced this decision — trigger, context, stakes. Min 40 chars.",
-                },
-                "why_chosen": {
-                    "type": "string",
-                    "description": (
-                        "The actual reasoning: evidence, principle, or constraint behind the "
-                        "choice. 2-4 sentences, min 60 chars."
-                    ),
-                },
-                "what_we_tried": {
-                    "type": "string",
-                    "description": "Prior attempts and dead ends — the 'tried X before Y' arc. Encouraged.",
-                },
-                "tradeoffs": {
-                    "type": "string",
-                    "description": "What was given up by choosing this. Encouraged.",
-                },
-                "alternatives": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "option": {"type": "string"},
-                            "reason_rejected": {"type": "string"},
-                        },
-                    },
-                    "description": "Options considered and why rejected",
-                },
-                "constraints_created": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "New constraints this decision introduces",
-                },
-                "related_to": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "IDs of related entries; get_context traverses these links.",
-                },
-                "supersedes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "IDs of prior decisions this replaces (marked 'superseded': demoted but still recallable).",
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Tags for categorization and retrieval",
-                },
-                "retrieval_hints": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "2-4 alternate search phrasings (synonyms, symptoms, errors). Indexed for retrieval.",
-                },
-                "origin": {
-                    "type": "string",
-                    "enum": ["user", "agent", "import"],
-                    "description": "Who authored this: user (stated), agent (inferred, default), or import. User-origin ranks higher.",
-                },
-                "rationale": {
-                    "type": "string",
-                    "description": "DEPRECATED: auto-maps to why_chosen if that field is absent.",
-                },
-                "project_dir": {
-                    "type": "string",
-                    "description": "Absolute path to the target project. Creates .context/ if needed.",
-                },
-            },
-            "required": ["summary", "problem", "why_chosen"],
-        },
-    },
-    {
-        "name": "record_pipeline",
-        "description": "Record a multi-step workflow that must be followed in order.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Pipeline name"},
-                "purpose": {
-                    "type": "string",
-                    "description": "Why this pipeline exists — what ad-hoc steps couldn't do. Min 40 chars.",
-                },
-                "when_to_invoke": {
-                    "type": "string",
-                    "description": "What should make a future session reach for this pipeline. Encouraged.",
-                },
-                "steps": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "order": {"type": "integer"},
-                            "action": {"type": "string", "description": "What this step does"},
-                            "output": {"type": "string", "description": "What this step produces"},
-                        },
-                        "required": ["order", "action"],
-                    },
-                    "description": "Ordered list of steps",
-                },
-                "constraints": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Rules that apply to this pipeline",
-                },
-                "related_to": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "IDs of related entries (decisions, constraints, other pipelines)",
-                },
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "retrieval_hints": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "2-4 alternate search phrasings. Indexed for retrieval.",
-                },
-                "origin": {
-                    "type": "string",
-                    "enum": ["user", "agent", "import"],
-                    "description": "Who authored this entry (user/agent/import). Default: agent.",
-                },
-                "project_dir": {
-                    "type": "string",
-                    "description": "Absolute path to the target project. Creates .context/ if needed.",
-                },
-            },
-            "required": ["name", "purpose", "steps"],
-        },
-    },
-    {
-        "name": "record_constraint",
-        "description": "Record a rule or constraint that must be followed in this project.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "rule": {"type": "string", "description": "The constraint in clear imperative language."},
-                "reason": {
-                    "type": "string",
-                    "description": "Why this exists — what goes wrong if violated, concretely. Min 40 chars.",
-                },
-                "triggering_incident": {
-                    "type": "string",
-                    "description": "The specific bug/gotcha/incident that led to this rule. Encouraged.",
-                },
-                "scope": {
-                    "type": "string",
-                    "description": (
-                        "'global', or a file/module path — scoped constraints are re-injected "
-                        "when a covered file is edited (scope_guard hook)."
-                    ),
-                    "default": "global",
-                },
-                "hardness": {
-                    "type": "string",
-                    "enum": ["absolute", "advisory"],
-                    "description": "absolute = never violate. advisory = prefer but exceptions exist.",
-                    "default": "absolute",
-                },
-                "related_to": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "IDs of related entries (the decision that created this constraint, etc.)",
-                },
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "retrieval_hints": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "2-4 alternate search phrasings. Indexed for retrieval.",
-                },
-                "origin": {
-                    "type": "string",
-                    "enum": ["user", "agent", "import"],
-                    "description": "Who authored this entry (user/agent/import). Default: agent.",
-                },
-                "project_dir": {
-                    "type": "string",
-                    "description": "Absolute path to the target project. Creates .context/ if needed.",
-                },
-            },
-            "required": ["rule", "reason"],
-        },
-    },
-    {
         "name": "record_entry",
         "description": (
             "Unified write tool: record a decision, constraint, or pipeline. "
-            "Consolidates record_decision / record_constraint / record_pipeline "
-            "(which remain as deprecated aliases). Required fields depend on kind "
-            "and are validated server-side: decision needs summary/problem/why_chosen; "
-            "constraint needs rule/reason; pipeline needs name/purpose/steps."
+            "Required fields by kind (validated server-side): decision needs "
+            "summary/problem/why_chosen; constraint needs rule/reason; pipeline "
+            "needs name/purpose/steps."
         ),
         "inputSchema": {
             "type": "object",
@@ -404,11 +211,11 @@ TOOLS = [
                 },
                 "since": {
                     "type": "string",
-                    "description": "Only entries verified/created on or after this ISO date.",
+                    "description": "Entries verified/created on or after this ISO date.",
                 },
                 "before": {
                     "type": "string",
-                    "description": "Only entries verified/created strictly before this ISO date.",
+                    "description": "Entries verified/created strictly before this ISO date.",
                 },
                 "include_related": {
                     "type": "boolean",
@@ -425,11 +232,10 @@ TOOLS = [
     {
         "name": "query_entries",
         "description": (
-            "Structured field filter — exact AND-combined predicates over existing "
-            "fields, NOT relevance search. Complements get_context for when you know "
-            "the field values (e.g. absolute constraints scoped to 'hooks/'). Stable "
-            "ID order, no ranking, no abstention; empty is a real answer. No default "
-            "status filter, so superseded/deprecated are included unless you pass one."
+            "Structured field filter — exact AND-combined predicates, NOT relevance "
+            "search. Use when you know the field values (e.g. absolute constraints "
+            "scoped to 'hooks/'). Stable ID order, no ranking; empty is a real "
+            "answer. Includes superseded/deprecated unless you filter status."
         ),
         "inputSchema": {
             "type": "object",
@@ -441,15 +247,15 @@ TOOLS = [
                 },
                 "kind": {
                     "type": ["string", "array"],
-                    "description": "Singular alias for `types` (decision/constraint/pipeline). `types` wins if both given.",
+                    "description": "Singular alias for `types`. `types` wins if both given.",
                 },
                 "text": {
                     "type": "string",
-                    "description": "Free text over rationale/text fields; every term must appear (AND, substring).",
+                    "description": "Free text over text fields; every term must appear (AND, substring).",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Cap the number of entries returned (matched_entries still reports the total).",
+                    "description": "Cap entries returned (matched_entries reports the total).",
                 },
                 "status": {
                     "type": ["string", "array"],
@@ -493,10 +299,9 @@ TOOLS = [
     {
         "name": "get_project_summary",
         "description": (
-            "The single orienting call: the whole lay of the land in one response — "
-            "counts by kind and status, active constraints (compact), the most recent "
-            "decisions, and the full id list, plus the human-readable summary. "
-            "Designed for conversation start; no further probing needed to orient."
+            "The single orienting call for conversation start: counts by kind and "
+            "status, active constraints (compact), recent decisions, the full id "
+            "list, and the human-readable summary — all in one response."
         ),
         "inputSchema": {
             "type": "object",
@@ -546,9 +351,9 @@ TOOLS = [
                 "merge_into": {
                     "type": "string",
                     "description": (
-                        "Dedup merge: fold this entry's unique content (tags, hints, related_to, "
-                        "backfilled text) into this same-type target, then deprecate this one with "
-                        "superseded_by=target. Non-destructive — the target is only added to."
+                        "Dedup merge: fold this entry's unique content into this same-type "
+                        "target, then deprecate this one with superseded_by=target. "
+                        "Non-destructive — the target is only added to."
                     ),
                 },
                 "project_dir": {
@@ -681,19 +486,20 @@ TOOLS = [
         },
     },
     {
-        "name": "pull_remote",
-        "description": "Merge remote-recorded entries into the local store (newest wins). No-op if remote unconfigured.",
+        "name": "mirror",
+        "description": (
+            "Sync entries with the remote store. op='pull' merges remote entries "
+            "into local (newest wins); op='backfill' pushes all local entries to "
+            "remote (upsert). No-op if remote unconfigured."
+        ),
         "inputSchema": {
             "type": "object",
-            "properties": {"project_dir": {"type": "string"}},
-        },
-    },
-    {
-        "name": "backfill_remote",
-        "description": "Push all local entries to the remote in one batch (upsert). No-op if remote unconfigured.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"project_dir": {"type": "string"}},
+            "properties": {
+                "op": {"type": "string", "enum": ["pull", "backfill"],
+                       "description": "pull = remote→local merge; backfill = local→remote push."},
+                "project_dir": {"type": "string"},
+            },
+            "required": ["op"],
         },
     },
 ]
@@ -2942,6 +2748,24 @@ def handle_backfill_remote(params):
         return {"backfilled": 0, "error": str(e)}
 
 
+def handle_mirror(params):
+    """MCP tool: mirror(op='pull'|'backfill'). Routes to the pull/backfill impls,
+    so behavior is identical to the retired pull_remote / backfill_remote tools."""
+    op = params.get("op")
+    inner = {k: v for k, v in params.items() if k != "op"}
+    if op == "pull":
+        return handle_pull_remote(inner)
+    if op == "backfill":
+        return handle_backfill_remote(inner)
+    return {
+        "error": "mirror requires op to be 'pull' or 'backfill'.",
+        "validation_errors": [{
+            "field": "op",
+            "guidance": "Set op to 'pull' or 'backfill'.",
+        }],
+    }
+
+
 HANDLERS = {
     "record_entry": handle_record_entry,
     "record_decision": handle_record_decision,
@@ -2959,6 +2783,9 @@ HANDLERS = {
     "reload_constraints": handle_reload_constraints,
     "export_snapshot": handle_export_snapshot,
     "import_snapshot": handle_import_snapshot,
+    "mirror": handle_mirror,
+    # Hidden back-compat: retired from tools/list (folded into `mirror`) but
+    # still dispatchable by name so existing CLI/scripted callers don't break.
     "pull_remote": handle_pull_remote,
     "backfill_remote": handle_backfill_remote,
 }

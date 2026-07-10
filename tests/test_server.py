@@ -2557,11 +2557,18 @@ class TestToolSchemaBudget:
         get_project_summary's description became the one-call orientation blurb.
         Budget raised to 4150. ~4280 after adding export_snapshot /
         import_snapshot (team-shared snapshot) — two small schemas; budget
-        raised to 4350."""
+        raised to 4350. ~2927 after buying budget back: the three deprecated
+        record_* aliases (record_decision/pipeline/constraint) were retired from
+        tools/list — their handlers stay in HANDLERS as hidden back-compat, so
+        the schema tax is gone but existing callers still work; pull_remote /
+        backfill_remote were folded into one `mirror(op=...)` tool; and the
+        heaviest descriptions were trimmed. Budget tightened to 3150 to LOCK IN
+        the reclaimed headroom — a new tool or wordier field must consciously
+        raise it again rather than silently re-spending what was bought back."""
         from server import TOOLS, estimate_tokens
         total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 4350, (
-            f"tools/list payload is ~{total} tokens (budget: 4350). "
+        assert total <= 3150, (
+            f"tools/list payload is ~{total} tokens (budget: 3150). "
             "Trim schema descriptions or consciously raise the budget."
         )
 
