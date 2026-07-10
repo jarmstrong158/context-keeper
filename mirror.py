@@ -537,11 +537,15 @@ def _row_to_entry(row):
     entry["status"] = row.get("status", entry.get("status", "active"))
     if row.get("superseded_by") is not None:
         entry["superseded_by"] = row["superseded_by"]
-    # payload normally already carries these; backfill from columns just in case.
+    # The columns are authoritative for status/timestamps and OVERRIDE any copy
+    # embedded in the payload blob. A remote-side update_entry/deprecate_entry
+    # bumps the updated_at COLUMN but leaves the payload's stale copy behind; if
+    # we let that stale copy win, the pulled entry would look older than it is
+    # and the newest-wins merge would wrongly skip it.
     if row.get("created_at"):
-        entry.setdefault("created_at", row["created_at"])
+        entry["created_at"] = row["created_at"]
     if row.get("updated_at"):
-        entry.setdefault("updated_at", row["updated_at"])
+        entry["updated_at"] = row["updated_at"]
     return entry
 
 
@@ -591,7 +595,7 @@ def _merge_rows(base_dir, rows):
                 changed = True
                 continue
             local = existing[index[rid]]
-            remote_ts = _entry_ts(entry)
+            remote_ts = _row_timestamp(row)  # authoritative column, not payload
             local_ts = _entry_ts(local)
             if remote_ts and remote_ts > local_ts:
                 if _differs_in_substance(local, entry):

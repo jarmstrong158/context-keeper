@@ -407,6 +407,36 @@ class TestPullRoundTrip:
         assert any(c["id"] == d["id"] and c["direction"] == "mirror_in"
                    and c["loser"]["summary"] == "stale local" for c in conflicts)
 
+    def test_pull_trusts_column_ts_over_stale_payload_ts(self, tmp_path, remote):
+        # A remote-side update_entry/deprecate_entry bumps the updated_at COLUMN
+        # but leaves the payload's own updated_at copy stale. Pull must compare
+        # on the column, not the payload, or a genuinely newer remote edit looks
+        # older than local and is wrongly skipped. (Regression: caught in E2E.)
+        src = _project(tmp_path / "src", "colts")
+        d = handle_record_decision({
+            "project_dir": src, "summary": "version one entry",
+            "problem": _LONG, "why_chosen": _LONG})
+        key = ("colts", d["id"])
+        # Column is newer (a fresh remote edit); payload copy is stale-old.
+        remote.rows[key]["payload"]["summary"] = "v2 from remote"
+        remote.rows[key]["payload"]["updated_at"] = "2000-01-01T00:00:00+00:00"
+        remote.rows[key]["updated_at"] = "2999-01-01T00:00:00+00:00"
+
+        dst = _project(tmp_path / "dst", "colts")
+        local_entry = dict(d["entry"])
+        local_entry["summary"] = "local middle"
+        local_entry["updated_at"] = "2500-01-01T00:00:00+00:00"  # between the two
+        (tmp_path / "dst" / ".context" / "decisions.json").write_text(
+            json.dumps([local_entry]), encoding="utf-8")
+
+        res = handle_pull_remote({"project_dir": dst})
+        assert res["updated"] == 1
+        disk = read_json_file(str(tmp_path / "dst" / ".context" / "decisions.json"))[0]
+        assert disk["summary"] == "v2 from remote"
+        # The stored copy takes the authoritative column timestamp, not the
+        # stale payload one, so a later push-back compares correctly.
+        assert disk["updated_at"] == "2999-01-01T00:00:00+00:00"
+
     def test_second_pull_is_noop_via_watermark(self, tmp_path, remote):
         src = _project(tmp_path / "src", "wm")
         _record_all(src)
