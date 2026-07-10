@@ -10,6 +10,15 @@ import os
 import sys
 from datetime import datetime, timezone
 
+# Two-way mirror (local <-> remote). Optional and fail-soft: with no
+# CONTEXT_KEEPER_REMOTE_URL set, every mirror call is a no-op. Imported at
+# top level; mirror.py imports server lazily (inside functions) so there is
+# no import-time circular dependency.
+try:
+    import mirror as _mirror
+except Exception:  # never let a mirror import problem break the server
+    _mirror = None
+
 CONTEXT_DIR_NAME = ".context"
 
 
@@ -98,10 +107,7 @@ USAGE_GUIDANCE = (
 TOOLS = [
     {
         "name": "record_decision",
-        "description": (
-            "Record an architectural or design decision with structured rationale. "
-            "Min lengths enforced server-side; thin entries are rejected with guidance."
-        ),
+        "description": "Record an architectural/design decision with structured rationale. Min lengths enforced; thin entries rejected.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -112,18 +118,15 @@ TOOLS = [
                 },
                 "why_chosen": {
                     "type": "string",
-                    "description": (
-                        "The actual reasoning: evidence, principle, or constraint behind the "
-                        "choice. 2-4 sentences, min 60 chars."
-                    ),
+                    "description": "The reasoning behind the choice: evidence, principle, or constraint. Min 60 chars.",
                 },
                 "what_we_tried": {
                     "type": "string",
-                    "description": "Prior attempts and dead ends — the 'tried X before Y' arc. Encouraged.",
+                    "description": "Prior attempts and dead ends (the 'tried X before Y' arc).",
                 },
                 "tradeoffs": {
                     "type": "string",
-                    "description": "What was given up by choosing this. Encouraged.",
+                    "description": "What was given up by choosing this.",
                 },
                 "alternatives": {
                     "type": "array",
@@ -144,18 +147,12 @@ TOOLS = [
                 "related_to": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "IDs of related entries (e.g. ['dec-005', 'con-006']); "
-                        "get_context traverses these links."
-                    ),
+                    "description": "IDs of related entries; get_context traverses these links.",
                 },
                 "supersedes": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "IDs of prior decisions this replaces — marked 'superseded': demoted "
-                        "but still recallable, not deleted like deprecate_entry."
-                    ),
+                    "description": "IDs of prior decisions this replaces (marked 'superseded': demoted but still recallable).",
                 },
                 "tags": {
                     "type": "array",
@@ -165,26 +162,20 @@ TOOLS = [
                 "retrieval_hints": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": (
-                        "2-4 alternate phrasings a future session might search for (synonyms, "
-                        "symptoms, error messages). Indexed for retrieval."
-                    ),
+                    "description": "2-4 alternate search phrasings (synonyms, symptoms, errors). Indexed for retrieval.",
                 },
                 "origin": {
                     "type": "string",
                     "enum": ["user", "agent", "import"],
-                    "description": (
-                        "'user' = explicitly stated by the user; 'agent' = inferred (default); "
-                        "'import' = backfilled. User-origin ranks higher."
-                    ),
+                    "description": "Who authored this: user (stated), agent (inferred, default), or import. User-origin ranks higher.",
                 },
                 "rationale": {
                     "type": "string",
-                    "description": "DEPRECATED: auto-maps to why_chosen if that field is absent.",
+                    "description": "DEPRECATED: maps to why_chosen if absent.",
                 },
                 "project_dir": {
                     "type": "string",
-                    "description": "Absolute path to the target project. Creates .context/ if needed.",
+                    "description": "Target project path; creates .context/ if needed.",
                 },
             },
             "required": ["summary", "problem", "why_chosen"],
@@ -192,14 +183,14 @@ TOOLS = [
     },
     {
         "name": "record_pipeline",
-        "description": "Record a multi-step workflow that must be followed in order.",
+        "description": "Record a multi-step workflow followed in order.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Pipeline name"},
                 "purpose": {
                     "type": "string",
-                    "description": "Why this pipeline exists — what ad-hoc steps couldn't do. Min 40 chars.",
+                    "description": "Why this pipeline exists, vs ad-hoc steps. Min 40 chars.",
                 },
                 "when_to_invoke": {
                     "type": "string",
@@ -232,7 +223,7 @@ TOOLS = [
                 "retrieval_hints": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "2-4 alternate phrasings a future session might search for. Indexed for retrieval.",
+                    "description": "2-4 alternate search phrasings. Indexed for retrieval.",
                 },
                 "origin": {
                     "type": "string",
@@ -241,7 +232,7 @@ TOOLS = [
                 },
                 "project_dir": {
                     "type": "string",
-                    "description": "Absolute path to the target project. Creates .context/ if needed.",
+                    "description": "Target project path; creates .context/ if needed.",
                 },
             },
             "required": ["name", "purpose", "steps"],
@@ -264,10 +255,7 @@ TOOLS = [
                 },
                 "scope": {
                     "type": "string",
-                    "description": (
-                        "'global', or a file/module path — scoped constraints are re-injected "
-                        "when a covered file is edited (scope_guard hook)."
-                    ),
+                    "description": "'global' or a file/module path; scoped constraints re-inject on edit (scope_guard hook).",
                     "default": "global",
                 },
                 "hardness": {
@@ -285,7 +273,7 @@ TOOLS = [
                 "retrieval_hints": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "2-4 alternate phrasings a future session might search for. Indexed for retrieval.",
+                    "description": "2-4 alternate search phrasings. Indexed for retrieval.",
                 },
                 "origin": {
                     "type": "string",
@@ -294,7 +282,7 @@ TOOLS = [
                 },
                 "project_dir": {
                     "type": "string",
-                    "description": "Absolute path to the target project. Creates .context/ if needed.",
+                    "description": "Target project path; creates .context/ if needed.",
                 },
             },
             "required": ["rule", "reason"],
@@ -302,10 +290,7 @@ TOOLS = [
     },
     {
         "name": "get_context",
-        "description": (
-            "Retrieve relevant project context ranked by relevance within a token budget. "
-            "Pass an id to fetch a single entry at full fidelity."
-        ),
+        "description": "Retrieve relevant context ranked within a token budget. Pass an id to fetch one entry at full fidelity.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -328,11 +313,11 @@ TOOLS = [
                 },
                 "since": {
                     "type": "string",
-                    "description": "Only entries verified/created on or after this ISO date.",
+                    "description": "Entries verified/created on or after this ISO date.",
                 },
                 "before": {
                     "type": "string",
-                    "description": "Only entries verified/created strictly before this ISO date.",
+                    "description": "Entries verified/created strictly before this ISO date.",
                 },
                 "include_related": {
                     "type": "boolean",
@@ -481,6 +466,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "pull_remote",
+        "description": "Merge remote-recorded entries into the local store (additive). No-op if remote unconfigured.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"project_dir": {"type": "string"}},
+        },
+    },
+    {
+        "name": "backfill_remote",
+        "description": "Push all local entries to the remote in one batch (upsert). No-op if remote unconfigured.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"project_dir": {"type": "string"}},
+        },
+    },
 ]
 
 # ============================================================
@@ -571,17 +572,73 @@ def read_config(base_dir=None):
         return dict(DEFAULT_CONFIG)
 
 
+def _id_namespace():
+    """The origin namespace this store mints IDs in (default: "" = canonical).
+
+    ID-collision safety (chosen approach = Option A, "namespace by origin",
+    applied ASYMMETRICALLY so it stays backward compatible):
+
+      Two stores writing sequential IDs independently WILL collide
+      (local mints dec-063, remote mints dec-063, different entries). The
+      fix is to give each independent writer its own disjoint namespace.
+
+      The LOCAL canonical store keeps the *bare* namespace it has always
+      used -- dec-001, con-001, pipe-001 -- so every existing id
+      (dec-001..dec-062, con-001..con-018) stays valid and readable, and
+      the existing test-suite expectations (dec-001, dec-002, ...) hold.
+
+      Any SECONDARY store (the remote Worker, a phone) sets
+      CONTEXT_KEEPER_ID_NAMESPACE to a short tag -- "r" for remote -- and
+      mints dec-r001, con-r001, ... Because "" and "r" are disjoint and
+      each side only counts IDs in its OWN namespace when computing the
+      next number, the two sequences can never collide. next_id below is
+      namespace-aware; foreign-namespace IDs pulled in from the remote are
+      simply skipped when numbering (they never inflate the local counter).
+
+    Rejected alternatives:
+      - Random suffix (dec-001-a7f3): breaks the human-readable, sortable,
+        stable ids that DECISIONS.md and every existing reference rely on,
+        and would have to rewrite 80 live ids to be consistent.
+      - Timestamp ids (dec-20260710T1055): same readability/stability loss,
+        and collisions are still possible within a second on one store.
+    """
+    return (os.environ.get("CONTEXT_KEEPER_ID_NAMESPACE") or "").strip()
+
+
+def _split_id(eid, prefix):
+    """Split an id 'dec-r012' into (namespace, number) -> ('r', 12).
+
+    Returns (None, None) if the id doesn't belong to `prefix` or has no
+    trailing number. The namespace is the non-digit run between the prefix
+    dash and the number, so bare 'dec-012' -> ('', 12).
+    """
+    if not eid.startswith(prefix + "-"):
+        return None, None
+    rest = eid[len(prefix) + 1:]
+    i = 0
+    while i < len(rest) and not rest[i].isdigit():
+        i += 1
+    ns, num_part = rest[:i], rest[i:]
+    if not num_part:
+        return None, None
+    try:
+        return ns, int(num_part)
+    except ValueError:
+        return None, None
+
+
 def next_id(entries, prefix):
+    ns = _id_namespace()
     max_num = 0
     for e in entries:
-        eid = e.get("id", "")
-        if eid.startswith(prefix + "-"):
-            try:
-                num = int(eid.split("-", 1)[1])
-                max_num = max(max_num, num)
-            except ValueError:
-                pass
-    return f"{prefix}-{max_num + 1:03d}"
+        entry_ns, num = _split_id(e.get("id", ""), prefix)
+        # Only count IDs minted in OUR namespace. A canonical store ("")
+        # ignores pulled-in remote ids (dec-r005); a remote store ("r")
+        # ignores the local dec-005 series. Disjoint -> collision-free.
+        if entry_ns != ns or num is None:
+            continue
+        max_num = max(max_num, num)
+    return f"{prefix}-{ns}{max_num + 1:03d}"
 
 
 def now_iso():
@@ -1154,6 +1211,21 @@ def _maybe_export_markdown(base_dir):
 # ============================================================
 
 
+def _mirror_out(entry, type_name, base_dir):
+    """Dual-write hook: push a just-written entry to the remote, fail-soft.
+
+    Wrapped so a mirror problem (module missing, remote down, bug) can
+    never affect the local write that already committed. All queueing and
+    logging happens inside mirror.mirror_out.
+    """
+    if _mirror is None:
+        return
+    try:
+        _mirror.mirror_out(entry, type_name, base_dir)
+    except Exception:
+        pass
+
+
 def handle_record_decision(params):
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
@@ -1228,6 +1300,14 @@ def handle_record_decision(params):
 
     write_json_file(dec_path, entries)
     _maybe_export_markdown(base_dir)
+    _mirror_out(entry, "decisions", base_dir)
+    # Superseded siblings changed status in the same write -- mirror them too
+    # so the remote reflects the demotion, not just the new decision.
+    if superseded:
+        by_id = {e.get("id"): e for e in entries}
+        for sid in superseded:
+            if by_id.get(sid):
+                _mirror_out(by_id[sid], "decisions", base_dir)
     result = {"success": True, "id": entry["id"], "entry": entry}
     if superseded:
         result["superseded"] = superseded
@@ -1273,6 +1353,7 @@ def handle_record_pipeline(params):
     }
     entries.append(entry)
     write_json_file(pipe_path, entries)
+    _mirror_out(entry, "pipelines", base_dir)
     return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
 
@@ -1311,6 +1392,7 @@ def handle_record_constraint(params):
     }
     entries.append(entry)
     write_json_file(con_path, entries)
+    _mirror_out(entry, "constraints", base_dir)
     return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
 
@@ -1682,6 +1764,7 @@ def handle_update_entry(params):
     write_json_file(file_path, entries)
     if type_name == "decisions":
         _maybe_export_markdown(base_dir)
+    _mirror_out(entry, type_name, base_dir)
 
     return {"success": True, "entry": entry}
 
@@ -1711,6 +1794,7 @@ def handle_deprecate_entry(params):
     write_json_file(file_path, entries)
     if type_name == "decisions":
         _maybe_export_markdown(base_dir)
+    _mirror_out(entry, type_name, base_dir)
 
     return {"success": True, "id": entry_id, "status": "deprecated"}
 
@@ -1925,6 +2009,51 @@ def handle_export_markdown(params):
     }
 
 
+def _mirror_base_dir(params):
+    """Resolve the .context/ dir for a mirror tool, honoring project_dir but
+    never creating anything (mirror ops are read/side-channel only)."""
+    base_dir = _base_dir_from_params(params)
+    return base_dir
+
+
+def handle_pull_remote(params):
+    """MCP tool: merge remote-recorded entries into the local store."""
+    if _mirror is None:
+        return {"pulled": 0, "reason": "mirror module unavailable"}
+    base_dir = _mirror_base_dir(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    if not _mirror.mirror_enabled():
+        return {
+            "pulled": 0,
+            "reason": "disabled",
+            "note": "Set CONTEXT_KEEPER_REMOTE_URL (and optionally CONTEXT_KEEPER_REMOTE_TOKEN) to enable mirroring.",
+        }
+    try:
+        return _mirror.pull_remote(base_dir)
+    except Exception as e:
+        return {"pulled": 0, "error": str(e)}
+
+
+def handle_backfill_remote(params):
+    """MCP tool: push all local entries for the project to the remote."""
+    if _mirror is None:
+        return {"backfilled": 0, "reason": "mirror module unavailable"}
+    base_dir = _mirror_base_dir(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    if not _mirror.mirror_enabled():
+        return {
+            "backfilled": 0,
+            "reason": "disabled",
+            "note": "Set CONTEXT_KEEPER_REMOTE_URL (and optionally CONTEXT_KEEPER_REMOTE_TOKEN) to enable mirroring.",
+        }
+    try:
+        return _mirror.backfill_remote(base_dir)
+    except Exception as e:
+        return {"backfilled": 0, "error": str(e)}
+
+
 HANDLERS = {
     "record_decision": handle_record_decision,
     "record_pipeline": handle_record_pipeline,
@@ -1937,6 +2066,8 @@ HANDLERS = {
     "prune_stale": handle_prune_stale,
     "get_compaction_report": handle_get_compaction_report,
     "verify_quality": handle_verify_quality,
+    "pull_remote": handle_pull_remote,
+    "backfill_remote": handle_backfill_remote,
 }
 
 # ============================================================

@@ -75,6 +75,17 @@ def main():
         # Never break session start because memory could not load.
         return
 
+    # Mirror IN before summarizing: pull any entries recorded on the remote
+    # (e.g. a phone) into the local store so the project summary below
+    # reflects them at turn one. No-op unless CONTEXT_KEEPER_REMOTE_URL is
+    # set; fail-soft so a remote outage never delays or breaks session start.
+    try:
+        import mirror
+        if mirror.mirror_enabled():
+            mirror.pull_remote(server.CONTEXT_DIR)
+    except Exception:
+        pass
+
     # Generate the compaction report NOW if a fresh snapshot is pending.
     # SessionStart(source=compact) fires immediately after compaction --
     # before any Stop hook -- so without this the report we inject below

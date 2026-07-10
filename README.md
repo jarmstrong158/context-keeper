@@ -28,6 +28,28 @@ Context Keeper gives Claude 11 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
 
+## v0.11: Two-Way Mirror (local <-> remote)
+
+Optional, fail-soft mirroring so a second device — e.g. a phone recording decisions on the go — can both **receive** the desktop's memory and **contribute** its own. The local `.context/` JSON store stays **canonical**; the remote (a Cloudflare Worker in the reference deployment) is a sync surface, never the source of truth.
+
+- **Mirror out (local -> remote).** After every `record_*`, `update_entry`, and `deprecate_entry`, the entry is POSTed to the remote. If the remote is unreachable the entry is queued to `.context/.mirror_queue.json` and flushed on the next successful push. A push failure **never** blocks or fails the local write.
+- **Mirror in (remote -> local).** `pull_remote` fetches entries newer than a local watermark (`.context/.mirror_watermark`) and merges them **additively** — a remote entry whose id already exists locally never overwrites the local copy. Wired into the SessionStart hook (so desktop sessions start with phone-recorded entries present) and exposed as the `pull_remote` MCP tool.
+- **`backfill_remote`** pushes the entire local store to the remote in one batch (upsert) — for seeding a fresh remote.
+- **Collision-safe IDs.** Two stores minting sequential ids independently would collide (`dec-063` on both). Fix: **namespace by origin.** The local canonical store keeps its bare sequence (`dec-001`…, every existing id stays valid). A secondary store sets `CONTEXT_KEEPER_ID_NAMESPACE=r` and mints `dec-r001`… — disjoint namespaces, each counting only its own, so sequential minting can never collide.
+- **Zero new dependencies** (stdlib `urllib` only), **no secrets in code** (remote URL/token from env vars only).
+
+Enable by setting env vars where the MCP server runs:
+
+```bash
+CONTEXT_KEEPER_REMOTE_URL=https://your-worker.example.workers.dev
+CONTEXT_KEEPER_REMOTE_TOKEN=…        # optional bearer token
+# CONTEXT_KEEPER_REMOTE_TIMEOUT=5    # optional per-request seconds
+```
+
+With no `CONTEXT_KEEPER_REMOTE_URL` set, every mirror path is a silent no-op — behavior is identical to pre-v0.11.
+
+**Remote API contract** (what the Worker implements): `POST /import` upserts `{"project", "records":[{"type","entry"}]}` by entry id; `GET /entries?project=&since=<iso>` returns `{"records":[…]}` newer than `since`, scoped to the project. `type` travels in the wire wrapper only — stored entries keep their exact on-disk shape.
+
 ## v0.10: Abstention + Supersession-as-Ranking
 
 Two ideas adapted from studying [Curion](https://github.com/geanatz/curion), kept dependency-free:
