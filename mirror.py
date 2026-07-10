@@ -258,6 +258,7 @@ def _rpc_call(cfg, tool_name, arguments):
     req = urllib.request.Request(cfg["url"], data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json, text/event-stream")
+    req.add_header("User-Agent", "context-keeper-mirror/0.15")
     with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
         raw = resp.read().decode("utf-8")
         ctype = resp.headers.get("content-type", "")
