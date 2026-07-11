@@ -521,13 +521,16 @@ your-project/
     pipelines.json           # Multi-step workflows
     constraints.json         # Rules and invariants
     config.json              # Token budget, stale threshold
+    embeddings.json          # Semantic-retrieval vector cache, keyed by entry text (auto-generated, only when semantic enabled)
     compaction_snapshot.json  # Pre-compaction snapshot (auto-generated)
     compaction_report.json   # Post-compaction diff report (auto-generated)
     reinject_state.json      # Per-session tool counter for constraint re-injection (auto-generated)
+    scope_guard_state.json   # Per-session record of already-injected scoped constraints (auto-generated)
     .mirror_queue.json       # Queued mirror-out writes pending a reachable remote (auto-generated)
     .mirror_watermark        # Newest remote timestamp already pulled (auto-generated)
     .mirror_conflicts.json   # Substance-differing versions overwritten by newest-wins (auto-generated)
     hook.log                 # Hook activity log
+    mirror.log               # Mirror (local<->remote) activity log (auto-generated)
 ```
 
 All files are human-readable JSON. You can edit them directly. IDs are sequential and readable: `dec-001`, `pipe-001`, `con-001`.
