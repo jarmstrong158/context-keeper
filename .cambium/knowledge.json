@@ -1,0 +1,186 @@
+{
+  "items": [
+    {
+      "id": "k-b9f5726f",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Context-keeper is the primary cross-session project memory system. Auto-memory does not organically capture project decisions or constraints.",
+      "why": "",
+      "tags": [
+        "context-keeper",
+        "architecture",
+        "memory",
+        "meta",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-001"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:00:57.619655+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-b84aa330",
+      "type": "memory",
+      "kind": "decision",
+      "content": "PreCompact hook prints capture prompt reminding Claude to record decisions/constraints before compaction.",
+      "why": "",
+      "tags": [
+        "context-keeper",
+        "hooks",
+        "capture",
+        "compaction",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-002"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:00:57.619655+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-e819fe88",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Capture is now anchored to git commits: hooks/commit_capture_reminder.py (PostToolUse, matcher Bash) injects a record-it-now reminder whenever a Bash command contains \"git commit\". Fourth hook in the loop alongside SessionStart (retrieval), PreCompact (pre-compression safety net), Stop (integrity).",
+      "why": "A git commit is the single best capture trigger: it is the exact moment a decision/constraint/gotcha became real enough to persist in version control, so prompting at commit time anchors capture to the natural unit of finished work instead of leaving it to agent discretion mid-task. PostToolUse additionalContext injects the reminder directly into the agent's context \u00e2\u20ac\u201d the same unskippable-injection principle that fixed retrieval in the SessionStart hook redesign.",
+      "tags": [
+        "hooks",
+        "capture-loop",
+        "post-tool-use",
+        "git-commit",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-003"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:00:57.619655+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-7e45c0cd",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.7: retrieval_hints (anticipated queries), origin field with trust-weighted scoring (user 10 / agent 5 / import 2), and since/before temporal filters on get_context.",
+      "why": "All three are zero-dependency and free at runtime. retrieval_hints puts predicted search phrasings in the lexical index at capture time - the recording agent knows what the entry is about and can predict how a future session will ask; adding hints to the two crowded-out entries recovered both to rank 1 (hit@5 back to 80, MRR 0.567 to 0.700 held-out). Origin trust is a 0-10 score term so user-stated rules outrank inferred ones without reordering legacy entries (uniform agent default). since/before reuses the recency timestamp parse.",
+      "tags": [
+        "retrieval",
+        "scoring",
+        "evals",
+        "capture",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-007"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:00:57.619655+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-013d34e0",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.10: get_context returns no_confident_match when the top entry's tag/text relevance is below min_relevance (default 0.20), instead of always handing back its top-scored entry as if it were an answer. Annotates, never suppresses.",
+      "why": "Measured before building (evals/abstention.py), exactly the discipline dec-009 established. The signal keys on _relevance_signal (tag/text overlap only, stopword-filtered), not the inflated composite, because only the overlap reflects 'does this answer the query'. Chose annotate-not-suppress (unlike Curion's hard no_memory) so the vocabulary-mismatch recall that retrieval_hints and the semantic blend work to preserve survives - a weak match is returned but flagged. Floor 0.20 is the highest with zero false-abstention on the eval set (no positive query scores below it); TNR 38%.",
+      "tags": [
+        "retrieval",
+        "abstention",
+        "quality",
+        "evals",
+        "curion",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-010"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-07-10T18:00:57.619655+00:00",
+      "updated_at": "2026-07-10T18:00:57.619655+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    }
+  ],
+  "imported": {
+    "context_keeper": [
+      "dec-001",
+      "dec-002",
+      "dec-003",
+      "dec-004",
+      "dec-005",
+      "dec-006",
+      "dec-007",
+      "dec-008",
+      "dec-009",
+      "dec-010",
+      "dec-011",
+      "dec-012",
+      "dec-013-4eb5",
+      "dec-014",
+      "con-001",
+      "con-002",
+      "con-003",
+      "con-004",
+      "con-005",
+      "con-006",
+      "con-007"
+    ],
+    "agentsync": []
+  }
+}
