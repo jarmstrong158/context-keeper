@@ -12,23 +12,24 @@ As conversations get long, Claude loses the "why" behind earlier decisions. New 
 
 ## The Solution
 
-Context Keeper gives Claude 13 tools to record and retrieve structured project context:
+Context Keeper gives Claude 14 tools to record and retrieve structured project context:
 
 | Tool | Purpose |
 |------|---------|
-| `record_decision` | Save a decision with structured rationale (problem, why_chosen, what_we_tried, tradeoffs) |
-| `record_pipeline` | Save a multi-step workflow with ordering and `purpose` |
-| `record_constraint` | Save a rule with scope, enforcement level, and `triggering_incident` |
+| `record_entry` | Unified write tool — record a decision, pipeline, or constraint via `kind`, with per-kind fields validated server-side. Consolidates the former `record_decision`/`record_pipeline`/`record_constraint` (still dispatchable by those names for back-compat) |
 | `get_context` | Retrieve relevant entries by query, tags, scope, or ID — relevance-ranked, pulls `related_to` links by default |
 | `query_entries` | **Exact structured-field filtering** (status, origin, tags, scope, hardness, supersession, dates) — deterministic, no ranking; distinct from `get_context`'s relevance search |
 | `get_project_summary` | Compact overview for conversation start |
 | `update_entry` | Update any entry by ID |
-| `deprecate_entry` | Retire an entry with reason |
+| `deprecate_entry` | Retire an entry with reason (optional `merge_into` folds a duplicate into a survivor) |
 | `prune_stale` | Find entries not verified recently |
 | `get_compaction_report` | Check if last compaction lost any context |
 | `verify_quality` | Scan entries for thin rationale, missing tags, isolated arcs (auto-called by PreCompact hook) |
 | `export_markdown` | Regenerate `DECISIONS.md` from the decisions store — a derived, read-only projection |
 | `reload_constraints` | Re-surface the constraints-only block on demand mid-session (rules refresh, not the full store) |
+| `export_snapshot` | Write the whole store to a committable `.context-keeper/memory.json.gz` for sharing project memory via git |
+| `import_snapshot` | Import that committed snapshot into the working store — non-destructive, auto-runs on first use when the store is empty |
+| `mirror` | Sync with the optional remote store: `op="pull"` merges remote→local (newest wins), `op="backfill"` pushes local→remote. No-op if the remote is unconfigured |
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
 
@@ -38,7 +39,7 @@ Context Keeper is a small, offline-first memory layer; several of its capabiliti
 
 | Capability | How Context Keeper does it |
 |------------|----------------------------|
-| **Procedural memory** | `record_pipeline` stores ordered, dependency-aware workflows (build/deploy/data flows) with `purpose` + `when_to_invoke` — reusable "how we do X", not just facts. |
+| **Procedural memory** | `record_entry(kind="pipeline")` stores ordered, dependency-aware workflows (build/deploy/data flows) with `purpose` + `when_to_invoke` — reusable "how we do X", not just facts. |
 | **Deduplication** | Every `record_*` runs a word-set Jaccard pass against the store and returns `similar_entries` when a new entry restates an existing one, so duplicates are caught at capture; `deprecate_entry(merge_into=...)` then folds the duplicate's unique content into the survivor and retires it in one non-destructive step. |
 | **Contradiction detection** | Those same overlaps are classified `likely_restatement` vs `likely_contradiction` (negation/antonym polarity), and a reversal raises a `contradiction_note` telling the agent to resolve the conflict rather than leave two live rules disagreeing. |
 | **Quality refinement** | `verify_quality` scans for thin rationale, missing tags, legacy-schema entries, and isolated (unlinked) arcs; the PreCompact hook runs it automatically so entries get enriched before context is compressed. |
@@ -68,9 +69,9 @@ Optional, fail-soft mirroring so a second device — e.g. a phone recording deci
 Conflict resolution is **last-writer-wins by `updated_at` timestamp**, applied identically in both directions, so an edit made on either device converges everywhere. Neither side ever deletes — a deprecation is a status change that propagates like any other edit.
 
 - **Mirror out (local -> remote).** After every write (`record_entry`/`record_*`, `update_entry`, `deprecate_entry`) the entry is pushed via the remote's `upsert_entries` MCP tool (one call per kind). `upsert_entries` preserves the incoming id and **replaces** an existing remote copy only when the pushed entry's `updated_at` is newer — so an edit or deprecation actually overwrites the stale remote copy instead of being skipped. If the remote is unreachable the entry is queued to `.context/.mirror_queue.json` (deduped to its latest state) and flushed on the next successful push. A push failure **never** blocks or fails the local write.
-- **Mirror in (remote -> local).** `pull_remote` calls the remote's `query_entries`, keeps rows newer than a local watermark (`.context/.mirror_watermark`), and merges them **by timestamp** — a remote entry whose id exists locally overwrites the local copy only when the remote's `updated_at` is newer; a newer local copy is kept and pushes back on its next write. Wired into the SessionStart hook (so desktop sessions start with phone-recorded entries present) and exposed as the `pull_remote` MCP tool.
+- **Mirror in (remote -> local).** `pull_remote` calls the remote's `query_entries`, keeps rows newer than a local watermark (`.context/.mirror_watermark`), and merges them **by timestamp** — a remote entry whose id exists locally overwrites the local copy only when the remote's `updated_at` is newer; a newer local copy is kept and pushes back on its next write. Wired into the SessionStart hook (so desktop sessions start with phone-recorded entries present) and exposed through the `mirror` MCP tool as `op="pull"`.
 - **Conflicts are preserved, not lost.** When either direction overwrites a copy that differed in substance (not just timestamps), the losing version is appended to `.context/.mirror_conflicts.json`. Last-writer-wins has already resolved which copy is live; this is the audit trail of what it replaced. No resolution UI — the record is there if you need to reconcile by hand.
-- **`backfill_remote`** pushes the entire local store to the remote (one `upsert_entries` call per kind) — for seeding a fresh remote. Idempotent: an equal-or-older re-push is skipped server-side.
+- **Backfill** (`mirror` with `op="backfill"`) pushes the entire local store to the remote (one `upsert_entries` call per kind) — for seeding a fresh remote. Idempotent: an equal-or-older re-push is skipped server-side.
 - **Collision-safe IDs (Option B: random suffix).** Two stores minting sequential ids independently would collide — the desktop and the Worker both hand out `dec-013` for *different* decisions, and an upsert keyed by `(project, id)` would then let one silently overwrite the other. Fix: when mirroring is enabled, new ids get a short random hex suffix — `dec-013-a7f3`. The number still leads (sortable, greppable); **old ids are never rewritten**; and with mirroring *off* ids stay bare `dec-013` (single writer, no collision possible).
 - **Zero new dependencies** (stdlib `urllib` only), **no secrets in code**: the remote URL contains the auth token as its final path segment (`/mcp/<token>`) and comes from an env var only.
 
@@ -83,7 +84,7 @@ CONTEXT_KEEPER_REMOTE_URL=https://context-keeper-remote.<acct>.workers.dev/mcp/<
 
 With no `CONTEXT_KEEPER_REMOTE_URL` set, every mirror path is a silent no-op — behavior is identical to pre-v0.15.
 
-**Transport:** stateless JSON-RPC over Streamable HTTP. Each write is one `POST` to the `/mcp/<token>` URL (`tools/call` → `upsert_entries`); `pull_remote` calls `query_entries`. No initialize/session handshake (the server is stateless); the response is a single `application/json` body.
+**Transport:** stateless JSON-RPC over Streamable HTTP. Each write is one `POST` to the `/mcp/<token>` URL (`tools/call` → `upsert_entries`); the pull op (`mirror` with `op="pull"`) calls the remote's `query_entries`. No initialize/session handshake (the server is stateless); the response is a single `application/json` body.
 
 ## v0.14: Dedup Merge (`deprecate_entry(merge_into=...)`)
 
@@ -386,20 +387,20 @@ Steps 2 and 3 only resolve to directories that **already** contain `.context/`. 
 When you make a design decision:
 ```
 You: Let's use JSON files instead of SQLite for storage.
-Claude: [calls record_decision with summary, problem, why_chosen, alternatives,
-         and optionally what_we_tried + tradeoffs + related_to links]
+Claude: [calls record_entry(kind="decision") with summary, problem, why_chosen,
+         alternatives, and optionally what_we_tried + tradeoffs + related_to links]
 ```
 
 When you establish a workflow:
 ```
 You: The deploy pipeline is: run tests, build, push to registry, deploy.
-Claude: [calls record_pipeline with ordered steps]
+Claude: [calls record_entry(kind="pipeline") with ordered steps]
 ```
 
 When you set a rule:
 ```
 You: Never run Conductor from source. Always use the exe.
-Claude: [calls record_constraint with rule, reason, and hardness=absolute]
+Claude: [calls record_entry(kind="constraint") with rule, reason, and hardness=absolute]
 ```
 
 ### Retrieving Context
