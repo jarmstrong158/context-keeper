@@ -2816,7 +2816,7 @@ def _serve_stdio():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.14.0"},
+                    "serverInfo": {"name": "context-keeper", "version": "0.15.0"},
                 },
             }
         elif method == "notifications/initialized":
