@@ -175,6 +175,16 @@ def query_cosines(query, entries, base_dir, sem_cfg):
             vecs[eid] = vec
             dirty = True
 
+    # Evict cache keys for ids no longer in the current entry set (deleted or
+    # deprecated entries were dropped before they reached us). Without this the
+    # cache only ever grows -- a churny store accumulates dead vectors forever.
+    current_ids = {e.get("id") for e in entries if e.get("id")}
+    stale_keys = [k for k in cache if k not in current_ids]
+    if stale_keys:
+        for k in stale_keys:
+            del cache[k]
+        dirty = True
+
     if dirty:
         _save(cache_path, cache)
     return {eid: _cosine(q_vec, vec) for eid, vec in vecs.items()}

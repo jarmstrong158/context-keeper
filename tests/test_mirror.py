@@ -437,6 +437,35 @@ class TestPullRoundTrip:
         # stale payload one, so a later push-back compares correctly.
         assert disk["updated_at"] == "2999-01-01T00:00:00+00:00"
 
+    def test_new_remote_entry_below_watermark_still_merges(self, tmp_path, remote):
+        # Skewed phone<->desktop clocks: after a first pull advances the global
+        # watermark to a recent timestamp, a genuinely NEW remote entry can
+        # arrive carrying a timestamp AT/BELOW that watermark (an older device
+        # clock, or an entry backfilled with an older created_at). The old
+        # pre-merge watermark filter excluded such a row before _merge_rows ran,
+        # dropping it permanently. Per-entry newest-wins merge must still take it.
+        src = _project(tmp_path / "src", "skew")
+        handle_record_decision({
+            "project_dir": src, "summary": "recent high-ts entry",
+            "problem": _LONG, "why_chosen": _LONG})
+        dst = _project(tmp_path / "dst", "skew")
+        # First pull brings the recent entry in and advances the watermark to it.
+        assert handle_pull_remote({"project_dir": dst})["pulled"] == 1
+
+        # A brand-new remote entry appears with a timestamp BELOW the watermark.
+        old_ts = "2000-01-01T00:00:00+00:00"
+        remote.rows[("skew", "dec-below-wm")] = {
+            "id": "dec-below-wm", "kind": "decision", "project": "skew",
+            "status": "active", "created_at": old_ts, "updated_at": old_ts,
+            "superseded_by": None,
+            "payload": {"summary": "backfilled below the watermark",
+                        "created_at": old_ts, "updated_at": old_ts},
+        }
+        res = handle_pull_remote({"project_dir": dst})
+        assert res["pulled"] == 1  # merged despite ts <= global watermark
+        disk = read_json_file(str(tmp_path / "dst" / ".context" / "decisions.json"))
+        assert any(e["id"] == "dec-below-wm" for e in disk)
+
     def test_second_pull_is_noop_via_watermark(self, tmp_path, remote):
         src = _project(tmp_path / "src", "wm")
         _record_all(src)
