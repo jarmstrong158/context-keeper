@@ -42,6 +42,15 @@ FILES = {
 } if CONTEXT_DIR else {}
 
 
+def _ascii(text):
+    """Coerce to ASCII so a summary containing arrows/checkmarks can't crash
+    the hook. Windows hook stdout is cp1252 and a non-ASCII char (e.g. an
+    em-dash or arrow in an entry summary the user wrote) raises
+    UnicodeEncodeError, which would kill the hook and lose its output. Same
+    guarantee session_start.py already applies to its own prints (con-001)."""
+    return str(text).encode("ascii", "replace").decode("ascii")
+
+
 def log(message):
     if CONTEXT_DIR is None:
         return
@@ -91,24 +100,24 @@ def main():
 
     # Transcript-visible status for the user (not injected into model
     # context — see module docstring).
-    print(
+    print(_ascii(
         "[Context Keeper] Compaction imminent -- snapshot of "
         f"{total} active entries saved for post-compaction integrity check."
-    )
+    ))
 
     if flagged:
-        print(
+        print(_ascii(
             f"\n[Context Keeper] QUALITY SCAN: {len(flagged)} entries look thin or "
             f"underspecified. Consider enriching them via update_entry so "
             f"future sessions recover the full why:"
-        )
+        ))
         for entry in flagged[:10]:  # cap output to keep hook noise bounded
             issues_str = "; ".join(i.get("type", "?") for i in entry.get("issues", []))
             summary = str(entry.get("summary", "?"))[:80]
-            print(f"  [{entry.get('id', '?')}] ({entry.get('type', '?')}) {summary}")
-            print(f"      issues: {issues_str}")
+            print(_ascii(f"  [{entry.get('id', '?')}] ({entry.get('type', '?')}) {summary}"))
+            print(_ascii(f"      issues: {issues_str}"))
         if len(flagged) > 10:
-            print(f"  ... and {len(flagged) - 10} more. Call verify_quality for the full list.")
+            print(_ascii(f"  ... and {len(flagged) - 10} more. Call verify_quality for the full list."))
 
 
 if __name__ == "__main__":

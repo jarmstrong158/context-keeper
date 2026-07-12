@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import sys
+import uuid
 from datetime import datetime, timezone
 
 # Two-way mirror (local <-> remote). Optional and fail-soft: with no
@@ -590,12 +591,25 @@ def write_json_file(path, data):
     JSON document that the next read would treat as an empty store.
     """
     ensure_context_dir(os.path.dirname(path))
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # Unique temp name per write. A shared "<path>.tmp" is atomic only within
+    # one process; the SessionStart hook's pull_remote -> _merge_rows runs in a
+    # DIFFERENT process from the live MCP server and both write the same store,
+    # so a shared suffix lets two concurrent writers clobber each other's temp
+    # file before os.replace. pid + uuid makes each writer's temp private.
+    tmp = path + f".{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # Don't leave a stray temp file behind on a failed write.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_config(base_dir=None):
@@ -2795,7 +2809,30 @@ HANDLERS = {
 # ============================================================
 
 
+def _force_utf8_stdio():
+    """Force UTF-8 on the MCP stdio transport.
+
+    On Windows the interpreter opens stdin/stdout in the ANSI code page
+    (cp1252), so UTF-8 bytes sent by the MCP client are decoded as cp1252:
+    an em-dash (U+2014, wire bytes b'\\xe2\\x80\\x94') arrives as the mojibake
+    'a\\u20ac"' and is then persisted verbatim, corrupting the store. The
+    on-disk json.dump is fine (ensure_ascii) -- the damage is at the INPUT
+    boundary, so the fix belongs here. Guarded for interpreters/streams
+    without reconfigure() (added 3.7; absent on already-wrapped streams).
+    """
+    for stream_name in ("stdin", "stdout"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
+
+
 def _serve_stdio():
+    _force_utf8_stdio()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2842,16 +2879,24 @@ def _serve_stdio():
                     },
                 }
             else:
+                raised = False
                 try:
                     result = handler(tool_args)
                 except Exception as e:
                     result = {"error": f"Tool '{tool_name}' failed: {e}"}
+                    raised = True
+                tool_result = {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                }
+                # A handler that raised is an error result, same as the
+                # unknown-tool branch -- flag it so the client doesn't treat
+                # the exception text as a successful payload.
+                if raised:
+                    tool_result["isError"] = True
                 response = {
                     "jsonrpc": "2.0",
                     "id": msg_id,
-                    "result": {
-                        "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-                    },
+                    "result": tool_result,
                 }
         elif method.startswith("notifications/"):
             continue

@@ -654,21 +654,23 @@ def pull_remote(base_dir=None):
     if not rows:
         return {"pulled": 0, "skipped": 0}
 
-    # Advance the watermark to the newest timestamp we saw regardless of how
-    # many were new, so the next pull skips this batch. Filter to strictly
-    # newer rows before merging (merge is additive/idempotent anyway).
+    # Merge ALL fetched rows -- do NOT pre-filter by the watermark.
+    # _merge_rows is idempotent and decides per-entry (newest-wins), so the
+    # watermark is only a bookkeeping hint here, not a correctness gate. A
+    # single global high-water mark drops legitimately-new remote entries under
+    # skewed phone<->desktop clocks (or an entry backfilled with an older
+    # created_at): such an entry carries a timestamp at/below the watermark and
+    # a pre-merge filter would exclude it forever, even though per-entry
+    # comparison would correctly accept it. Track max_ts only to advance the
+    # watermark (bounds log noise / return value); it no longer gates merging.
     max_ts = watermark
-    to_merge = []
     for row in rows:
         ts = _row_timestamp(row)
-        if max_ts is None or (ts and ts > max_ts):
-            max_ts = ts if (max_ts is None or ts > max_ts) else max_ts
-        if watermark and ts and ts <= watermark:
-            continue
-        to_merge.append(row)
+        if ts and (max_ts is None or ts > max_ts):
+            max_ts = ts
 
     try:
-        added, updated, skipped = _merge_rows(base_dir, to_merge)
+        added, updated, skipped = _merge_rows(base_dir, rows)
     except Exception as e:
         _log(base_dir, f"pull_remote merge failed: {e}")
         return {"pulled": 0, "error": str(e)}

@@ -2026,7 +2026,14 @@ class TestQueryEntries:
         assert r["entries_returned"] == 0
         assert r["budget_truncated"] is True
 
-    def test_unresolved_project_errors(self):
+    def test_unresolved_project_errors(self, monkeypatch):
+        # The module-level CONTEXT_DIR is resolved once at import time. When the
+        # suite runs from inside the repo, that resolves to the repo's own
+        # .context/, so a params dict with no project_dir would wrongly succeed.
+        # Neutralize it so this asserts the genuine unresolved-project path
+        # regardless of pytest's cwd.
+        import server as srv
+        monkeypatch.setattr(srv, "CONTEXT_DIR", None)
         r = handle_query_entries({"status": "active"})
         assert "error" in r
 
@@ -2904,3 +2911,60 @@ class TestSnapshot:
         handle_record_decision(decision_params(tmp_path, summary="Added after the snapshot export"))
         s = handle_get_project_summary({"project_dir": str(tmp_path)})
         assert s["counts"]["decisions"] == 2  # the post-snapshot entry survives
+
+
+# ===========================================================================
+# UTF-8 stdio boundary: non-ASCII input must not be decoded as cp1252 mojibake
+# ===========================================================================
+
+_SERVER_PATH = str(Path(__file__).parent.parent / "server.py")
+
+
+class TestStdioUtf8RoundTrip:
+    """Regression: the MCP stdio transport must decode client input as UTF-8.
+
+    On Windows, stdin defaults to cp1252, so a UTF-8 em-dash (U+2014, wire
+    bytes e2 80 94) was decoded to the mojibake 'a\\u20ac\"' and persisted --
+    the upstream source of the mojibake that corrupted the knowledge base.
+    We drive the REAL stdio server in a subprocess and force its default
+    stdio codepage to cp1252 (PYTHONIOENCODING) so the bug reproduces on any
+    OS; the fix (reconfigure to UTF-8 in _serve_stdio) must override it.
+    """
+
+    def _drive(self, tmp_path, marker):
+        (tmp_path / CONTEXT_DIR_NAME).mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path),
+                   PYTHONIOENCODING="cp1252")
+        env.pop("CONTEXT_KEEPER_REMOTE_URL", None)
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "record_decision", "arguments": {
+                    "summary": marker,
+                    "problem": "p" * 50,
+                    "why_chosen": "w" * 70,
+                }}},
+        ]
+        # ensure_ascii=False so the non-ASCII chars travel as RAW UTF-8 bytes on
+        # the wire -- exactly what a JavaScript MCP client's JSON.stringify emits
+        # (it does not \u-escape). That raw-byte path is what a cp1252 stdin
+        # mis-decodes; ASCII \u-escapes would sidestep the bug and prove nothing.
+        stdin_bytes = ("\n".join(json.dumps(r, ensure_ascii=False) for r in requests)
+                       + "\n").encode("utf-8")
+        subprocess.run(
+            [sys.executable, _SERVER_PATH], input=stdin_bytes,
+            capture_output=True, env=env, timeout=30,
+        )
+        disk = json.loads(
+            (tmp_path / CONTEXT_DIR_NAME / "decisions.json").read_text(encoding="utf-8"))
+        return disk
+
+    def test_em_dash_arrow_check_round_trip(self, tmp_path):
+        # em-dash (U+2014), arrow (U+2192), check (U+2713)
+        marker = "scope—wide flow→step done✓"
+        disk = self._drive(tmp_path, marker)
+        assert len(disk) == 1
+        # Exact codepoints preserved -- not cp1252 mojibake.
+        assert disk[0]["summary"] == marker
+        # And explicitly assert the classic em-dash mojibake is absent.
+        assert "â" not in disk[0]["summary"]
