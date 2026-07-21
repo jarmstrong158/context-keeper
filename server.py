@@ -24,6 +24,26 @@ except Exception:  # never let a mirror import problem break the server
 CONTEXT_DIR_NAME = ".context"
 
 
+def _xylem_active_project_file():
+    """Path to the shared Xylem session pointer (overridable for tests)."""
+    override = os.environ.get("XYLEM_ACTIVE_PROJECT_FILE")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.expanduser("~"), ".xylem", "active_project.json")
+
+
+def _xylem_session_project():
+    """The session's project path from the shared Xylem pointer the SessionStart
+    hook writes, or None. Never raises — a missing/garbage pointer is just 'no
+    session hint'."""
+    try:
+        with open(_xylem_active_project_file(), encoding="utf-8") as f:
+            proj = json.load(f).get("project")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return proj if isinstance(proj, str) and os.path.isdir(proj) else None
+
+
 def _resolve_project_dir():
     """Resolve the project directory with a safe cwd fallback.
 
@@ -43,6 +63,12 @@ def _resolve_project_dir():
     explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
     if explicit:
         return explicit
+    # The Xylem SessionStart hook records which project this session is in; honor
+    # it like CONTEXT_KEEPER_PROJECT (an explicit opt-in) so a persistent server
+    # follows the session's project instead of the dir it was launched from.
+    session = _xylem_session_project()
+    if session:
+        return session
     cwd = os.getcwd()
     if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
         return cwd
@@ -955,7 +981,11 @@ def _base_dir_from_params(params):
     project_dir = params.get("project_dir")
     if project_dir:
         return os.path.join(os.path.normpath(project_dir), CONTEXT_DIR_NAME)
-    return CONTEXT_DIR
+    # Resolve PER CALL (env > Xylem session pointer > cwd/.context discovery) so a
+    # persistent server follows whichever project the session is in, instead of
+    # the single dir resolved once at module import (the static CONTEXT_DIR).
+    proj = _resolve_project_dir()
+    return os.path.join(proj, CONTEXT_DIR_NAME) if proj else CONTEXT_DIR
 
 
 def _find_entry_by_id(entry_id, base_dir=None):

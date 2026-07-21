@@ -2027,15 +2027,33 @@ class TestQueryEntries:
         assert r["budget_truncated"] is True
 
     def test_unresolved_project_errors(self, monkeypatch):
-        # The module-level CONTEXT_DIR is resolved once at import time. When the
-        # suite runs from inside the repo, that resolves to the repo's own
-        # .context/, so a params dict with no project_dir would wrongly succeed.
-        # Neutralize it so this asserts the genuine unresolved-project path
-        # regardless of pytest's cwd.
+        # Project resolution is now PER CALL (env > Xylem session pointer >
+        # cwd/.context discovery), not the static import-time CONTEXT_DIR. When
+        # the suite runs from inside the repo, cwd discovery would resolve to the
+        # repo's own .context/, so a params dict with no project_dir would wrongly
+        # succeed. Neutralize every resolution source to assert the genuine
+        # unresolved-project path regardless of pytest's cwd or a stray pointer.
         import server as srv
+        monkeypatch.setattr(srv, "_resolve_project_dir", lambda: None)
         monkeypatch.setattr(srv, "CONTEXT_DIR", None)
         r = handle_query_entries({"status": "active"})
         assert "error" in r
+
+    def test_xylem_session_pointer_is_honored(self, tmp_path, monkeypatch):
+        # With no env and no project_dir param, a persistent server follows the
+        # project the Xylem SessionStart hook recorded in the shared pointer.
+        import json as _json
+        import os as _os
+        import server as srv
+        proj = tmp_path / "proj"
+        (proj / ".context").mkdir(parents=True)
+        ptr = tmp_path / "active_project.json"
+        ptr.write_text(_json.dumps({"project": str(proj)}))
+        monkeypatch.setenv("XYLEM_ACTIVE_PROJECT_FILE", str(ptr))
+        monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
+        assert srv._resolve_project_dir() == str(proj)
+        assert srv._base_dir_from_params({}) == _os.path.join(
+            str(proj), ".context")
 
     def test_get_context_still_hides_deprecated(self, tmp_path):
         # Guard: query_entries must not have changed get_context's behavior —
