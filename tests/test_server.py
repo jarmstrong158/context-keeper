@@ -2986,3 +2986,111 @@ class TestStdioUtf8RoundTrip:
         assert disk[0]["summary"] == marker
         # And explicitly assert the classic em-dash mojibake is absent.
         assert "â" not in disk[0]["summary"]
+
+
+# ===========================================================================
+# Transport: JSON-RPC batch handling (audit #1)
+# ===========================================================================
+
+from server import _handle_line, _dispatch_message  # noqa: E402
+
+
+class TestJsonRpcTransport:
+    """A legal JSON-RPC 2.0 batch must not kill the transport.
+
+    Regression: _serve_stdio called msg.get("id") on the parsed line
+    *outside* the only try block, so a top-level array -- which the spec
+    explicitly permits a client to send at any time -- raised
+    AttributeError out of the read loop and terminated the server process,
+    taking every subsequent request with it.
+    """
+
+    def test_batch_array_does_not_crash_and_answers_each(self, tmp_path):
+        line = json.dumps([
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ])
+        out = _handle_line(line)
+        assert out is not None
+        payload = json.loads(out)
+        assert isinstance(payload, list) and len(payload) == 2
+        assert [r["id"] for r in payload] == [1, 2]
+        assert payload[0]["result"]["serverInfo"]["name"] == "context-keeper"
+        assert "tools" in payload[1]["result"]
+
+    def test_batch_of_only_notifications_writes_nothing(self):
+        line = json.dumps([
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "method": "notifications/cancelled"},
+        ])
+        assert _handle_line(line) is None
+
+    def test_batch_mixed_notification_and_request_answers_only_request(self):
+        line = json.dumps([
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}},
+        ])
+        payload = json.loads(_handle_line(line))
+        assert isinstance(payload, list) and len(payload) == 1
+        assert payload[0]["id"] == 7
+
+    def test_empty_batch_is_invalid_request_not_a_crash(self):
+        payload = json.loads(_handle_line("[]"))
+        assert payload["error"]["code"] == -32600
+        assert payload["id"] is None
+
+    def test_batch_with_junk_member_still_answers_the_good_one(self):
+        line = json.dumps([42, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}])
+        payload = json.loads(_handle_line(line))
+        assert len(payload) == 2
+        assert payload[0]["error"]["code"] == -32600
+        assert payload[1]["id"] == 3
+
+    def test_scalar_toplevel_is_invalid_request(self):
+        for raw in ("42", '"hello"', "true", "null"):
+            payload = json.loads(_handle_line(raw))
+            assert payload["error"]["code"] == -32600, raw
+
+    def test_malformed_json_is_parse_error(self):
+        payload = json.loads(_handle_line("{not json"))
+        assert payload["error"]["code"] == -32700
+
+    def test_non_string_method_is_invalid_request(self):
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": {"a": 1}})))
+        assert payload["error"]["code"] == -32600
+
+    def test_null_params_does_not_crash(self):
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": None})))
+        # Falls through to the unknown-tool branch rather than raising.
+        assert payload["result"]["isError"] is True
+
+    def test_single_request_shape_unchanged(self):
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
+        assert isinstance(payload, dict)
+        assert payload["result"]["protocolVersion"] == "2024-11-05"
+
+    def test_live_server_survives_a_batch_and_keeps_serving(self, tmp_path):
+        """End-to-end: drive the REAL stdio process. Before the fix the batch
+        line killed it, so the follow-up request got no answer at all."""
+        (tmp_path / CONTEXT_DIR_NAME).mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
+        env.pop("CONTEXT_KEEPER_REMOTE_URL", None)
+        stdin = (
+            json.dumps([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}])
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            + "\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, _SERVER_PATH], input=stdin, capture_output=True,
+            text=True, env=env, timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        # Line 1: the batch response (an array). Line 2: the follow-up, which
+        # only exists if the batch did not kill the process.
+        assert isinstance(json.loads(lines[0]), list)
+        assert json.loads(lines[1])["id"] == 2

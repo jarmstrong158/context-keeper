@@ -21,6 +21,13 @@ try:
 except Exception:  # never let a mirror import problem break the server
     _mirror = None
 
+# Single source of truth for the version *inside the Python package*. The
+# same literal also lives in pyproject.toml, server.json (twice) and
+# mcpb/manifest.json, which the packaging formats require verbatim -- so
+# tests/test_server.py::TestVersionConsistency asserts all five agree. Bump
+# them together or that test fails the build.
+__version__ = "0.15.0"
+
 CONTEXT_DIR_NAME = ".context"
 
 
@@ -2861,83 +2868,147 @@ def _force_utf8_stdio():
             pass
 
 
+def _dispatch_message(msg):
+    """Handle ONE JSON-RPC message object.
+
+    Returns the response dict to write, or None when nothing should be
+    written (a notification). Never raises on malformed input: anything
+    that isn't a JSON-RPC request object comes back as a -32600 Invalid
+    Request instead of propagating out and killing the transport.
+
+    Split out of _serve_stdio so a batch (a top-level JSON array, which is
+    legal JSON-RPC 2.0 and which a client may send at any time) can be
+    fanned out over the same logic. Previously the loop did msg.get("id")
+    directly on the parsed line, so a batch array -- or any non-object
+    top-level JSON -- raised AttributeError and took the whole server down.
+    """
+    if not isinstance(msg, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600,
+                      "message": "Invalid Request: expected a JSON-RPC object"},
+        }
+
+    msg_id = msg.get("id")
+    method = msg.get("method", "")
+    if not isinstance(method, str):
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id if isinstance(msg_id, (str, int, float)) else None,
+            "error": {"code": -32600, "message": "Invalid Request: 'method' must be a string"},
+        }
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "context-keeper", "version": __version__},
+            },
+        }
+    if method.startswith("notifications/"):
+        # Notifications take no reply, per JSON-RPC 2.0.
+        return None
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"tools": TOOLS},
+        }
+    if method == "tools/call":
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        handler = HANDLERS.get(tool_name)
+
+        if handler is None:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"})}],
+                    "isError": True,
+                },
+            }
+        raised = False
+        try:
+            result = handler(tool_args)
+        except Exception as e:
+            result = {"error": f"Tool '{tool_name}' failed: {e}"}
+            raised = True
+        tool_result = {
+            "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+        }
+        # A handler that raised is an error result, same as the
+        # unknown-tool branch -- flag it so the client doesn't treat
+        # the exception text as a successful payload.
+        if raised:
+            tool_result["isError"] = True
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": tool_result,
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
+
+
+def _handle_line(line):
+    """Parse one transport line and return the JSON text to write back, or None.
+
+    Handles the three top-level shapes a conforming JSON-RPC 2.0 client may
+    send: a single request object, a batch (non-empty array of request
+    objects -> array of the responses that aren't notifications), and
+    garbage (-32700 / -32600). A batch whose members are all notifications
+    produces no output, per spec.
+    """
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        # Malformed JSON: answer with Parse Error rather than going silent,
+        # so a client isn't left waiting on a request the server dropped.
+        return json.dumps({
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        })
+
+    if isinstance(msg, list):
+        if not msg:
+            # "If the batch rpc call itself fails to be recognized ... the
+            # response ... MUST be a single Response object" -- spec.
+            return json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Invalid Request: empty batch"},
+            })
+        responses = [r for r in (_dispatch_message(m) for m in msg) if r is not None]
+        if not responses:
+            return None
+        return json.dumps(responses)
+
+    response = _dispatch_message(msg)
+    return None if response is None else json.dumps(response)
+
+
 def _serve_stdio():
     _force_utf8_stdio()
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
+        out = _handle_line(line)
+        if out is None:
             continue
-
-        msg_id = msg.get("id")
-        method = msg.get("method", "")
-        params = msg.get("params", {})
-
-        if method == "initialize":
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.15.0"},
-                },
-            }
-        elif method == "notifications/initialized":
-            continue
-        elif method == "tools/list":
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {"tools": TOOLS},
-            }
-        elif method == "tools/call":
-            tool_name = params.get("name", "")
-            tool_args = params.get("arguments", {})
-            handler = HANDLERS.get(tool_name)
-
-            if handler is None:
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": {
-                        "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"})}],
-                        "isError": True,
-                    },
-                }
-            else:
-                raised = False
-                try:
-                    result = handler(tool_args)
-                except Exception as e:
-                    result = {"error": f"Tool '{tool_name}' failed: {e}"}
-                    raised = True
-                tool_result = {
-                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-                }
-                # A handler that raised is an error result, same as the
-                # unknown-tool branch -- flag it so the client doesn't treat
-                # the exception text as a successful payload.
-                if raised:
-                    tool_result["isError"] = True
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": tool_result,
-                }
-        elif method.startswith("notifications/"):
-            continue
-        else:
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {"code": -32601, "message": f"Method not found: {method}"},
-            }
-
-        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.write(out + "\n")
         sys.stdout.flush()
 
 
