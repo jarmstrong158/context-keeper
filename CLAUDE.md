@@ -6,11 +6,12 @@ Context Keeper maintains project memory across Claude conversations: architectur
 
 Context Keeper stores data in a `.context/` directory inside a project. The server resolves the project directory in this order:
 1. `CONTEXT_KEEPER_PROJECT` env var (explicit opt-in — trusted)
-2. cwd, but **only if** it already contains a `.context/` directory
-3. Walk parent dirs from cwd, returning the first ancestor that already contains a `.context/` (git-style discovery — so launching from a subdirectory of your project still resolves correctly)
-4. Otherwise: refuse. `record_*`, `update_entry`, `deprecate_entry`, and `prune_stale` all return an "unresolved project" error.
+2. The Xylem session pointer `~/.xylem/active_project.json` (override with `XYLEM_ACTIVE_PROJECT_FILE`), written by the Xylem SessionStart hook. Also an explicit opt-in: it exists so a *persistent* server follows the session's project rather than the directory it happened to be launched from, so it outranks cwd discovery.
+3. cwd, but **only if** it already contains a `.context/` directory
+4. Walk parent dirs from cwd, returning the first ancestor that already contains a `.context/` (git-style discovery — so launching from a subdirectory of your project still resolves correctly)
+5. Otherwise: refuse. `record_*`, `update_entry`, `deprecate_entry`, and `prune_stale` all return an "unresolved project" error.
 
-Steps 2 and 3 only resolve to directories that **already** contain `.context/`. The server never creates one implicitly, so you will never silently create a stray `.context/` in the wrong directory. The footgun from earlier versions — where Claude Code was launched from a parent directory and polluted it — is fixed at the code level.
+Steps 3 and 4 only resolve to directories that **already** contain `.context/`. The server never creates one implicitly, so you will never silently create a stray `.context/` in the wrong directory. The footgun from earlier versions — where Claude Code was launched from a parent directory and polluted it — is fixed at the code level.
 
 **All 14 tools accept `project_dir`** for explicit cross-project targeting. When cwd doesn't resolve, pass `project_dir` to any tool — including `record_*`.
 

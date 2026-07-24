@@ -56,12 +56,17 @@ def _resolve_project_dir():
 
     Order of precedence:
       1. CONTEXT_KEEPER_PROJECT env var, if set (trusted — user opted in)
-      2. cwd, ONLY if it already contains a .context/ directory
-      3. Walk parent dirs from cwd, returning the first ancestor that
+      2. The Xylem session pointer (~/.xylem/active_project.json, override
+         with XYLEM_ACTIVE_PROJECT_FILE) written by the SessionStart hook.
+         Also an explicit opt-in — it exists so a persistent server follows
+         the session's project instead of the dir it was launched from — so
+         it outranks the cwd-based discovery below.
+      3. cwd, ONLY if it already contains a .context/ directory
+      4. Walk parent dirs from cwd, returning the first ancestor that
          already contains a .context/ directory (git-style discovery)
-      4. None — refuse to default, callers must pass project_dir explicitly
+      5. None — refuse to default, callers must pass project_dir explicitly
 
-    Steps 2 and 3 only resolve to directories that ALREADY contain
+    Steps 3 and 4 only resolve to directories that ALREADY contain
     .context/. We never create one implicitly, so the footgun where
     Claude Code is launched from a parent directory and context-keeper
     silently pollutes it stays fixed. The upward walk just lets the

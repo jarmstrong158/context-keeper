@@ -236,6 +236,51 @@ class TestProjectResolution:
         result = _resolve_project_dir()
         assert result == str(inner)
 
+    def test_xylem_pointer_outranks_cwd_context_dir(self, tmp_path, monkeypatch):
+        """Step 1.5: the session pointer beats cwd/.context discovery.
+
+        This is the precedence that made the three cwd tests above fail on
+        the author's machine (green in CI, red locally) -- assert it
+        explicitly so the ordering is covered rather than incidental.
+        """
+        import json as _json
+        pointed = tmp_path / "pointed"
+        (pointed / CONTEXT_DIR_NAME).mkdir(parents=True)
+        here = tmp_path / "here"
+        (here / CONTEXT_DIR_NAME).mkdir(parents=True)
+        ptr = tmp_path / "active_project.json"
+        ptr.write_text(_json.dumps({"project": str(pointed)}), encoding="utf-8")
+
+        monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
+        monkeypatch.setenv("XYLEM_ACTIVE_PROJECT_FILE", str(ptr))
+        monkeypatch.chdir(here)
+
+        assert _resolve_project_dir() == str(pointed)
+
+    def test_env_var_outranks_xylem_pointer(self, tmp_path, monkeypatch):
+        """Step 1 still beats step 1.5."""
+        import json as _json
+        pointed = tmp_path / "pointed"
+        (pointed / CONTEXT_DIR_NAME).mkdir(parents=True)
+        ptr = tmp_path / "active_project.json"
+        ptr.write_text(_json.dumps({"project": str(pointed)}), encoding="utf-8")
+
+        monkeypatch.setenv("XYLEM_ACTIVE_PROJECT_FILE", str(ptr))
+        monkeypatch.setenv("CONTEXT_KEEPER_PROJECT", str(tmp_path / "env_wins"))
+
+        assert _resolve_project_dir() == str(tmp_path / "env_wins")
+
+    def test_suite_is_hermetic_against_a_real_xylem_pointer(self):
+        """The conftest fixture must neutralize the developer's real pointer.
+
+        Without this, anyone who actually runs the Xylem suite gets a
+        different _resolve_project_dir() than CI does, and the cwd tests
+        above fail for reasons that have nothing to do with the code.
+        """
+        import server as srv
+        assert srv._xylem_session_project() is None
+        assert not os.path.exists(srv._xylem_active_project_file())
+
     def test_record_decision_no_project_dir_returns_error(self, monkeypatch):
         """Calling handler with no project_dir and no env var returns error dict."""
         monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
