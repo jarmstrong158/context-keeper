@@ -34,6 +34,21 @@ Issues = "https://github.com/jarmstrong158/context-keeper/issues"
 [project.scripts]
 context-keeper = "server:main"
 
+# PACKAGING INVARIANT -- read before editing either list below.
+#
+# This project is a flat set of top-level modules, not a package, so hatch
+# has no directory to sweep: every shipped .py file must be named EXPLICITLY
+# in BOTH lists. A module that exists in git but is missing here is silently
+# absent from the pip install, and the feature it implements just doesn't
+# work for pip users. That has now happened twice -- mirror.py (fixed in
+# b5acffa) and hooks/constraint_reinject.py (the v0.11 constraint-reinjection
+# feature, fixed here).
+#
+# tests/test_server.py::TestPackagingCompleteness derives the required set
+# from the repo itself (every top-level *.py and hooks/*.py that isn't
+# build-time-only) and fails if either list drifts, so a new module cannot
+# be forgotten a third time. If you add a module, add it to both lists.
+
 [tool.hatch.build.targets.sdist]
 include = [
     "server.py",
@@ -44,6 +59,7 @@ include = [
     "hooks/post_compact.py",
     "hooks/commit_capture_reminder.py",
     "hooks/scope_guard.py",
+    "hooks/constraint_reinject.py",
     "LICENSE",
     "README.md",
     "CLAUDE.md",
@@ -59,3 +75,4 @@ include = [
 "hooks/post_compact.py" = "hooks/post_compact.py"
 "hooks/commit_capture_reminder.py" = "hooks/commit_capture_reminder.py"
 "hooks/scope_guard.py" = "hooks/scope_guard.py"
+"hooks/constraint_reinject.py" = "hooks/constraint_reinject.py"

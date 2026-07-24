@@ -7,6 +7,7 @@ lets us use ``tmp_path`` for full isolation without mocking any file I/O.
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -3334,3 +3335,188 @@ class TestStaleIndexWrites:
         disk = json.loads(self._decisions(tmp_path).read_text(encoding="utf-8"))
         assert len(disk) == 3
         assert next(e for e in disk if e["id"] == a)["status"] == "deprecated"
+
+
+# ===========================================================================
+# Distribution metadata: packaging, manifest, version (audit #4 and #6)
+# ===========================================================================
+
+_REPO_ROOT = Path(__file__).parent.parent
+_PYPROJECT = _REPO_ROOT / "pyproject.toml"
+_MANIFEST = _REPO_ROOT / "mcpb" / "manifest.json"
+_SERVER_JSON = _REPO_ROOT / "server.json"
+
+# Top-level .py files that are deliberately NOT shipped to pip users.
+# Keep this list tiny and justified -- it is the only escape hatch from the
+# completeness check below, so anything added here needs a reason.
+_NOT_SHIPPED = {
+    "setup.py",      # (none today) build shim, not runtime
+    "conftest.py",   # test-only
+}
+
+
+def _pyproject_section(name):
+    """Return the raw text of one [section] of pyproject.toml.
+
+    Deliberately a text scan rather than tomllib: tomllib is 3.11+, the
+    project supports 3.10, and importorskip would let this check silently
+    vanish on exactly the interpreter someone might be releasing from.
+    """
+    text = _PYPROJECT.read_text(encoding="utf-8")
+    start = text.index(f"[{name}]") + len(name) + 2
+    rest = text[start:]
+    nxt = rest.find("\n[")
+    return rest if nxt == -1 else rest[:nxt]
+
+
+def _shipped_python_modules():
+    """Every Python module the installed package needs at runtime, derived
+    from the repo rather than from a hand-maintained list."""
+    mods = {p.name for p in _REPO_ROOT.glob("*.py")} - _NOT_SHIPPED
+    mods |= {f"hooks/{p.name}" for p in (_REPO_ROOT / "hooks").glob("*.py")}
+    return mods
+
+
+class TestPackagingCompleteness:
+    """Every runtime module must appear in BOTH hatch include lists.
+
+    This is a flat module layout, not a package, so hatch sweeps no
+    directory -- each file must be named explicitly. A module missing from
+    these lists is silently absent from the pip install and the feature it
+    implements just stops existing for pip users, with no error anywhere.
+
+    That has now happened twice: mirror.py (fixed in b5acffa) and
+    hooks/constraint_reinject.py, which dropped the entire v0.11 constraint-
+    reinjection feature from every pip install. Deriving the expected set
+    from the repo is what stops a third occurrence -- a hand-maintained
+    checklist is exactly what failed the first two times.
+    """
+
+    def test_every_runtime_module_is_in_the_sdist_include(self):
+        section = _pyproject_section("tool.hatch.build.targets.sdist")
+        missing = sorted(m for m in _shipped_python_modules()
+                         if f'"{m}"' not in section)
+        assert not missing, (
+            f"Modules exist in the repo but are missing from the sdist "
+            f"include list in pyproject.toml: {missing}")
+
+    def test_every_runtime_module_is_in_the_wheel_force_include(self):
+        section = _pyproject_section("tool.hatch.build.targets.wheel.force-include")
+        missing = sorted(m for m in _shipped_python_modules()
+                         if f'"{m}" = "{m}"' not in section)
+        assert not missing, (
+            f"Modules exist in the repo but are missing from the wheel "
+            f"force-include map in pyproject.toml: {missing}")
+
+    def test_constraint_reinject_hook_specifically_is_packaged(self):
+        """Named explicitly: this is the regression that motivated the check,
+        and the hook README.md documents as a configurable PostToolUse hook."""
+        for section_name in ("tool.hatch.build.targets.sdist",
+                             "tool.hatch.build.targets.wheel.force-include"):
+            assert "hooks/constraint_reinject.py" in _pyproject_section(section_name)
+
+    def test_every_documented_hook_is_packaged(self):
+        """README tells users to wire these paths into settings.json. A hook
+        the docs configure but the package omits is a broken install."""
+        readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        documented = {
+            f"hooks/{p.name}" for p in (_REPO_ROOT / "hooks").glob("*.py")
+            if f"hooks/{p.name}" in readme
+        }
+        assert documented, "expected README to document at least one hook path"
+        sdist = _pyproject_section("tool.hatch.build.targets.sdist")
+        assert all(f'"{h}"' in sdist for h in documented), sorted(
+            h for h in documented if f'"{h}"' not in sdist)
+
+
+class TestMcpbBundleStaging:
+    """The Claude Desktop .mcpb bundle must stage every first-party module.
+
+    Third instance of the same bug found by this audit: build-mcpb.sh
+    hand-picked server.py + semantic_index.py and omitted mirror.py.
+    server.py imports mirror inside a try/except so it can never fail loudly
+    -- the desktop bundle just shipped with the mirror feature silently
+    missing, exactly like the pip package did before b5acffa.
+    """
+
+    def test_build_script_stages_every_top_level_module(self):
+        script = (_REPO_ROOT / "scripts" / "build-mcpb.sh").read_text(encoding="utf-8")
+        modules = {p.name for p in _REPO_ROOT.glob("*.py")} - _NOT_SHIPPED
+        missing = sorted(m for m in modules if f'"$ROOT/{m}"' not in script)
+        assert not missing, (
+            f"scripts/build-mcpb.sh does not stage: {missing} -- the desktop "
+            f"bundle would ship without them")
+
+    def test_mirror_specifically_is_staged(self):
+        script = (_REPO_ROOT / "scripts" / "build-mcpb.sh").read_text(encoding="utf-8")
+        assert '"$ROOT/mirror.py"' in script
+
+
+class TestManifestToolsMatchServer:
+    """mcpb/manifest.json advertises the tool list to Claude Desktop.
+
+    It had drifted badly: it still advertised record_decision /
+    record_pipeline / record_constraint, which were folded into record_entry
+    and are no longer in server.TOOLS at all, while omitting record_entry
+    itself plus export_snapshot, import_snapshot and mirror. So the bundle
+    promised three tools that do not exist over MCP and hid four that do.
+    """
+
+    def _manifest_names(self):
+        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+        return sorted(t["name"] for t in manifest["tools"])
+
+    def test_manifest_advertises_exactly_the_server_tools(self):
+        import server as srv
+        assert self._manifest_names() == sorted(t["name"] for t in srv.TOOLS)
+
+    def test_manifest_advertises_no_retired_tool(self):
+        import server as srv
+        live = {t["name"] for t in srv.TOOLS}
+        retired = {"record_decision", "record_pipeline", "record_constraint"}
+        assert not retired & live, "retired names came back into TOOLS"
+        assert not retired & set(self._manifest_names())
+
+    def test_manifest_tools_are_all_callable_handlers(self):
+        import server as srv
+        assert all(n in srv.HANDLERS for n in self._manifest_names())
+
+
+class TestVersionConsistency:
+    """One release, five version literals, and CI syncs only one of them.
+
+    pyproject.toml, server.json (twice: the server version and the pypi
+    package version), mcpb/manifest.json and server.py all carry the number
+    verbatim, because each format requires a literal. Nothing checked they
+    agreed, so a partial bump ships a wheel whose initialize response,
+    registry entry and desktop bundle all claim different versions.
+    """
+
+    def _versions(self):
+        pyproject = _PYPROJECT.read_text(encoding="utf-8")
+        m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
+        assert m, "no version in pyproject.toml"
+        server_json = json.loads(_SERVER_JSON.read_text(encoding="utf-8"))
+        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+        import server as srv
+        return {
+            "pyproject.toml": m.group(1),
+            "server.json:version": server_json["version"],
+            "server.json:packages[0].version": server_json["packages"][0]["version"],
+            "mcpb/manifest.json": manifest["version"],
+            "server.py:__version__": srv.__version__,
+        }
+
+    def test_all_five_version_literals_agree(self):
+        versions = self._versions()
+        assert len(set(versions.values())) == 1, (
+            "version literals disagree -- bump them together: "
+            + json.dumps(versions, indent=2))
+
+    def test_initialize_response_reports_the_packaged_version(self):
+        """The wire version a client sees must be the packaged one, not a
+        literal frozen into the transport code."""
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
+        assert payload["result"]["serverInfo"]["version"] == \
+            self._versions()["pyproject.toml"]
