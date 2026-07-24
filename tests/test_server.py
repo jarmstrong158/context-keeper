@@ -3139,3 +3139,198 @@ class TestJsonRpcTransport:
         # only exists if the batch did not kill the process.
         assert isinstance(json.loads(lines[0]), list)
         assert json.loads(lines[1])["id"] == 2
+
+
+# ===========================================================================
+# Read-modify-write races: index must not survive the re-read (audit #2)
+# ===========================================================================
+
+
+class TestStaleIndexWrites:
+    """update_entry / deprecate_entry must re-find by id after the re-read.
+
+    Both handlers used to take `index` from _find_entry_by_id's read, then
+    _load_entries_for_write the file AGAIN and blind-assign
+    entries[index] = entry. If the file changed in between -- another
+    agent's record_*, a mirror pull, or the hand-edit README.md:537
+    explicitly invites -- that index points at a DIFFERENT record and the
+    write silently overwrites it. The merge path in deprecate_entry was
+    already hardened against exactly this (it rebuilds an id->index map
+    after the re-read) but the fix was never back-ported to the two plain
+    paths.
+
+    Each test reproduces the corruption by changing the store between the
+    two reads, which is what a hand-edit or a concurrent write looks like
+    from the handler's point of view.
+    """
+
+    def _decisions(self, tmp_path):
+        return context_dir(tmp_path) / "decisions.json"
+
+    def _seed_three(self, tmp_path):
+        ids = []
+        for n in ("alpha", "bravo", "charlie"):
+            r = handle_record_decision(decision_params(
+                tmp_path, summary=f"Decision about {n} subsystem", tags=[n]))
+            ids.append(r["entry"]["id"])
+        return ids
+
+    def _change_between_reads(self, monkeypatch, path, mutate, fire_on=2):
+        """Run mutate(path) exactly once, on the handler's Nth read of `path`.
+
+        Read 1 is _find_entry_by_id's (where the stale index came from); read
+        2 is _load_entries_for_write's, so firing on read 2 places the change
+        precisely in the window between them -- the race being fixed. The
+        mutated content is what read 2 returns.
+        """
+        import server as srv
+        original = srv._read_json_file_checked
+        state = {"reads": 0, "fired": False}
+
+        def hooked(p):
+            if os.path.abspath(p) == os.path.abspath(path):
+                state["reads"] += 1
+                if not state["fired"] and state["reads"] == fire_on:
+                    state["fired"] = True
+                    mutate(path)
+            return original(p)
+
+        monkeypatch.setattr(srv, "_read_json_file_checked", hooked)
+        return state
+
+    @staticmethod
+    def _reverse_on_disk(p):
+        disk = json.loads(Path(p).read_text(encoding="utf-8"))
+        disk.reverse()
+        Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
+
+    def test_update_entry_does_not_clobber_a_reordered_neighbor(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        # 'a' is at index 0 on the first read; after the reversal index 0 is
+        # 'c'. The old code wrote the mutated 'a' into slot 0 -- destroying 'c'.
+        self._change_between_reads(monkeypatch, str(path), self._reverse_on_disk)
+        r = handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Rewritten alpha summary"}})
+        assert "error" not in r, r
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        by_id = {e["id"]: e for e in disk}
+        # Nothing lost, nothing duplicated.
+        assert len(disk) == 3
+        assert sorted(by_id) == sorted([a, b, c])
+        # The update landed on 'a' ...
+        assert by_id[a]["summary"] == "Rewritten alpha summary"
+        # ... and the neighbors are untouched, not overwritten by a copy of 'a'.
+        assert by_id[c]["summary"] == "Decision about charlie subsystem"
+        assert by_id[b]["summary"] == "Decision about bravo subsystem"
+
+    def test_deprecate_entry_does_not_clobber_a_reordered_neighbor(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        self._change_between_reads(monkeypatch, str(path), self._reverse_on_disk)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "reason": "Superseded during a concurrent-edit regression test."})
+        assert "error" not in r, r
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        by_id = {e["id"]: e for e in disk}
+        assert len(disk) == 3
+        assert sorted(by_id) == sorted([a, b, c])
+        # Exactly ONE entry got deprecated, and it is the one we asked for.
+        assert by_id[a]["status"] == "deprecated"
+        assert by_id[b].get("status") != "deprecated"
+        assert by_id[c].get("status") != "deprecated"
+
+    def test_update_entry_preserves_a_concurrent_edit_to_another_field(
+            self, tmp_path, monkeypatch):
+        """The stale COPY was assigned back wholesale, so a concurrent edit to
+        a field the caller never mentioned got reverted. Applying the update
+        to the freshly-read object keeps it."""
+        a, _b, _c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        def hand_edit(p):
+            disk = json.loads(Path(p).read_text(encoding="utf-8"))
+            for e in disk:
+                if e["id"] == a:
+                    e["tradeoffs"] = "Added by hand while the tool was running"
+            Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
+
+        self._change_between_reads(monkeypatch, str(path), hand_edit)
+        handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Rewritten alpha summary"}})
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        entry = next(e for e in disk if e["id"] == a)
+        assert entry["summary"] == "Rewritten alpha summary"
+        assert entry["tradeoffs"] == "Added by hand while the tool was running"
+
+    @staticmethod
+    def _deleter(target_id):
+        def delete(p):
+            disk = json.loads(Path(p).read_text(encoding="utf-8"))
+            disk = [e for e in disk if e["id"] != target_id]
+            Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
+        return delete
+
+    def test_update_entry_errors_if_the_entry_vanishes_mid_write(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        self._change_between_reads(monkeypatch, str(path), self._deleter(a))
+        r = handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Rewritten alpha summary"}})
+        assert "error" in r and "retry" in r["error"].lower()
+
+        # Refusing is the point: the survivors stay intact and the vanished
+        # entry is not resurrected into someone else's slot.
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        assert sorted(e["id"] for e in disk) == sorted([b, c])
+        assert all("Rewritten alpha" not in e["summary"] for e in disk)
+
+    def test_deprecate_entry_errors_if_the_entry_vanishes_mid_write(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        self._change_between_reads(monkeypatch, str(path), self._deleter(a))
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "reason": "Deprecating an entry that vanished under us."})
+        assert "error" in r and "retry" in r["error"].lower()
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        assert sorted(e["id"] for e in disk) == sorted([b, c])
+        assert not any(e.get("status") == "deprecated" for e in disk)
+
+    def test_update_entry_happy_path_unchanged(self, tmp_path):
+        """Guard: no concurrent change, behavior identical to before."""
+        a, _b, _c = self._seed_three(tmp_path)
+        r = handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Plain update, no race"}})
+        assert r["success"] is True
+        assert r["entry"]["summary"] == "Plain update, no race"
+        disk = json.loads(self._decisions(tmp_path).read_text(encoding="utf-8"))
+        assert len(disk) == 3
+        assert next(e for e in disk if e["id"] == a)["summary"] == "Plain update, no race"
+
+    def test_deprecate_entry_happy_path_unchanged(self, tmp_path):
+        a, _b, _c = self._seed_three(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "reason": "No race here; the ordinary deprecation path must still work."})
+        assert r["success"] is True and r["status"] == "deprecated"
+        disk = json.loads(self._decisions(tmp_path).read_text(encoding="utf-8"))
+        assert len(disk) == 3
+        assert next(e for e in disk if e["id"] == a)["status"] == "deprecated"

@@ -1024,6 +1024,37 @@ def _find_entry_by_id(entry_id, base_dir=None):
     return None, None, None, None
 
 
+def _reload_and_locate(entry_id, file_path):
+    """Re-read a store for writing and locate `entry_id` in the FRESH list.
+
+    Returns (entries, live_entry, error_dict). Exactly one of live_entry /
+    error_dict is meaningful.
+
+    Every read-modify-write handler here does two reads: one to find the
+    entry, one to load the list it will write back. Between them the file can
+    change -- another agent's record_*, a mirror pull, or the hand-edit the
+    README explicitly invites ("the JSON is plain and safe to edit by hand").
+    Carrying the *index* from the first read across to the second means the
+    write lands wherever that slot happens to point now, silently overwriting
+    an unrelated record. Re-finding by id is the only stable link between the
+    two reads, and mutating the live object -- rather than assigning back the
+    stale copy -- preserves concurrent edits to fields the caller isn't
+    touching.
+    """
+    entries, load_err = _load_entries_for_write(file_path)
+    if load_err is not None:
+        return None, None, load_err
+    for e in entries:
+        if e.get("id") == entry_id:
+            return entries, e, None
+    return None, None, {
+        "error": (
+            f"Entry '{entry_id}' disappeared from "
+            f"{os.path.basename(file_path)} between read and write "
+            f"(concurrent edit?). Nothing was written -- retry.")
+    }
+
+
 # ============================================================
 # Validation (v0.4 — schema-enforced rationale depth)
 # ============================================================
@@ -2255,7 +2286,7 @@ def handle_update_entry(params):
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
 
-    entry, type_name, file_path, index = _find_entry_by_id(entry_id, base_dir)
+    entry, type_name, file_path, _ = _find_entry_by_id(entry_id, base_dir)
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
 
@@ -2275,6 +2306,14 @@ def handle_update_entry(params):
             {"field": "steps", "guidance": "Provide an ordered list of steps."}
         ]}
 
+    # Re-read for the write and re-find by id. Validation above ran against
+    # the first read, but the APPLY must target the live object from the
+    # second read -- see _reload_and_locate for why an index cannot survive
+    # the gap between the two reads.
+    entries, entry, err = _reload_and_locate(entry_id, file_path)
+    if err is not None:
+        return err
+
     # Apply updates (protect id and created_at)
     protected = {"id", "created_at"}
     for key, val in updates.items():
@@ -2284,11 +2323,6 @@ def handle_update_entry(params):
     entry["verified_at"] = now_iso()
     entry["updated_at"] = now_iso()
 
-    # Write back
-    entries, load_err = _load_entries_for_write(file_path)
-    if load_err is not None:
-        return load_err
-    entries[index] = entry
     write_json_file(file_path, entries)
     if type_name == "decisions":
         _maybe_export_markdown(base_dir)
@@ -2347,7 +2381,7 @@ def handle_deprecate_entry(params):
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
 
-    entry, type_name, file_path, index = _find_entry_by_id(entry_id, base_dir)
+    entry, type_name, file_path, _ = _find_entry_by_id(entry_id, base_dir)
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
 
@@ -2399,16 +2433,19 @@ def handle_deprecate_entry(params):
             "merged": merge_result,
         }
 
+    # Re-read for the write and re-find by id, same as update_entry and the
+    # merge path above -- the index from the first read is not a stable
+    # handle across the two reads.
+    entries, entry, err = _reload_and_locate(entry_id, file_path)
+    if err is not None:
+        return err
+
     entry["status"] = "deprecated"
     entry["deprecated_reason"] = reason
     entry["updated_at"] = now_iso()
     if superseded_by and type_name == "decisions":
         entry["superseded_by"] = superseded_by
 
-    entries, load_err = _load_entries_for_write(file_path)
-    if load_err is not None:
-        return load_err
-    entries[index] = entry
     write_json_file(file_path, entries)
     if type_name == "decisions":
         _maybe_export_markdown(base_dir)
