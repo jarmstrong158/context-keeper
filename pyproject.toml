@@ -54,6 +54,8 @@ include = [
     "server.py",
     "mirror.py",
     "semantic_index.py",
+    "code_drift.py",
+    "usage.py",
     "hooks/session_start.py",
     "hooks/pre_compact.py",
     "hooks/post_compact.py",
@@ -69,6 +71,8 @@ include = [
 "server.py" = "server.py"
 "mirror.py" = "mirror.py"
 "semantic_index.py" = "semantic_index.py"
+"code_drift.py" = "code_drift.py"
+"usage.py" = "usage.py"
 "CLAUDE.md" = "CLAUDE.md"
 "hooks/session_start.py" = "hooks/session_start.py"
 "hooks/pre_compact.py" = "hooks/pre_compact.py"

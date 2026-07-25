@@ -3429,6 +3429,178 @@ class TestPackagingCompleteness:
             h for h in documented if f'"{h}"' not in sdist)
 
 
+class TestSemanticAbstention:
+    """top_relevance must reflect the semantic signal get_context ranks on.
+
+    get_context blends embedding cosine into the RANKING, but computed
+    top_relevance from a lexical-only signal. So an entry retrieved purely
+    on semantic similarity -- the vocabulary-mismatch rescue the blend
+    exists for -- was ranked #1 and then flagged `no_confident_match` for
+    having no lexical overlap, while the guidance text told the agent the
+    semantic signal "has already been blended in". It had not.
+
+    The fix cannot be max(lexical, cosine). Measured on evals/ across three
+    real stores, nomic-embed's top cosine never drops below ~0.51 even for
+    a question the store cannot answer (no-answer band 0.515-0.718;
+    answerable band 0.636-0.815). Raw cosine would put EVERY query above
+    the 0.20 floor: measured TNR 19% -> 0%, abstention silently off. So the
+    cosine is calibrated first -- zero below the no-answer ceiling, ramping
+    to 1.0 near the answerable maximum.
+    """
+
+    _QUERY = "throttling bursty inbound traffic"
+
+    def _seed_disjoint(self, tmp_path):
+        """An entry that shares NO query vocabulary, so lexical relevance is
+        exactly 0 and only the semantic path can rescue it."""
+        r = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Token bucket limiter on the ingress gateway",
+            problem="Sudden spikes of concurrent client calls were exhausting "
+                    "the upstream connection pool during peak hours.",
+            why_chosen="A bucket smooths spikes without dropping legitimate "
+                       "callers outright, and the gateway already tracks per-client "
+                       "identity so no new state store was required.",
+            tags=["gateway"]))
+        return r["entry"]["id"]
+
+    def _stub_cosines(self, monkeypatch, mapping):
+        import semantic_index
+        monkeypatch.setattr(semantic_index, "query_cosines",
+                            lambda q, entries, base, cfg: dict(mapping))
+
+    def _get(self, tmp_path, semantic=None, **extra):
+        params = {"project_dir": str(tmp_path), "query": self._QUERY,
+                  "include_related": False}
+        if semantic is not None:
+            params["semantic"] = semantic
+        params.update(extra)
+        return handle_get_context(params)
+
+    # --- the calibration curve itself -------------------------------------
+
+    def test_cosine_below_the_floor_contributes_nothing(self):
+        import server as srv
+        # The entire no-answer band measured on the eval set.
+        for cos in (0.515, 0.60, 0.65, 0.70, 0.718, srv._SEM_REL_LO):
+            assert srv._semantic_relevance(cos) == 0.0, cos
+
+    def test_cosine_ramps_between_floor_and_ceiling(self):
+        import server as srv
+        mid = (srv._SEM_REL_LO + srv._SEM_REL_HI) / 2
+        assert srv._semantic_relevance(mid) == pytest.approx(0.5, abs=1e-6)
+        assert srv._semantic_relevance(srv._SEM_REL_HI) == 1.0
+        assert srv._semantic_relevance(0.99) == 1.0
+        assert srv._semantic_relevance(None) == 0.0
+
+    def test_calibration_floor_sits_above_the_no_answer_band(self):
+        """Guard on the constants themselves: if someone lowers the floor
+        into the measured no-answer band, abstention starts eroding."""
+        import server as srv
+        assert srv._SEM_REL_LO > 0.718, (
+            "floor must stay above the highest cosine any no-answer query "
+            "reached on the eval set, or no-answer queries start clearing "
+            "the abstention floor on semantics alone")
+        assert srv._SEM_REL_HI > srv._SEM_REL_LO
+
+    # --- the bug being fixed ----------------------------------------------
+
+    def test_lexical_only_flags_a_pure_semantic_hit_as_no_match(self, tmp_path):
+        """Baseline: with semantic off, the disjoint entry abstains. This is
+        correct for a lexical judgement and is what must NOT change."""
+        eid = self._seed_disjoint(tmp_path)
+        import server as srv
+        entry = srv._find_entry_by_id(eid, str(tmp_path / CONTEXT_DIR_NAME))[0]
+        # Self-check: genuinely zero lexical overlap, so the test proves what
+        # it claims rather than riding on incidental shared words.
+        assert srv._relevance_signal(entry, None, self._QUERY) == 0.0
+
+        r = self._get(tmp_path)
+        assert r["no_confident_match"] is True
+        assert r["top_relevance"] == 0.0
+        assert "lexical" in r["guidance"]
+
+    def test_strong_cosine_rescues_a_zero_lexical_hit(self, tmp_path, monkeypatch):
+        """The actual fix: a strong semantic match no longer gets flagged as
+        'no memory on this' just because the words differ."""
+        eid = self._seed_disjoint(tmp_path)
+        self._stub_cosines(monkeypatch, {eid: 0.84})
+        r = self._get(tmp_path, semantic={"enabled": True})
+        assert r["top_relevance"] >= 0.20
+        assert "no_confident_match" not in r
+
+    def test_no_answer_band_cosine_does_not_defeat_abstention(
+            self, tmp_path, monkeypatch):
+        """THE regression that matters. Every cosine in the measured
+        no-answer band must leave the abstention verdict untouched -- this is
+        what a naive max(lexical, cosine) would have broken."""
+        eid = self._seed_disjoint(tmp_path)
+        for cos in (0.515, 0.573, 0.603, 0.674, 0.718):
+            self._stub_cosines(monkeypatch, {eid: cos})
+            r = self._get(tmp_path, semantic={"enabled": True})
+            assert r["no_confident_match"] is True, (
+                f"cosine {cos} is inside the measured no-answer band and must "
+                f"not lift a zero-lexical entry over the floor")
+            assert r["top_relevance"] == 0.0, cos
+
+    def test_raw_cosine_would_have_disabled_abstention(self, tmp_path, monkeypatch):
+        """Documents the trap explicitly: if the raw cosine were used, this
+        same 0.60 no-answer-band value would clear the 0.20 floor threefold."""
+        import server as srv
+        raw = 0.60
+        assert raw > srv.DEFAULT_CONFIG["min_relevance"]      # the trap
+        assert srv._semantic_relevance(raw) == 0.0            # the fix
+
+    # --- honesty of the reported number ------------------------------------
+
+    def test_guidance_names_the_basis_it_actually_used(self, tmp_path, monkeypatch):
+        eid = self._seed_disjoint(tmp_path)
+        off = self._get(tmp_path)
+        assert "Semantic retrieval is off" in off["guidance"]
+
+        self._stub_cosines(monkeypatch, {eid: 0.60})
+        on = self._get(tmp_path, semantic={"enabled": True})
+        assert "lexical + semantic" in on["guidance"]
+        assert "already reflected" in on["guidance"]
+
+    def test_semantic_off_is_byte_identical_to_before(self, tmp_path, monkeypatch):
+        """Zero-dep default must be untouched: no cosine is even requested."""
+        self._seed_disjoint(tmp_path)
+        import semantic_index
+        called = []
+        monkeypatch.setattr(semantic_index, "query_cosines",
+                            lambda *a, **k: called.append(1) or {})
+        r = self._get(tmp_path)
+        assert not called
+        assert r["no_confident_match"] is True
+
+    def test_calibration_band_is_configurable_per_project(
+            self, tmp_path, monkeypatch):
+        """A different embedding model has a different cosine distribution,
+        so the band must be overridable rather than baked in."""
+        eid = self._seed_disjoint(tmp_path)
+        self._stub_cosines(monkeypatch, {eid: 0.60})
+        # Default band: 0.60 is below the floor -> abstain.
+        assert self._get(tmp_path, semantic={"enabled": True})[
+            "no_confident_match"] is True
+        # Recalibrated for a model whose cosines run lower -> confident.
+        r = self._get(tmp_path, semantic={
+            "enabled": True, "relevance_floor": 0.40, "relevance_ceiling": 0.65})
+        assert "no_confident_match" not in r
+        assert r["top_relevance"] >= 0.20
+
+    def test_lexical_still_wins_when_it_is_the_stronger_signal(
+            self, tmp_path, monkeypatch):
+        """max(), not replace: a strong lexical hit is not dragged down by a
+        weak cosine."""
+        r0 = handle_record_decision(decision_params(
+            tmp_path, summary="Throttling bursty inbound traffic at the edge"))
+        self._stub_cosines(monkeypatch, {r0["entry"]["id"]: 0.30})
+        r = self._get(tmp_path, semantic={"enabled": True})
+        assert r["top_relevance"] >= 0.20
+        assert "no_confident_match" not in r
+
+
 class TestMcpbBundleStaging:
     """The Claude Desktop .mcpb bundle must stage every first-party module.
 

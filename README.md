@@ -595,6 +595,17 @@ retrieval harness lives in [`evals/`](evals/)). Entry embeddings are cached per
 store in `.context/embeddings.json`, keyed by a hash of the entry text, so an
 edited entry is re-embedded automatically.
 
+The same cosine also feeds the abstention signal (`top_relevance`), so an entry
+found on meaning alone is not flagged `no_confident_match` merely for using
+different words than the query. It is **calibrated**, not used raw: embedding
+cosines have a high floor — nomic-embed's top cosine never falls below ~0.51
+even for a question the store cannot answer — so comparing a raw cosine to the
+0.20 abstention floor would put every query above it and silently disable
+abstention. The cosine contributes nothing below `semantic.relevance_floor`
+(default `0.72`, just above the highest cosine any no-answer query reached on
+the eval set) and ramps to 1.0 at `semantic.relevance_ceiling` (default `0.85`).
+**Both are model-specific** — recalibrate them for a different embedding model.
+
 It is strictly additive and fail-safe: if Ollama is unreachable or the model is
 missing, retrieval silently falls back to lexical ranking. The default stays
 `enabled: false`, so zero-dependency remains the out-of-the-box behavior.

@@ -12,6 +12,18 @@ import sys
 import uuid
 from datetime import datetime, timezone
 
+# Optional local modules. Imported defensively so a partial checkout, or a
+# vendored copy of server.py on its own, still starts — every call site treats
+# a missing module as "no information available" rather than an error.
+try:
+    import code_drift
+except ImportError:  # pragma: no cover - defensive
+    code_drift = None
+try:
+    import usage
+except ImportError:  # pragma: no cover - defensive
+    usage = None
+
 # Two-way mirror (local <-> remote). Optional and fail-soft: with no
 # CONTEXT_KEEPER_REMOTE_URL set, every mirror call is a no-op. Imported at
 # top level; mirror.py imports server lazily (inside functions) so there is
@@ -119,9 +131,18 @@ DEFAULT_CONFIG = {
     "stale_threshold_days": 30,
     "project_name": "",
     # Abstention floor: get_context flags no_confident_match when the top
-    # entry's tag/text relevance is below this (0-1). 0.20 is the highest
-    # value with zero false-abstention on the eval set (positive queries
-    # never fall below it). Results are still returned — this only annotates.
+    # entry's relevance is below this (0-1). 0.20 is the highest value with
+    # zero false-abstention on the eval set (positive queries never fall
+    # below it). Results are still returned — this only annotates.
+    #
+    # The relevance it compares against is tag/text overlap, plus — when the
+    # opt-in semantic blend is on — the CALIBRATED cosine (see
+    # _semantic_relevance). The calibration is not optional decoration: raw
+    # nomic-embed cosines never drop below ~0.51 even for a completely
+    # unrelated question, so comparing a raw cosine to this floor would put
+    # every query above it and disable abstention entirely. Tune the
+    # calibration for a different embedding model with
+    # semantic.relevance_floor / semantic.relevance_ceiling.
     "min_relevance": 0.20,
     # Opt-in derived projection: regenerate a human-readable DECISIONS.md
     # from decisions.json on every decision write. The markdown is
@@ -867,15 +888,72 @@ than then there here out up down off again once only just also very more most
 """.split())
 
 
-def _relevance_signal(entry, query_tags, query_text):
+# Cosine calibration for the abstention signal. These map a RAW embedding
+# cosine onto the same 0-1 scale the lexical signal already lives on, and
+# they are model-specific — do not treat them as universal.
+#
+# Why any mapping at all: a cosine from nomic-embed-text is not a
+# probability and shares no scale with lexical overlap. Measured on this
+# repo's eval set (evals/, 31 answerable + 16 no-answer queries across three
+# real stores), nomic's cosines are compressed into a high, narrow band:
+#
+#     answerable queries   top cosine  min 0.636  median 0.719  max 0.815
+#     NO-ANSWER queries    top cosine  min 0.515  median 0.603  max 0.718
+#
+# The bands overlap heavily, and the no-answer FLOOR is 0.515 — far above
+# the 0.20 abstention floor. So the obvious implementation,
+# max(lexical, cosine), puts every query on earth above the floor and
+# silently disables abstention completely: measured TNR falls 19% -> 0%.
+# ("what is the capital of France" scores ~0.49 against this store.)
+#
+# _SEM_REL_LO is therefore set just above the highest cosine any no-answer
+# query reached (0.718), so the semantic term contributes exactly nothing
+# until a match is stronger than anything a no-answer query produced, and
+# lexical alone decides. Above that it ramps linearly to _SEM_REL_HI (near
+# the observed answerable maximum), where it saturates at 1.0.
+#
+# Overridable per project via config semantic.relevance_floor /
+# .relevance_ceiling, because a different embedding model has a different
+# cosine distribution and these numbers would be wrong for it.
+_SEM_REL_LO = 0.72
+_SEM_REL_HI = 0.85
+
+
+def _semantic_relevance(cosine, lo=_SEM_REL_LO, hi=_SEM_REL_HI):
+    """Map a raw embedding cosine onto the lexical signal's 0-1 scale.
+
+    Deliberately returns 0.0 for anything at or below `lo` rather than a
+    small positive number: below the calibration floor the cosine carries
+    no evidence that this entry answers the query, and letting it leak a
+    fraction of a point is what would erode the abstention floor.
+    """
+    if cosine is None or hi <= lo:
+        return 0.0
+    if cosine <= lo:
+        return 0.0
+    return min(1.0, (cosine - lo) / (hi - lo))
+
+
+def _relevance_signal(entry, query_tags, query_text, cosine=None,
+                      sem_lo=_SEM_REL_LO, sem_hi=_SEM_REL_HI):
     """0-1 estimate of how well this entry matches the QUERY specifically —
-    tag/text overlap only, ignoring recency/status/origin.
+    tag/text overlap, plus the calibrated semantic cosine when one is given.
 
     This is the signal the abstention floor keys on. The composite
     score_entry value is inflated by non-relevance terms (an active,
     recent, global entry banks ~55 points with zero query overlap), so a
     totally irrelevant entry can masquerade as a confident hit. This
     isolates the part that actually reflects "does this answer the query."
+
+    `cosine` is the entry's embedding cosine when the opt-in semantic blend
+    is active, and None otherwise. It matters because get_context already
+    blends cosine into the RANKING: without it here, an entry retrieved
+    purely on semantic similarity — the vocabulary-mismatch rescue the
+    blend exists for — was ranked first and then flagged
+    `no_confident_match` for having no lexical overlap, which is precisely
+    backwards. The cosine is run through _semantic_relevance first; see the
+    calibration note there for why the raw value must never be used
+    directly.
 
     Returns None when no query is given — a bare summary/tag-less request
     is never an abstention case. Stopwords are dropped so filler like
@@ -893,7 +971,11 @@ def _relevance_signal(entry, query_tags, query_text):
             ew = _text_words(entry)
             sigs.append(len(qw & ew) / len(qw))
     if not sigs:
+        # No lexical basis at all (no query text and no tags) -- a bare
+        # request, not an abstention case, even if a cosine exists.
         return None
+    if cosine is not None:
+        sigs.append(_semantic_relevance(cosine, sem_lo, sem_hi))
     return max(sigs)
 
 
@@ -1811,24 +1893,46 @@ def handle_get_context(params):
     # just flagged so the agent doesn't present them as established fact.
     if (query or tags) and results:
         min_rel = params.get("min_relevance", cfg.get("min_relevance", 0.20))
+        # Feed the same cosines that shaped the RANKING into the abstention
+        # signal. Without this the two disagreed: an entry surfaced purely on
+        # semantic similarity ranked first and was then flagged
+        # no_confident_match for lacking lexical overlap, while the guidance
+        # text claimed the semantic signal had "already been blended in".
+        # It had been blended into the rank and nowhere else.
+        sem_lo = sem_cfg.get("relevance_floor", _SEM_REL_LO)
+        sem_hi = sem_cfg.get("relevance_ceiling", _SEM_REL_HI)
         top_rel = 0.0
         for r in results:
             if r.get("via") == "related_to":
                 continue  # arc-pulled, not relevance-ranked against the query
-            sig = _relevance_signal(r["entry"], tags, query)
+            sig = _relevance_signal(
+                r["entry"], tags, query,
+                cosine=sem_map.get(r["entry"].get("id")) if sem_map else None,
+                sem_lo=sem_lo, sem_hi=sem_hi)
             if sig is not None:
                 top_rel = max(top_rel, sig)
         response["top_relevance"] = round(top_rel, 2)
         if top_rel < min_rel:
             response["no_confident_match"] = True
+            basis = "lexical + semantic" if sem_map else "lexical"
             response["guidance"] = (
-                "No strongly relevant memory found (lexical relevance "
+                f"No strongly relevant memory found ({basis} relevance "
                 f"{top_rel:.2f} < {min_rel:.2f}). The entries above are the closest "
-                "lexical neighbors, but likely nothing was recorded on this exact "
+                "neighbors, but likely nothing was recorded on this exact "
                 "topic. Do NOT present them as established project decisions — treat "
-                "this as 'no memory on this' unless an entry genuinely fits. If "
-                "semantic retrieval is enabled it has already been blended in."
+                "this as 'no memory on this' unless an entry genuinely fits. "
+                + ("Semantic retrieval was enabled and its cosines are already "
+                   "reflected in this number."
+                   if sem_map else
+                   "Semantic retrieval is off, so this is a lexical judgement only; "
+                   "enabling it (config semantic.enabled) improves recall on queries "
+                   "phrased differently from the stored entry.")
             )
+
+    # A targeted ask: somebody was looking for this. Distinct from the blanket
+    # session-start load, and the distinction is the whole point — see usage.py.
+    if usage is not None:
+        usage.record(base_dir, [r["entry"].get("id") for r in results], "retrieved")
 
     return response
 
@@ -2028,6 +2132,10 @@ def handle_query_entries(params):
 
     # No abstention, no relevance floor, no guidance: a structured query that
     # matches nothing simply returns an empty set. Emptiness is a real answer.
+    # Structured predicates are as targeted as a tag query — somebody asked.
+    if usage is not None:
+        usage.record(base_dir, [r.get("id") for r in results], "retrieved")
+
     return {
         "results": results,
         "matched_entries": len(matched),
@@ -2249,6 +2357,17 @@ def handle_get_project_summary(params):
         "pipelines": [p.get("id") for p in pipelines],
         "constraints": [c.get("id") for c in constraints],
     }
+
+    # A blanket load: this entry arrived in context because the session started,
+    # not because anyone wanted it. Counting these separately from targeted
+    # retrievals is what later distinguishes a load-bearing entry from one the
+    # store has been paying to carry.
+    if usage is not None:
+        usage.record(
+            base_dir,
+            entry_ids["decisions"] + entry_ids["pipelines"] + entry_ids["constraints"],
+            "injected",
+        )
 
     return {
         "initialized": True,
@@ -2560,6 +2679,19 @@ def handle_verify_quality(params):
         for tag in e.get("tags", []):
             tag_index.setdefault(tag.lower(), set()).add(e.get("id"))
 
+    # Verify against the artifact, not the calendar. `prune_stale` asks how long
+    # since someone looked; this asks whether the code under the entry moved,
+    # which is the question that actually decides whether it is still true.
+    # None (no git, no repo) is distinct from {} (a repo with nothing scoped).
+    drift = None
+    if code_drift is not None and params.get("check_drift", True):
+        try:
+            drift = code_drift.scan([e for _, e in all_active], base_dir)
+        except Exception:
+            drift = None
+
+    usage_data = usage.read(base_dir) if usage is not None else {}
+
     flagged = []
     for tname, e in all_active:
         issues = []
@@ -2619,6 +2751,14 @@ def handle_verify_quality(params):
                 "detail": f"Shares tags with {len(unlinked_siblings)} other entries but has no related_to links. Suggested links: {sorted(unlinked_siblings)[:5]}",
             })
 
+        # The code this entry describes moved, or moved away entirely.
+        if drift and code_drift is not None:
+            issues.extend(code_drift.issues_for(drift.get(eid)))
+
+        # Carried into every session and never actually sought.
+        if usage is not None:
+            issues.extend(usage.issues_for(usage.stats_for(base_dir, eid, usage_data)))
+
         if issues:
             flagged.append({
                 "id": eid,
@@ -2632,6 +2772,10 @@ def handle_verify_quality(params):
         "count": len(flagged),
         "total_active": len(all_active),
         "min_reason_chars": min_reason,
+        # Absent git or a work tree there is no drift signal at all. Saying so
+        # keeps "nothing drifted" and "we could not look" distinguishable.
+        "drift_checked": drift is not None,
+        "scoped_entries_checked": len(drift) if drift else 0,
         "action": (
             "Use update_entry to enrich flagged entries. For 'legacy' issues, "
             "the original entry stays valid but a v0.4 re-record captures the full why. "
