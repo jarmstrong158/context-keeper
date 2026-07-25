@@ -40,6 +40,7 @@ cp "$ROOT/mirror.py"          "$STAGE/server/mirror.py"
 cp "$ROOT/semantic_index.py"  "$STAGE/server/semantic_index.py"
 cp "$ROOT/code_drift.py"      "$STAGE/server/code_drift.py"
 cp "$ROOT/usage.py"           "$STAGE/server/usage.py"
+cp "$ROOT/work_focus.py"      "$STAGE/server/work_focus.py"
 
 rm -f "$BUNDLE"
 

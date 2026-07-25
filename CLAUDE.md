@@ -23,6 +23,8 @@ Steps 3 and 4 only resolve to directories that **already** contain `.context/`. 
 Context Keeper has two halves:
 
 1. **Retrieval** (session start): The SessionStart hook injects the compaction report and project summary directly into context (it runs the handlers itself and prints their output). Retrieval is automatic and unskippable — you do not need to call the tools to be oriented on what's already recorded. `get_compaction_report` / `get_project_summary` remain callable on demand.
+
+   The summary ends with **"Rules covering what you are working on"** when the working tree gives a signal — constraints scoped to files that are currently uncommitted, or touched by the last few commits. This is `scope_guard`'s idea (dec-005) moved to session start: the rules for the code in front of you, surfaced before you touch it rather than after. It is deliberately **appended last**, never ranked in among the other entries, so the stable prefix stays byte-identical across sessions and the prompt cache keeps hitting. No repo, or a clean tree with no recent commits, means no block at all.
 2. **Capture** (during session + pre-compaction): Record decisions, constraints, and pipelines *as they happen* during the session. **A git commit is the capture trigger**: a commit that establishes a decision/constraint/gotcha is not finished until the matching record_*/update_entry lands in the same work cycle — never batch capture "for later" (in field use, "later" never came and the user had to ask three times in one night). The PostToolUse commit-reminder hook injects this prompt automatically after every `git commit`; the SessionStart hook injects a quality-scan nudge at turn one (PreCompact stdout is user-visible only, so it cannot prompt the model). Don't rely on either — record in-line whenever possible.
 
 Both halves must work for the system to be useful. Retrieval without capture means the same entries get stale. Capture without retrieval means you don't know what's already recorded.
@@ -74,6 +76,7 @@ Call `record_entry` with `kind="constraint"` and:
 - Set `scope` to a real file/directory path (e.g. `hooks/`, `server.py`) whenever the rule is localized — the scope_guard hook re-injects scoped constraints at the moment a covered file is edited, so a precise scope turns the rule into an active guardrail instead of a session-start memo
 - `reason` (required, ≥40 chars) — what goes wrong if it's violated, concretely
 - `triggering_incident` (optional but encouraged) — the specific bug/gotcha/incident that led to this rule (concrete > abstract for future sessions)
+- `enforced_by` (optional) — the test or command that actually checks this rule, e.g. `tests/test_server.py::TestToolSchemaBudget`. Name the check rather than restating what it asserts: a constraint that duplicates a threshold its test owns will drift from it (that is `con-009`, and `con-004` is how it was found). `verify_quality` confirms the name still resolves and a drift flag then says *"run this"* instead of *"go read the code"*. It is **never executed** — stores travel via `import_snapshot` and `mirror`, so a field that ran commands would be a code-execution path into the store.
 - `related_to` (link to the decision that created this constraint, etc.), `tags`
 
 ## When to Retrieve

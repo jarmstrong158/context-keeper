@@ -23,6 +23,10 @@ try:
     import usage
 except ImportError:  # pragma: no cover - defensive
     usage = None
+try:
+    import work_focus
+except ImportError:  # pragma: no cover - defensive
+    work_focus = None
 
 # Two-way mirror (local <-> remote). Optional and fail-soft: with no
 # CONTEXT_KEEPER_REMOTE_URL set, every mirror call is a no-op. Imported at
@@ -212,6 +216,7 @@ TOOLS = [
                 "rule": {"type": "string", "description": "constraint: the rule, imperative."},
                 "reason": {"type": "string", "description": "constraint: why it exists. Min 40 chars."},
                 "triggering_incident": {"type": "string", "description": "constraint: the incident behind it."},
+                "enforced_by": {"type": "string", "description": "constraint: test/command that checks it (named, never run)."},
                 "scope": {"type": "string", "description": "constraint: 'global' or a file/module path.",
                           "default": "global"},
                 "hardness": {"type": "string", "enum": ["absolute", "advisory"],
@@ -1651,6 +1656,7 @@ def _record_constraint_impl(params):
         "rule": params["rule"],
         "reason": params["reason"],
         "triggering_incident": params.get("triggering_incident", ""),
+        "enforced_by": params.get("enforced_by", ""),
         "scope": params.get("scope", "global"),
         "hardness": params.get("hardness", "absolute"),
         "related_to": params.get("related_to", []),
@@ -2318,6 +2324,25 @@ def handle_get_project_summary(params):
             lines.pop()
         summary_text = "\n".join(lines)
 
+    # Task focus, appended AFTER everything above and after truncation.
+    #
+    # Order matters twice. The block varies with the working tree, so putting it
+    # last keeps the stable prefix byte-identical across sessions and the prompt
+    # cache hitting — interleaving it by relevance would invalidate the cache on
+    # every file touched. And appending after truncation means a large store
+    # trims its own decisions rather than evicting the rules for the code
+    # actually in front of the reader. Its size is capped in work_focus and
+    # accounted separately, exactly like the additive orientation fields below.
+    focus = []
+    if work_focus is not None:
+        try:
+            root = os.path.dirname(base_dir.rstrip(os.sep)) or None
+            focus = work_focus.focus_lines(constraints, root)
+        except Exception:
+            focus = []
+        if focus:
+            summary_text = summary_text + "\n" + "\n".join(focus)
+
     # Additive orientation fields so get_project_summary is the single
     # "whole lay of the land" call — an agent can orient without further
     # probing. Every existing key above (summary, counts, stale_entries,
@@ -2754,6 +2779,15 @@ def handle_verify_quality(params):
         # The code this entry describes moved, or moved away entirely.
         if drift and code_drift is not None:
             issues.extend(code_drift.issues_for(drift.get(eid)))
+
+        # A constraint naming its own check is only useful while the name
+        # resolves. Never executed -- see code_drift.enforcement_issues.
+        if code_drift is not None and e.get("enforced_by"):
+            try:
+                issues.extend(code_drift.enforcement_issues(
+                    e, code_drift.repo_root(base_dir)))
+            except Exception:
+                pass
 
         # Carried into every session and never actually sought.
         if usage is not None:
