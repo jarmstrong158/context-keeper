@@ -76,7 +76,16 @@ def _parse_iso(value):
 
 
 def _norm(path):
-    return str(path).replace("\\", "/").strip().lstrip("./").rstrip("/")
+    """Normalise to forward slashes with no './' prefix or trailing slash.
+
+    lstrip("./") strips CHARACTERS, not a prefix: it turns '.github/workflows'
+    into 'github/workflows' and '.context/x.json' into 'context/x.json', so any
+    entry scoped to a dotfile path would silently never match a commit.
+    """
+    p = str(path).replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/")
 
 
 def changed_paths_since(root, since_iso):
@@ -177,12 +186,53 @@ def scan(entries, base_dir, root=None):
         abs_scope = os.path.join(root, scope_norm.replace("/", os.sep))
         report[e.get("id")] = {
             "scope": scope_norm,
+            "enforced_by": (e.get("enforced_by") or "").strip(),
             "scope_exists": os.path.exists(abs_scope),
             "verified_at": _entry_time(e),
             "commits_since_verified": commits,
             "last_change": latest,
         }
     return report
+
+
+def enforcement_issues(entry, root):
+    """Check that a constraint's `enforced_by` target still exists.
+
+    A constraint that names its own check is worth more than one that does not:
+    the drift flag can say "run this" instead of "go read the code". But a name
+    is only useful while it resolves — con-004 pointed at TestToolSchemaBudget in
+    prose for weeks while its own stated threshold had drifted away from what
+    that test asserted.
+
+    Deliberately never executes the target. Stores travel: import_snapshot pulls
+    from git and mirror pulls from a Worker, so a JSON field that ran shell
+    commands on import would be a code-execution path into an offline,
+    inspectable memory store. This resolves the name and stops.
+    """
+    ref = (entry.get("enforced_by") or "").strip()
+    if not ref or not root:
+        return []
+
+    # "tests/test_server.py::TestToolSchemaBudget" -> file part
+    file_part = ref.split("::", 1)[0].strip()
+    if "/" in file_part or file_part.endswith(".py"):
+        if os.path.exists(os.path.join(root, file_part.replace("/", os.sep))):
+            return []
+        return [{
+            "type": "enforcement_missing",
+            "detail": (f"enforced_by names '{file_part}', which does not exist in the "
+                       "repo. The check this constraint relies on has moved or gone."),
+        }]
+
+    # A bare symbol (a test class or function name): grep rather than guess.
+    out = _git(["grep", "-l", "--fixed-strings", ref], root, timeout=15)
+    if out is None or out.strip():
+        return []  # found, or git could not tell us — do not cry wolf
+    return [{
+        "type": "enforcement_missing",
+        "detail": (f"enforced_by names '{ref}', which appears nowhere in the repo. "
+                   "The check this constraint relies on has been renamed or removed."),
+    }]
 
 
 def issues_for(drift):
@@ -201,13 +251,19 @@ def issues_for(drift):
         })
     elif drift["commits_since_verified"] > 0:
         n = drift["commits_since_verified"]
+        # An entry that names its own check turns "go read the code" into a
+        # single command — say so instead of sending the reader to the diff.
+        how = (f"Run {drift['enforced_by']} to re-verify, then update_entry "
+               "(which refreshes verified_at)."
+               if drift.get("enforced_by") else
+               "Re-read the code and either update_entry (which refreshes "
+               "verified_at) or deprecate it.")
         out.append({
             "type": "code_drift",
             "detail": (
                 f"{n} commit{'s' if n != 1 else ''} touched '{drift['scope']}' since "
                 f"this was last verified ({drift['verified_at'][:10]}). Most recent: "
-                f"\"{drift['last_change'][:90]}\". Re-read the code and either "
-                "update_entry (which refreshes verified_at) or deprecate it."
+                f"\"{drift['last_change'][:90]}\". " + how
             ),
         })
     return out
