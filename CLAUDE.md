@@ -6,11 +6,12 @@ Context Keeper maintains project memory across Claude conversations: architectur
 
 Context Keeper stores data in a `.context/` directory inside a project. The server resolves the project directory in this order:
 1. `CONTEXT_KEEPER_PROJECT` env var (explicit opt-in — trusted)
-2. cwd, but **only if** it already contains a `.context/` directory
-3. Walk parent dirs from cwd, returning the first ancestor that already contains a `.context/` (git-style discovery — so launching from a subdirectory of your project still resolves correctly)
-4. Otherwise: refuse. `record_*`, `update_entry`, `deprecate_entry`, and `prune_stale` all return an "unresolved project" error.
+2. The Xylem session pointer `~/.xylem/active_project.json` (override with `XYLEM_ACTIVE_PROJECT_FILE`), written by the Xylem SessionStart hook. Also an explicit opt-in: it exists so a *persistent* server follows the session's project rather than the directory it happened to be launched from, so it outranks cwd discovery.
+3. cwd, but **only if** it already contains a `.context/` directory
+4. Walk parent dirs from cwd, returning the first ancestor that already contains a `.context/` (git-style discovery — so launching from a subdirectory of your project still resolves correctly)
+5. Otherwise: refuse. `record_*`, `update_entry`, `deprecate_entry`, and `prune_stale` all return an "unresolved project" error.
 
-Steps 2 and 3 only resolve to directories that **already** contain `.context/`. The server never creates one implicitly, so you will never silently create a stray `.context/` in the wrong directory. The footgun from earlier versions — where Claude Code was launched from a parent directory and polluted it — is fixed at the code level.
+Steps 3 and 4 only resolve to directories that **already** contain `.context/`. The server never creates one implicitly, so you will never silently create a stray `.context/` in the wrong directory. The footgun from earlier versions — where Claude Code was launched from a parent directory and polluted it — is fixed at the code level.
 
 **All 14 tools accept `project_dir`** for explicit cross-project targeting. When cwd doesn't resolve, pass `project_dir` to any tool — including `record_*`.
 
@@ -97,7 +98,9 @@ When a `record_*` call succeeds but the response includes `similar_entries`, do 
 - **Genuinely distinct** — the overlap is incidental; link them: `update_entry` your new entry with `related_to` including the similar ids.
 
 ## Acting on no_confident_match (v0.10+)
-When `get_context` returns `no_confident_match: true`, the top entry's lexical relevance to your query was below the floor — the returned entries are the closest neighbors but probably nothing was recorded on this exact topic. Do **not** present them as established project decisions. Treat it as "no memory on this" unless an entry genuinely fits on inspection. The entries are still included (not suppressed) so you can judge; `top_relevance` is the score.
+When `get_context` returns `no_confident_match: true`, the top entry's relevance to your query was below the floor — the returned entries are the closest neighbors but probably nothing was recorded on this exact topic. Do **not** present them as established project decisions. Treat it as "no memory on this" unless an entry genuinely fits on inspection. The entries are still included (not suppressed) so you can judge; `top_relevance` is the score.
+
+`top_relevance` is tag/text overlap, and — when the opt-in semantic blend is on — the *calibrated* embedding cosine as well, so an entry found purely on meaning is no longer flagged as "no match" just for using different words. The `guidance` string names which basis was used. The cosine is calibrated rather than compared raw because raw embedding cosines have a high floor (nomic-embed never drops below ~0.51 even on a totally unrelated question); using the raw value would put every query above the floor and turn abstention off entirely.
 
 ## Superseding vs deprecating a decision (v0.10+)
 Two different lifecycle actions:
@@ -111,6 +114,15 @@ Two different lifecycle actions:
 - One-off debugging steps
 
 ## Staleness Management
+Two different questions, and the second is the one that decides whether an entry is still true:
+
+- **`prune_stale`** asks *how long since anyone looked* — wall-clock age against `stale_threshold_days`.
+- **`verify_quality`** asks *whether the ground moved* — whether commits have touched the entry's `scope` path since `verified_at`.
+
+Prefer the second. A decision about code nobody has touched in a year is fine; a decision about a function rewritten yesterday is already wrong, and by date it looks fresher. This is not hypothetical: an org-scope memory once warned agents about a conflict result the tool had already been fixed to stop producing. It was the most-recalled item in the store, and by calendar it looked healthy.
+
+Setting a real file/directory `scope` is what turns this on — a `global` scope has nothing to compare against.
+
 Periodically (every few sessions or when the user asks), call `prune_stale` to find entries that haven't been verified recently. Present stale entries to the user and ask: "Is this still accurate?" Then either:
 - Call `update_entry` to refresh verified_at (confirming it's still valid)
 - Call `deprecate_entry` if it's no longer relevant
@@ -121,6 +133,11 @@ Call `verify_quality` periodically — and especially before compaction — to s
 - **thin_reason** entries (rationale text below threshold) — enrich via `update_entry`
 - **no_tags** entries (won't surface in tag queries)
 - **isolated** entries (share tags with siblings but have no `related_to` links — a missed arc link)
+- **code_drift** — commits have landed on the entry's `scope` path since it was last verified. Re-read the code, then either `update_entry` (which refreshes `verified_at`) or deprecate it.
+- **orphaned_scope** — the entry's `scope` path no longer exists. It describes something moved, renamed, or deleted.
+- **unused** — the entry has been injected into context many times and never returned by a targeted query. Sharpen its tags and `retrieval_hints`, or deprecate it.
+
+`drift_checked: false` in the response means there was no git work tree to compare against — that is "could not look", **not** "nothing drifted". Don't read it as a clean bill of health.
 
 The PreCompact hook calls `verify_quality` automatically and prints flagged entries. When you see them, enrich what you can while the session context is still warm — once compaction fires, the connective tissue may be unrecoverable.
 

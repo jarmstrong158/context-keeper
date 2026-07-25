@@ -4,7 +4,16 @@
 #
 # The bundle is a zip with manifest.json at its root plus the Python server
 # under server/. This server has ZERO third-party dependencies (stdlib only),
-# so there is no server/lib to vendor — we ship just the two source modules.
+# so there is no server/lib to vendor — but every FIRST-PARTY module must
+# still be staged by hand, because there is no package for a tool to sweep.
+#
+# Stage every top-level *.py in the repo root. Do not hand-pick: server.py
+# imports mirror.py inside a try/except (so a missing module degrades
+# silently, with no error for anyone to notice) and this script used to copy
+# only server.py + semantic_index.py, which shipped a desktop bundle with the
+# mirror feature quietly absent. Same class of bug as the pip package losing
+# mirror.py (b5acffa) and hooks/constraint_reinject.py.
+# tests/test_server.py::TestMcpbBundleStaging enforces this.
 #
 # Packs with the official mcpb CLI when available (it validates the manifest);
 # otherwise falls back to a deterministic `zip`. Both produce a valid bundle.
@@ -27,7 +36,10 @@ mkdir -p "$STAGE/server" "$OUT_DIR"
 cp "$ROOT/mcpb/manifest.json" "$STAGE/manifest.json"
 cp "$ROOT/mcpb/icon.png"      "$STAGE/icon.png"
 cp "$ROOT/server.py"          "$STAGE/server/server.py"
+cp "$ROOT/mirror.py"          "$STAGE/server/mirror.py"
 cp "$ROOT/semantic_index.py"  "$STAGE/server/semantic_index.py"
+cp "$ROOT/code_drift.py"      "$STAGE/server/code_drift.py"
+cp "$ROOT/usage.py"           "$STAGE/server/usage.py"
 
 rm -f "$BUNDLE"
 

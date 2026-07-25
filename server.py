@@ -12,6 +12,18 @@ import sys
 import uuid
 from datetime import datetime, timezone
 
+# Optional local modules. Imported defensively so a partial checkout, or a
+# vendored copy of server.py on its own, still starts — every call site treats
+# a missing module as "no information available" rather than an error.
+try:
+    import code_drift
+except ImportError:  # pragma: no cover - defensive
+    code_drift = None
+try:
+    import usage
+except ImportError:  # pragma: no cover - defensive
+    usage = None
+
 # Two-way mirror (local <-> remote). Optional and fail-soft: with no
 # CONTEXT_KEEPER_REMOTE_URL set, every mirror call is a no-op. Imported at
 # top level; mirror.py imports server lazily (inside functions) so there is
@@ -20,6 +32,13 @@ try:
     import mirror as _mirror
 except Exception:  # never let a mirror import problem break the server
     _mirror = None
+
+# Single source of truth for the version *inside the Python package*. The
+# same literal also lives in pyproject.toml, server.json (twice) and
+# mcpb/manifest.json, which the packaging formats require verbatim -- so
+# tests/test_server.py::TestVersionConsistency asserts all five agree. Bump
+# them together or that test fails the build.
+__version__ = "0.15.0"
 
 CONTEXT_DIR_NAME = ".context"
 
@@ -49,12 +68,17 @@ def _resolve_project_dir():
 
     Order of precedence:
       1. CONTEXT_KEEPER_PROJECT env var, if set (trusted — user opted in)
-      2. cwd, ONLY if it already contains a .context/ directory
-      3. Walk parent dirs from cwd, returning the first ancestor that
+      2. The Xylem session pointer (~/.xylem/active_project.json, override
+         with XYLEM_ACTIVE_PROJECT_FILE) written by the SessionStart hook.
+         Also an explicit opt-in — it exists so a persistent server follows
+         the session's project instead of the dir it was launched from — so
+         it outranks the cwd-based discovery below.
+      3. cwd, ONLY if it already contains a .context/ directory
+      4. Walk parent dirs from cwd, returning the first ancestor that
          already contains a .context/ directory (git-style discovery)
-      4. None — refuse to default, callers must pass project_dir explicitly
+      5. None — refuse to default, callers must pass project_dir explicitly
 
-    Steps 2 and 3 only resolve to directories that ALREADY contain
+    Steps 3 and 4 only resolve to directories that ALREADY contain
     .context/. We never create one implicitly, so the footgun where
     Claude Code is launched from a parent directory and context-keeper
     silently pollutes it stays fixed. The upward walk just lets the
@@ -107,9 +131,18 @@ DEFAULT_CONFIG = {
     "stale_threshold_days": 30,
     "project_name": "",
     # Abstention floor: get_context flags no_confident_match when the top
-    # entry's tag/text relevance is below this (0-1). 0.20 is the highest
-    # value with zero false-abstention on the eval set (positive queries
-    # never fall below it). Results are still returned — this only annotates.
+    # entry's relevance is below this (0-1). 0.20 is the highest value with
+    # zero false-abstention on the eval set (positive queries never fall
+    # below it). Results are still returned — this only annotates.
+    #
+    # The relevance it compares against is tag/text overlap, plus — when the
+    # opt-in semantic blend is on — the CALIBRATED cosine (see
+    # _semantic_relevance). The calibration is not optional decoration: raw
+    # nomic-embed cosines never drop below ~0.51 even for a completely
+    # unrelated question, so comparing a raw cosine to this floor would put
+    # every query above it and disable abstention entirely. Tune the
+    # calibration for a different embedding model with
+    # semantic.relevance_floor / semantic.relevance_ceiling.
     "min_relevance": 0.20,
     # Opt-in derived projection: regenerate a human-readable DECISIONS.md
     # from decisions.json on every decision write. The markdown is
@@ -855,15 +888,72 @@ than then there here out up down off again once only just also very more most
 """.split())
 
 
-def _relevance_signal(entry, query_tags, query_text):
+# Cosine calibration for the abstention signal. These map a RAW embedding
+# cosine onto the same 0-1 scale the lexical signal already lives on, and
+# they are model-specific — do not treat them as universal.
+#
+# Why any mapping at all: a cosine from nomic-embed-text is not a
+# probability and shares no scale with lexical overlap. Measured on this
+# repo's eval set (evals/, 31 answerable + 16 no-answer queries across three
+# real stores), nomic's cosines are compressed into a high, narrow band:
+#
+#     answerable queries   top cosine  min 0.636  median 0.719  max 0.815
+#     NO-ANSWER queries    top cosine  min 0.515  median 0.603  max 0.718
+#
+# The bands overlap heavily, and the no-answer FLOOR is 0.515 — far above
+# the 0.20 abstention floor. So the obvious implementation,
+# max(lexical, cosine), puts every query on earth above the floor and
+# silently disables abstention completely: measured TNR falls 19% -> 0%.
+# ("what is the capital of France" scores ~0.49 against this store.)
+#
+# _SEM_REL_LO is therefore set just above the highest cosine any no-answer
+# query reached (0.718), so the semantic term contributes exactly nothing
+# until a match is stronger than anything a no-answer query produced, and
+# lexical alone decides. Above that it ramps linearly to _SEM_REL_HI (near
+# the observed answerable maximum), where it saturates at 1.0.
+#
+# Overridable per project via config semantic.relevance_floor /
+# .relevance_ceiling, because a different embedding model has a different
+# cosine distribution and these numbers would be wrong for it.
+_SEM_REL_LO = 0.72
+_SEM_REL_HI = 0.85
+
+
+def _semantic_relevance(cosine, lo=_SEM_REL_LO, hi=_SEM_REL_HI):
+    """Map a raw embedding cosine onto the lexical signal's 0-1 scale.
+
+    Deliberately returns 0.0 for anything at or below `lo` rather than a
+    small positive number: below the calibration floor the cosine carries
+    no evidence that this entry answers the query, and letting it leak a
+    fraction of a point is what would erode the abstention floor.
+    """
+    if cosine is None or hi <= lo:
+        return 0.0
+    if cosine <= lo:
+        return 0.0
+    return min(1.0, (cosine - lo) / (hi - lo))
+
+
+def _relevance_signal(entry, query_tags, query_text, cosine=None,
+                      sem_lo=_SEM_REL_LO, sem_hi=_SEM_REL_HI):
     """0-1 estimate of how well this entry matches the QUERY specifically —
-    tag/text overlap only, ignoring recency/status/origin.
+    tag/text overlap, plus the calibrated semantic cosine when one is given.
 
     This is the signal the abstention floor keys on. The composite
     score_entry value is inflated by non-relevance terms (an active,
     recent, global entry banks ~55 points with zero query overlap), so a
     totally irrelevant entry can masquerade as a confident hit. This
     isolates the part that actually reflects "does this answer the query."
+
+    `cosine` is the entry's embedding cosine when the opt-in semantic blend
+    is active, and None otherwise. It matters because get_context already
+    blends cosine into the RANKING: without it here, an entry retrieved
+    purely on semantic similarity — the vocabulary-mismatch rescue the
+    blend exists for — was ranked first and then flagged
+    `no_confident_match` for having no lexical overlap, which is precisely
+    backwards. The cosine is run through _semantic_relevance first; see the
+    calibration note there for why the raw value must never be used
+    directly.
 
     Returns None when no query is given — a bare summary/tag-less request
     is never an abstention case. Stopwords are dropped so filler like
@@ -881,7 +971,11 @@ def _relevance_signal(entry, query_tags, query_text):
             ew = _text_words(entry)
             sigs.append(len(qw & ew) / len(qw))
     if not sigs:
+        # No lexical basis at all (no query text and no tags) -- a bare
+        # request, not an abstention case, even if a cosine exists.
         return None
+    if cosine is not None:
+        sigs.append(_semantic_relevance(cosine, sem_lo, sem_hi))
     return max(sigs)
 
 
@@ -1010,6 +1104,37 @@ def _find_entry_by_id(entry_id, base_dir=None):
                 if e.get("id") == entry_id:
                     return e, tname, tpath, i
     return None, None, None, None
+
+
+def _reload_and_locate(entry_id, file_path):
+    """Re-read a store for writing and locate `entry_id` in the FRESH list.
+
+    Returns (entries, live_entry, error_dict). Exactly one of live_entry /
+    error_dict is meaningful.
+
+    Every read-modify-write handler here does two reads: one to find the
+    entry, one to load the list it will write back. Between them the file can
+    change -- another agent's record_*, a mirror pull, or the hand-edit the
+    README explicitly invites ("the JSON is plain and safe to edit by hand").
+    Carrying the *index* from the first read across to the second means the
+    write lands wherever that slot happens to point now, silently overwriting
+    an unrelated record. Re-finding by id is the only stable link between the
+    two reads, and mutating the live object -- rather than assigning back the
+    stale copy -- preserves concurrent edits to fields the caller isn't
+    touching.
+    """
+    entries, load_err = _load_entries_for_write(file_path)
+    if load_err is not None:
+        return None, None, load_err
+    for e in entries:
+        if e.get("id") == entry_id:
+            return entries, e, None
+    return None, None, {
+        "error": (
+            f"Entry '{entry_id}' disappeared from "
+            f"{os.path.basename(file_path)} between read and write "
+            f"(concurrent edit?). Nothing was written -- retry.")
+    }
 
 
 # ============================================================
@@ -1768,24 +1893,46 @@ def handle_get_context(params):
     # just flagged so the agent doesn't present them as established fact.
     if (query or tags) and results:
         min_rel = params.get("min_relevance", cfg.get("min_relevance", 0.20))
+        # Feed the same cosines that shaped the RANKING into the abstention
+        # signal. Without this the two disagreed: an entry surfaced purely on
+        # semantic similarity ranked first and was then flagged
+        # no_confident_match for lacking lexical overlap, while the guidance
+        # text claimed the semantic signal had "already been blended in".
+        # It had been blended into the rank and nowhere else.
+        sem_lo = sem_cfg.get("relevance_floor", _SEM_REL_LO)
+        sem_hi = sem_cfg.get("relevance_ceiling", _SEM_REL_HI)
         top_rel = 0.0
         for r in results:
             if r.get("via") == "related_to":
                 continue  # arc-pulled, not relevance-ranked against the query
-            sig = _relevance_signal(r["entry"], tags, query)
+            sig = _relevance_signal(
+                r["entry"], tags, query,
+                cosine=sem_map.get(r["entry"].get("id")) if sem_map else None,
+                sem_lo=sem_lo, sem_hi=sem_hi)
             if sig is not None:
                 top_rel = max(top_rel, sig)
         response["top_relevance"] = round(top_rel, 2)
         if top_rel < min_rel:
             response["no_confident_match"] = True
+            basis = "lexical + semantic" if sem_map else "lexical"
             response["guidance"] = (
-                "No strongly relevant memory found (lexical relevance "
+                f"No strongly relevant memory found ({basis} relevance "
                 f"{top_rel:.2f} < {min_rel:.2f}). The entries above are the closest "
-                "lexical neighbors, but likely nothing was recorded on this exact "
+                "neighbors, but likely nothing was recorded on this exact "
                 "topic. Do NOT present them as established project decisions — treat "
-                "this as 'no memory on this' unless an entry genuinely fits. If "
-                "semantic retrieval is enabled it has already been blended in."
+                "this as 'no memory on this' unless an entry genuinely fits. "
+                + ("Semantic retrieval was enabled and its cosines are already "
+                   "reflected in this number."
+                   if sem_map else
+                   "Semantic retrieval is off, so this is a lexical judgement only; "
+                   "enabling it (config semantic.enabled) improves recall on queries "
+                   "phrased differently from the stored entry.")
             )
+
+    # A targeted ask: somebody was looking for this. Distinct from the blanket
+    # session-start load, and the distinction is the whole point — see usage.py.
+    if usage is not None:
+        usage.record(base_dir, [r["entry"].get("id") for r in results], "retrieved")
 
     return response
 
@@ -1985,6 +2132,10 @@ def handle_query_entries(params):
 
     # No abstention, no relevance floor, no guidance: a structured query that
     # matches nothing simply returns an empty set. Emptiness is a real answer.
+    # Structured predicates are as targeted as a tag query — somebody asked.
+    if usage is not None:
+        usage.record(base_dir, [r.get("id") for r in results], "retrieved")
+
     return {
         "results": results,
         "matched_entries": len(matched),
@@ -2207,6 +2358,17 @@ def handle_get_project_summary(params):
         "constraints": [c.get("id") for c in constraints],
     }
 
+    # A blanket load: this entry arrived in context because the session started,
+    # not because anyone wanted it. Counting these separately from targeted
+    # retrievals is what later distinguishes a load-bearing entry from one the
+    # store has been paying to carry.
+    if usage is not None:
+        usage.record(
+            base_dir,
+            entry_ids["decisions"] + entry_ids["pipelines"] + entry_ids["constraints"],
+            "injected",
+        )
+
     return {
         "initialized": True,
         "project_name": project_name,
@@ -2243,7 +2405,7 @@ def handle_update_entry(params):
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
 
-    entry, type_name, file_path, index = _find_entry_by_id(entry_id, base_dir)
+    entry, type_name, file_path, _ = _find_entry_by_id(entry_id, base_dir)
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
 
@@ -2263,6 +2425,14 @@ def handle_update_entry(params):
             {"field": "steps", "guidance": "Provide an ordered list of steps."}
         ]}
 
+    # Re-read for the write and re-find by id. Validation above ran against
+    # the first read, but the APPLY must target the live object from the
+    # second read -- see _reload_and_locate for why an index cannot survive
+    # the gap between the two reads.
+    entries, entry, err = _reload_and_locate(entry_id, file_path)
+    if err is not None:
+        return err
+
     # Apply updates (protect id and created_at)
     protected = {"id", "created_at"}
     for key, val in updates.items():
@@ -2272,11 +2442,6 @@ def handle_update_entry(params):
     entry["verified_at"] = now_iso()
     entry["updated_at"] = now_iso()
 
-    # Write back
-    entries, load_err = _load_entries_for_write(file_path)
-    if load_err is not None:
-        return load_err
-    entries[index] = entry
     write_json_file(file_path, entries)
     if type_name == "decisions":
         _maybe_export_markdown(base_dir)
@@ -2335,7 +2500,7 @@ def handle_deprecate_entry(params):
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
 
-    entry, type_name, file_path, index = _find_entry_by_id(entry_id, base_dir)
+    entry, type_name, file_path, _ = _find_entry_by_id(entry_id, base_dir)
     if entry is None:
         return {"error": f"No entry found with id '{entry_id}'"}
 
@@ -2387,16 +2552,19 @@ def handle_deprecate_entry(params):
             "merged": merge_result,
         }
 
+    # Re-read for the write and re-find by id, same as update_entry and the
+    # merge path above -- the index from the first read is not a stable
+    # handle across the two reads.
+    entries, entry, err = _reload_and_locate(entry_id, file_path)
+    if err is not None:
+        return err
+
     entry["status"] = "deprecated"
     entry["deprecated_reason"] = reason
     entry["updated_at"] = now_iso()
     if superseded_by and type_name == "decisions":
         entry["superseded_by"] = superseded_by
 
-    entries, load_err = _load_entries_for_write(file_path)
-    if load_err is not None:
-        return load_err
-    entries[index] = entry
     write_json_file(file_path, entries)
     if type_name == "decisions":
         _maybe_export_markdown(base_dir)
@@ -2511,6 +2679,19 @@ def handle_verify_quality(params):
         for tag in e.get("tags", []):
             tag_index.setdefault(tag.lower(), set()).add(e.get("id"))
 
+    # Verify against the artifact, not the calendar. `prune_stale` asks how long
+    # since someone looked; this asks whether the code under the entry moved,
+    # which is the question that actually decides whether it is still true.
+    # None (no git, no repo) is distinct from {} (a repo with nothing scoped).
+    drift = None
+    if code_drift is not None and params.get("check_drift", True):
+        try:
+            drift = code_drift.scan([e for _, e in all_active], base_dir)
+        except Exception:
+            drift = None
+
+    usage_data = usage.read(base_dir) if usage is not None else {}
+
     flagged = []
     for tname, e in all_active:
         issues = []
@@ -2570,6 +2751,14 @@ def handle_verify_quality(params):
                 "detail": f"Shares tags with {len(unlinked_siblings)} other entries but has no related_to links. Suggested links: {sorted(unlinked_siblings)[:5]}",
             })
 
+        # The code this entry describes moved, or moved away entirely.
+        if drift and code_drift is not None:
+            issues.extend(code_drift.issues_for(drift.get(eid)))
+
+        # Carried into every session and never actually sought.
+        if usage is not None:
+            issues.extend(usage.issues_for(usage.stats_for(base_dir, eid, usage_data)))
+
         if issues:
             flagged.append({
                 "id": eid,
@@ -2583,6 +2772,10 @@ def handle_verify_quality(params):
         "count": len(flagged),
         "total_active": len(all_active),
         "min_reason_chars": min_reason,
+        # Absent git or a work tree there is no drift signal at all. Saying so
+        # keeps "nothing drifted" and "we could not look" distinguishable.
+        "drift_checked": drift is not None,
+        "scoped_entries_checked": len(drift) if drift else 0,
         "action": (
             "Use update_entry to enrich flagged entries. For 'legacy' issues, "
             "the original entry stays valid but a v0.4 re-record captures the full why. "
@@ -2861,83 +3054,147 @@ def _force_utf8_stdio():
             pass
 
 
+def _dispatch_message(msg):
+    """Handle ONE JSON-RPC message object.
+
+    Returns the response dict to write, or None when nothing should be
+    written (a notification). Never raises on malformed input: anything
+    that isn't a JSON-RPC request object comes back as a -32600 Invalid
+    Request instead of propagating out and killing the transport.
+
+    Split out of _serve_stdio so a batch (a top-level JSON array, which is
+    legal JSON-RPC 2.0 and which a client may send at any time) can be
+    fanned out over the same logic. Previously the loop did msg.get("id")
+    directly on the parsed line, so a batch array -- or any non-object
+    top-level JSON -- raised AttributeError and took the whole server down.
+    """
+    if not isinstance(msg, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600,
+                      "message": "Invalid Request: expected a JSON-RPC object"},
+        }
+
+    msg_id = msg.get("id")
+    method = msg.get("method", "")
+    if not isinstance(method, str):
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id if isinstance(msg_id, (str, int, float)) else None,
+            "error": {"code": -32600, "message": "Invalid Request: 'method' must be a string"},
+        }
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "context-keeper", "version": __version__},
+            },
+        }
+    if method.startswith("notifications/"):
+        # Notifications take no reply, per JSON-RPC 2.0.
+        return None
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"tools": TOOLS},
+        }
+    if method == "tools/call":
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        handler = HANDLERS.get(tool_name)
+
+        if handler is None:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"})}],
+                    "isError": True,
+                },
+            }
+        raised = False
+        try:
+            result = handler(tool_args)
+        except Exception as e:
+            result = {"error": f"Tool '{tool_name}' failed: {e}"}
+            raised = True
+        tool_result = {
+            "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+        }
+        # A handler that raised is an error result, same as the
+        # unknown-tool branch -- flag it so the client doesn't treat
+        # the exception text as a successful payload.
+        if raised:
+            tool_result["isError"] = True
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": tool_result,
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
+
+
+def _handle_line(line):
+    """Parse one transport line and return the JSON text to write back, or None.
+
+    Handles the three top-level shapes a conforming JSON-RPC 2.0 client may
+    send: a single request object, a batch (non-empty array of request
+    objects -> array of the responses that aren't notifications), and
+    garbage (-32700 / -32600). A batch whose members are all notifications
+    produces no output, per spec.
+    """
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        # Malformed JSON: answer with Parse Error rather than going silent,
+        # so a client isn't left waiting on a request the server dropped.
+        return json.dumps({
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        })
+
+    if isinstance(msg, list):
+        if not msg:
+            # "If the batch rpc call itself fails to be recognized ... the
+            # response ... MUST be a single Response object" -- spec.
+            return json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Invalid Request: empty batch"},
+            })
+        responses = [r for r in (_dispatch_message(m) for m in msg) if r is not None]
+        if not responses:
+            return None
+        return json.dumps(responses)
+
+    response = _dispatch_message(msg)
+    return None if response is None else json.dumps(response)
+
+
 def _serve_stdio():
     _force_utf8_stdio()
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
+        out = _handle_line(line)
+        if out is None:
             continue
-
-        msg_id = msg.get("id")
-        method = msg.get("method", "")
-        params = msg.get("params", {})
-
-        if method == "initialize":
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "context-keeper", "version": "0.15.0"},
-                },
-            }
-        elif method == "notifications/initialized":
-            continue
-        elif method == "tools/list":
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {"tools": TOOLS},
-            }
-        elif method == "tools/call":
-            tool_name = params.get("name", "")
-            tool_args = params.get("arguments", {})
-            handler = HANDLERS.get(tool_name)
-
-            if handler is None:
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": {
-                        "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"})}],
-                        "isError": True,
-                    },
-                }
-            else:
-                raised = False
-                try:
-                    result = handler(tool_args)
-                except Exception as e:
-                    result = {"error": f"Tool '{tool_name}' failed: {e}"}
-                    raised = True
-                tool_result = {
-                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-                }
-                # A handler that raised is an error result, same as the
-                # unknown-tool branch -- flag it so the client doesn't treat
-                # the exception text as a successful payload.
-                if raised:
-                    tool_result["isError"] = True
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": tool_result,
-                }
-        elif method.startswith("notifications/"):
-            continue
-        else:
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {"code": -32601, "message": f"Method not found: {method}"},
-            }
-
-        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.write(out + "\n")
         sys.stdout.flush()
 
 

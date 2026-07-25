@@ -7,6 +7,7 @@ lets us use ``tmp_path`` for full isolation without mocking any file I/O.
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -235,6 +236,51 @@ class TestProjectResolution:
 
         result = _resolve_project_dir()
         assert result == str(inner)
+
+    def test_xylem_pointer_outranks_cwd_context_dir(self, tmp_path, monkeypatch):
+        """Step 1.5: the session pointer beats cwd/.context discovery.
+
+        This is the precedence that made the three cwd tests above fail on
+        the author's machine (green in CI, red locally) -- assert it
+        explicitly so the ordering is covered rather than incidental.
+        """
+        import json as _json
+        pointed = tmp_path / "pointed"
+        (pointed / CONTEXT_DIR_NAME).mkdir(parents=True)
+        here = tmp_path / "here"
+        (here / CONTEXT_DIR_NAME).mkdir(parents=True)
+        ptr = tmp_path / "active_project.json"
+        ptr.write_text(_json.dumps({"project": str(pointed)}), encoding="utf-8")
+
+        monkeypatch.delenv("CONTEXT_KEEPER_PROJECT", raising=False)
+        monkeypatch.setenv("XYLEM_ACTIVE_PROJECT_FILE", str(ptr))
+        monkeypatch.chdir(here)
+
+        assert _resolve_project_dir() == str(pointed)
+
+    def test_env_var_outranks_xylem_pointer(self, tmp_path, monkeypatch):
+        """Step 1 still beats step 1.5."""
+        import json as _json
+        pointed = tmp_path / "pointed"
+        (pointed / CONTEXT_DIR_NAME).mkdir(parents=True)
+        ptr = tmp_path / "active_project.json"
+        ptr.write_text(_json.dumps({"project": str(pointed)}), encoding="utf-8")
+
+        monkeypatch.setenv("XYLEM_ACTIVE_PROJECT_FILE", str(ptr))
+        monkeypatch.setenv("CONTEXT_KEEPER_PROJECT", str(tmp_path / "env_wins"))
+
+        assert _resolve_project_dir() == str(tmp_path / "env_wins")
+
+    def test_suite_is_hermetic_against_a_real_xylem_pointer(self):
+        """The conftest fixture must neutralize the developer's real pointer.
+
+        Without this, anyone who actually runs the Xylem suite gets a
+        different _resolve_project_dir() than CI does, and the cwd tests
+        above fail for reasons that have nothing to do with the code.
+        """
+        import server as srv
+        assert srv._xylem_session_project() is None
+        assert not os.path.exists(srv._xylem_active_project_file())
 
     def test_record_decision_no_project_dir_returns_error(self, monkeypatch):
         """Calling handler with no project_dir and no env var returns error dict."""
@@ -2986,3 +3032,663 @@ class TestStdioUtf8RoundTrip:
         assert disk[0]["summary"] == marker
         # And explicitly assert the classic em-dash mojibake is absent.
         assert "â" not in disk[0]["summary"]
+
+
+# ===========================================================================
+# Transport: JSON-RPC batch handling (audit #1)
+# ===========================================================================
+
+from server import _handle_line, _dispatch_message  # noqa: E402
+
+
+class TestJsonRpcTransport:
+    """A legal JSON-RPC 2.0 batch must not kill the transport.
+
+    Regression: _serve_stdio called msg.get("id") on the parsed line
+    *outside* the only try block, so a top-level array -- which the spec
+    explicitly permits a client to send at any time -- raised
+    AttributeError out of the read loop and terminated the server process,
+    taking every subsequent request with it.
+    """
+
+    def test_batch_array_does_not_crash_and_answers_each(self, tmp_path):
+        line = json.dumps([
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ])
+        out = _handle_line(line)
+        assert out is not None
+        payload = json.loads(out)
+        assert isinstance(payload, list) and len(payload) == 2
+        assert [r["id"] for r in payload] == [1, 2]
+        assert payload[0]["result"]["serverInfo"]["name"] == "context-keeper"
+        assert "tools" in payload[1]["result"]
+
+    def test_batch_of_only_notifications_writes_nothing(self):
+        line = json.dumps([
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "method": "notifications/cancelled"},
+        ])
+        assert _handle_line(line) is None
+
+    def test_batch_mixed_notification_and_request_answers_only_request(self):
+        line = json.dumps([
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}},
+        ])
+        payload = json.loads(_handle_line(line))
+        assert isinstance(payload, list) and len(payload) == 1
+        assert payload[0]["id"] == 7
+
+    def test_empty_batch_is_invalid_request_not_a_crash(self):
+        payload = json.loads(_handle_line("[]"))
+        assert payload["error"]["code"] == -32600
+        assert payload["id"] is None
+
+    def test_batch_with_junk_member_still_answers_the_good_one(self):
+        line = json.dumps([42, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}])
+        payload = json.loads(_handle_line(line))
+        assert len(payload) == 2
+        assert payload[0]["error"]["code"] == -32600
+        assert payload[1]["id"] == 3
+
+    def test_scalar_toplevel_is_invalid_request(self):
+        for raw in ("42", '"hello"', "true", "null"):
+            payload = json.loads(_handle_line(raw))
+            assert payload["error"]["code"] == -32600, raw
+
+    def test_malformed_json_is_parse_error(self):
+        payload = json.loads(_handle_line("{not json"))
+        assert payload["error"]["code"] == -32700
+
+    def test_non_string_method_is_invalid_request(self):
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": {"a": 1}})))
+        assert payload["error"]["code"] == -32600
+
+    def test_null_params_does_not_crash(self):
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": None})))
+        # Falls through to the unknown-tool branch rather than raising.
+        assert payload["result"]["isError"] is True
+
+    def test_single_request_shape_unchanged(self):
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
+        assert isinstance(payload, dict)
+        assert payload["result"]["protocolVersion"] == "2024-11-05"
+
+    def test_live_server_survives_a_batch_and_keeps_serving(self, tmp_path):
+        """End-to-end: drive the REAL stdio process. Before the fix the batch
+        line killed it, so the follow-up request got no answer at all."""
+        (tmp_path / CONTEXT_DIR_NAME).mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
+        env.pop("CONTEXT_KEEPER_REMOTE_URL", None)
+        stdin = (
+            json.dumps([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}])
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            + "\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, _SERVER_PATH], input=stdin, capture_output=True,
+            text=True, env=env, timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        # Line 1: the batch response (an array). Line 2: the follow-up, which
+        # only exists if the batch did not kill the process.
+        assert isinstance(json.loads(lines[0]), list)
+        assert json.loads(lines[1])["id"] == 2
+
+
+# ===========================================================================
+# Read-modify-write races: index must not survive the re-read (audit #2)
+# ===========================================================================
+
+
+class TestStaleIndexWrites:
+    """update_entry / deprecate_entry must re-find by id after the re-read.
+
+    Both handlers used to take `index` from _find_entry_by_id's read, then
+    _load_entries_for_write the file AGAIN and blind-assign
+    entries[index] = entry. If the file changed in between -- another
+    agent's record_*, a mirror pull, or the hand-edit README.md:537
+    explicitly invites -- that index points at a DIFFERENT record and the
+    write silently overwrites it. The merge path in deprecate_entry was
+    already hardened against exactly this (it rebuilds an id->index map
+    after the re-read) but the fix was never back-ported to the two plain
+    paths.
+
+    Each test reproduces the corruption by changing the store between the
+    two reads, which is what a hand-edit or a concurrent write looks like
+    from the handler's point of view.
+    """
+
+    def _decisions(self, tmp_path):
+        return context_dir(tmp_path) / "decisions.json"
+
+    def _seed_three(self, tmp_path):
+        ids = []
+        for n in ("alpha", "bravo", "charlie"):
+            r = handle_record_decision(decision_params(
+                tmp_path, summary=f"Decision about {n} subsystem", tags=[n]))
+            ids.append(r["entry"]["id"])
+        return ids
+
+    def _change_between_reads(self, monkeypatch, path, mutate, fire_on=2):
+        """Run mutate(path) exactly once, on the handler's Nth read of `path`.
+
+        Read 1 is _find_entry_by_id's (where the stale index came from); read
+        2 is _load_entries_for_write's, so firing on read 2 places the change
+        precisely in the window between them -- the race being fixed. The
+        mutated content is what read 2 returns.
+        """
+        import server as srv
+        original = srv._read_json_file_checked
+        state = {"reads": 0, "fired": False}
+
+        def hooked(p):
+            if os.path.abspath(p) == os.path.abspath(path):
+                state["reads"] += 1
+                if not state["fired"] and state["reads"] == fire_on:
+                    state["fired"] = True
+                    mutate(path)
+            return original(p)
+
+        monkeypatch.setattr(srv, "_read_json_file_checked", hooked)
+        return state
+
+    @staticmethod
+    def _reverse_on_disk(p):
+        disk = json.loads(Path(p).read_text(encoding="utf-8"))
+        disk.reverse()
+        Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
+
+    def test_update_entry_does_not_clobber_a_reordered_neighbor(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        # 'a' is at index 0 on the first read; after the reversal index 0 is
+        # 'c'. The old code wrote the mutated 'a' into slot 0 -- destroying 'c'.
+        self._change_between_reads(monkeypatch, str(path), self._reverse_on_disk)
+        r = handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Rewritten alpha summary"}})
+        assert "error" not in r, r
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        by_id = {e["id"]: e for e in disk}
+        # Nothing lost, nothing duplicated.
+        assert len(disk) == 3
+        assert sorted(by_id) == sorted([a, b, c])
+        # The update landed on 'a' ...
+        assert by_id[a]["summary"] == "Rewritten alpha summary"
+        # ... and the neighbors are untouched, not overwritten by a copy of 'a'.
+        assert by_id[c]["summary"] == "Decision about charlie subsystem"
+        assert by_id[b]["summary"] == "Decision about bravo subsystem"
+
+    def test_deprecate_entry_does_not_clobber_a_reordered_neighbor(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        self._change_between_reads(monkeypatch, str(path), self._reverse_on_disk)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "reason": "Superseded during a concurrent-edit regression test."})
+        assert "error" not in r, r
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        by_id = {e["id"]: e for e in disk}
+        assert len(disk) == 3
+        assert sorted(by_id) == sorted([a, b, c])
+        # Exactly ONE entry got deprecated, and it is the one we asked for.
+        assert by_id[a]["status"] == "deprecated"
+        assert by_id[b].get("status") != "deprecated"
+        assert by_id[c].get("status") != "deprecated"
+
+    def test_update_entry_preserves_a_concurrent_edit_to_another_field(
+            self, tmp_path, monkeypatch):
+        """The stale COPY was assigned back wholesale, so a concurrent edit to
+        a field the caller never mentioned got reverted. Applying the update
+        to the freshly-read object keeps it."""
+        a, _b, _c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        def hand_edit(p):
+            disk = json.loads(Path(p).read_text(encoding="utf-8"))
+            for e in disk:
+                if e["id"] == a:
+                    e["tradeoffs"] = "Added by hand while the tool was running"
+            Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
+
+        self._change_between_reads(monkeypatch, str(path), hand_edit)
+        handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Rewritten alpha summary"}})
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        entry = next(e for e in disk if e["id"] == a)
+        assert entry["summary"] == "Rewritten alpha summary"
+        assert entry["tradeoffs"] == "Added by hand while the tool was running"
+
+    @staticmethod
+    def _deleter(target_id):
+        def delete(p):
+            disk = json.loads(Path(p).read_text(encoding="utf-8"))
+            disk = [e for e in disk if e["id"] != target_id]
+            Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
+        return delete
+
+    def test_update_entry_errors_if_the_entry_vanishes_mid_write(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        self._change_between_reads(monkeypatch, str(path), self._deleter(a))
+        r = handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Rewritten alpha summary"}})
+        assert "error" in r and "retry" in r["error"].lower()
+
+        # Refusing is the point: the survivors stay intact and the vanished
+        # entry is not resurrected into someone else's slot.
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        assert sorted(e["id"] for e in disk) == sorted([b, c])
+        assert all("Rewritten alpha" not in e["summary"] for e in disk)
+
+    def test_deprecate_entry_errors_if_the_entry_vanishes_mid_write(
+            self, tmp_path, monkeypatch):
+        a, b, c = self._seed_three(tmp_path)
+        path = self._decisions(tmp_path)
+
+        self._change_between_reads(monkeypatch, str(path), self._deleter(a))
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "reason": "Deprecating an entry that vanished under us."})
+        assert "error" in r and "retry" in r["error"].lower()
+
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        assert sorted(e["id"] for e in disk) == sorted([b, c])
+        assert not any(e.get("status") == "deprecated" for e in disk)
+
+    def test_update_entry_happy_path_unchanged(self, tmp_path):
+        """Guard: no concurrent change, behavior identical to before."""
+        a, _b, _c = self._seed_three(tmp_path)
+        r = handle_update_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "updates": {"summary": "Plain update, no race"}})
+        assert r["success"] is True
+        assert r["entry"]["summary"] == "Plain update, no race"
+        disk = json.loads(self._decisions(tmp_path).read_text(encoding="utf-8"))
+        assert len(disk) == 3
+        assert next(e for e in disk if e["id"] == a)["summary"] == "Plain update, no race"
+
+    def test_deprecate_entry_happy_path_unchanged(self, tmp_path):
+        a, _b, _c = self._seed_three(tmp_path)
+        r = handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": a,
+            "reason": "No race here; the ordinary deprecation path must still work."})
+        assert r["success"] is True and r["status"] == "deprecated"
+        disk = json.loads(self._decisions(tmp_path).read_text(encoding="utf-8"))
+        assert len(disk) == 3
+        assert next(e for e in disk if e["id"] == a)["status"] == "deprecated"
+
+
+# ===========================================================================
+# Distribution metadata: packaging, manifest, version (audit #4 and #6)
+# ===========================================================================
+
+_REPO_ROOT = Path(__file__).parent.parent
+_PYPROJECT = _REPO_ROOT / "pyproject.toml"
+_MANIFEST = _REPO_ROOT / "mcpb" / "manifest.json"
+_SERVER_JSON = _REPO_ROOT / "server.json"
+
+# Top-level .py files that are deliberately NOT shipped to pip users.
+# Keep this list tiny and justified -- it is the only escape hatch from the
+# completeness check below, so anything added here needs a reason.
+_NOT_SHIPPED = {
+    "setup.py",      # (none today) build shim, not runtime
+    "conftest.py",   # test-only
+}
+
+
+def _pyproject_section(name):
+    """Return the raw text of one [section] of pyproject.toml.
+
+    Deliberately a text scan rather than tomllib: tomllib is 3.11+, the
+    project supports 3.10, and importorskip would let this check silently
+    vanish on exactly the interpreter someone might be releasing from.
+    """
+    text = _PYPROJECT.read_text(encoding="utf-8")
+    start = text.index(f"[{name}]") + len(name) + 2
+    rest = text[start:]
+    nxt = rest.find("\n[")
+    return rest if nxt == -1 else rest[:nxt]
+
+
+def _shipped_python_modules():
+    """Every Python module the installed package needs at runtime, derived
+    from the repo rather than from a hand-maintained list."""
+    mods = {p.name for p in _REPO_ROOT.glob("*.py")} - _NOT_SHIPPED
+    mods |= {f"hooks/{p.name}" for p in (_REPO_ROOT / "hooks").glob("*.py")}
+    return mods
+
+
+class TestPackagingCompleteness:
+    """Every runtime module must appear in BOTH hatch include lists.
+
+    This is a flat module layout, not a package, so hatch sweeps no
+    directory -- each file must be named explicitly. A module missing from
+    these lists is silently absent from the pip install and the feature it
+    implements just stops existing for pip users, with no error anywhere.
+
+    That has now happened twice: mirror.py (fixed in b5acffa) and
+    hooks/constraint_reinject.py, which dropped the entire v0.11 constraint-
+    reinjection feature from every pip install. Deriving the expected set
+    from the repo is what stops a third occurrence -- a hand-maintained
+    checklist is exactly what failed the first two times.
+    """
+
+    def test_every_runtime_module_is_in_the_sdist_include(self):
+        section = _pyproject_section("tool.hatch.build.targets.sdist")
+        missing = sorted(m for m in _shipped_python_modules()
+                         if f'"{m}"' not in section)
+        assert not missing, (
+            f"Modules exist in the repo but are missing from the sdist "
+            f"include list in pyproject.toml: {missing}")
+
+    def test_every_runtime_module_is_in_the_wheel_force_include(self):
+        section = _pyproject_section("tool.hatch.build.targets.wheel.force-include")
+        missing = sorted(m for m in _shipped_python_modules()
+                         if f'"{m}" = "{m}"' not in section)
+        assert not missing, (
+            f"Modules exist in the repo but are missing from the wheel "
+            f"force-include map in pyproject.toml: {missing}")
+
+    def test_constraint_reinject_hook_specifically_is_packaged(self):
+        """Named explicitly: this is the regression that motivated the check,
+        and the hook README.md documents as a configurable PostToolUse hook."""
+        for section_name in ("tool.hatch.build.targets.sdist",
+                             "tool.hatch.build.targets.wheel.force-include"):
+            assert "hooks/constraint_reinject.py" in _pyproject_section(section_name)
+
+    def test_every_documented_hook_is_packaged(self):
+        """README tells users to wire these paths into settings.json. A hook
+        the docs configure but the package omits is a broken install."""
+        readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        documented = {
+            f"hooks/{p.name}" for p in (_REPO_ROOT / "hooks").glob("*.py")
+            if f"hooks/{p.name}" in readme
+        }
+        assert documented, "expected README to document at least one hook path"
+        sdist = _pyproject_section("tool.hatch.build.targets.sdist")
+        assert all(f'"{h}"' in sdist for h in documented), sorted(
+            h for h in documented if f'"{h}"' not in sdist)
+
+
+class TestSemanticAbstention:
+    """top_relevance must reflect the semantic signal get_context ranks on.
+
+    get_context blends embedding cosine into the RANKING, but computed
+    top_relevance from a lexical-only signal. So an entry retrieved purely
+    on semantic similarity -- the vocabulary-mismatch rescue the blend
+    exists for -- was ranked #1 and then flagged `no_confident_match` for
+    having no lexical overlap, while the guidance text told the agent the
+    semantic signal "has already been blended in". It had not.
+
+    The fix cannot be max(lexical, cosine). Measured on evals/ across three
+    real stores, nomic-embed's top cosine never drops below ~0.51 even for
+    a question the store cannot answer (no-answer band 0.515-0.718;
+    answerable band 0.636-0.815). Raw cosine would put EVERY query above
+    the 0.20 floor: measured TNR 19% -> 0%, abstention silently off. So the
+    cosine is calibrated first -- zero below the no-answer ceiling, ramping
+    to 1.0 near the answerable maximum.
+    """
+
+    _QUERY = "throttling bursty inbound traffic"
+
+    def _seed_disjoint(self, tmp_path):
+        """An entry that shares NO query vocabulary, so lexical relevance is
+        exactly 0 and only the semantic path can rescue it."""
+        r = handle_record_decision(decision_params(
+            tmp_path,
+            summary="Token bucket limiter on the ingress gateway",
+            problem="Sudden spikes of concurrent client calls were exhausting "
+                    "the upstream connection pool during peak hours.",
+            why_chosen="A bucket smooths spikes without dropping legitimate "
+                       "callers outright, and the gateway already tracks per-client "
+                       "identity so no new state store was required.",
+            tags=["gateway"]))
+        return r["entry"]["id"]
+
+    def _stub_cosines(self, monkeypatch, mapping):
+        import semantic_index
+        monkeypatch.setattr(semantic_index, "query_cosines",
+                            lambda q, entries, base, cfg: dict(mapping))
+
+    def _get(self, tmp_path, semantic=None, **extra):
+        params = {"project_dir": str(tmp_path), "query": self._QUERY,
+                  "include_related": False}
+        if semantic is not None:
+            params["semantic"] = semantic
+        params.update(extra)
+        return handle_get_context(params)
+
+    # --- the calibration curve itself -------------------------------------
+
+    def test_cosine_below_the_floor_contributes_nothing(self):
+        import server as srv
+        # The entire no-answer band measured on the eval set.
+        for cos in (0.515, 0.60, 0.65, 0.70, 0.718, srv._SEM_REL_LO):
+            assert srv._semantic_relevance(cos) == 0.0, cos
+
+    def test_cosine_ramps_between_floor_and_ceiling(self):
+        import server as srv
+        mid = (srv._SEM_REL_LO + srv._SEM_REL_HI) / 2
+        assert srv._semantic_relevance(mid) == pytest.approx(0.5, abs=1e-6)
+        assert srv._semantic_relevance(srv._SEM_REL_HI) == 1.0
+        assert srv._semantic_relevance(0.99) == 1.0
+        assert srv._semantic_relevance(None) == 0.0
+
+    def test_calibration_floor_sits_above_the_no_answer_band(self):
+        """Guard on the constants themselves: if someone lowers the floor
+        into the measured no-answer band, abstention starts eroding."""
+        import server as srv
+        assert srv._SEM_REL_LO > 0.718, (
+            "floor must stay above the highest cosine any no-answer query "
+            "reached on the eval set, or no-answer queries start clearing "
+            "the abstention floor on semantics alone")
+        assert srv._SEM_REL_HI > srv._SEM_REL_LO
+
+    # --- the bug being fixed ----------------------------------------------
+
+    def test_lexical_only_flags_a_pure_semantic_hit_as_no_match(self, tmp_path):
+        """Baseline: with semantic off, the disjoint entry abstains. This is
+        correct for a lexical judgement and is what must NOT change."""
+        eid = self._seed_disjoint(tmp_path)
+        import server as srv
+        entry = srv._find_entry_by_id(eid, str(tmp_path / CONTEXT_DIR_NAME))[0]
+        # Self-check: genuinely zero lexical overlap, so the test proves what
+        # it claims rather than riding on incidental shared words.
+        assert srv._relevance_signal(entry, None, self._QUERY) == 0.0
+
+        r = self._get(tmp_path)
+        assert r["no_confident_match"] is True
+        assert r["top_relevance"] == 0.0
+        assert "lexical" in r["guidance"]
+
+    def test_strong_cosine_rescues_a_zero_lexical_hit(self, tmp_path, monkeypatch):
+        """The actual fix: a strong semantic match no longer gets flagged as
+        'no memory on this' just because the words differ."""
+        eid = self._seed_disjoint(tmp_path)
+        self._stub_cosines(monkeypatch, {eid: 0.84})
+        r = self._get(tmp_path, semantic={"enabled": True})
+        assert r["top_relevance"] >= 0.20
+        assert "no_confident_match" not in r
+
+    def test_no_answer_band_cosine_does_not_defeat_abstention(
+            self, tmp_path, monkeypatch):
+        """THE regression that matters. Every cosine in the measured
+        no-answer band must leave the abstention verdict untouched -- this is
+        what a naive max(lexical, cosine) would have broken."""
+        eid = self._seed_disjoint(tmp_path)
+        for cos in (0.515, 0.573, 0.603, 0.674, 0.718):
+            self._stub_cosines(monkeypatch, {eid: cos})
+            r = self._get(tmp_path, semantic={"enabled": True})
+            assert r["no_confident_match"] is True, (
+                f"cosine {cos} is inside the measured no-answer band and must "
+                f"not lift a zero-lexical entry over the floor")
+            assert r["top_relevance"] == 0.0, cos
+
+    def test_raw_cosine_would_have_disabled_abstention(self, tmp_path, monkeypatch):
+        """Documents the trap explicitly: if the raw cosine were used, this
+        same 0.60 no-answer-band value would clear the 0.20 floor threefold."""
+        import server as srv
+        raw = 0.60
+        assert raw > srv.DEFAULT_CONFIG["min_relevance"]      # the trap
+        assert srv._semantic_relevance(raw) == 0.0            # the fix
+
+    # --- honesty of the reported number ------------------------------------
+
+    def test_guidance_names_the_basis_it_actually_used(self, tmp_path, monkeypatch):
+        eid = self._seed_disjoint(tmp_path)
+        off = self._get(tmp_path)
+        assert "Semantic retrieval is off" in off["guidance"]
+
+        self._stub_cosines(monkeypatch, {eid: 0.60})
+        on = self._get(tmp_path, semantic={"enabled": True})
+        assert "lexical + semantic" in on["guidance"]
+        assert "already reflected" in on["guidance"]
+
+    def test_semantic_off_is_byte_identical_to_before(self, tmp_path, monkeypatch):
+        """Zero-dep default must be untouched: no cosine is even requested."""
+        self._seed_disjoint(tmp_path)
+        import semantic_index
+        called = []
+        monkeypatch.setattr(semantic_index, "query_cosines",
+                            lambda *a, **k: called.append(1) or {})
+        r = self._get(tmp_path)
+        assert not called
+        assert r["no_confident_match"] is True
+
+    def test_calibration_band_is_configurable_per_project(
+            self, tmp_path, monkeypatch):
+        """A different embedding model has a different cosine distribution,
+        so the band must be overridable rather than baked in."""
+        eid = self._seed_disjoint(tmp_path)
+        self._stub_cosines(monkeypatch, {eid: 0.60})
+        # Default band: 0.60 is below the floor -> abstain.
+        assert self._get(tmp_path, semantic={"enabled": True})[
+            "no_confident_match"] is True
+        # Recalibrated for a model whose cosines run lower -> confident.
+        r = self._get(tmp_path, semantic={
+            "enabled": True, "relevance_floor": 0.40, "relevance_ceiling": 0.65})
+        assert "no_confident_match" not in r
+        assert r["top_relevance"] >= 0.20
+
+    def test_lexical_still_wins_when_it_is_the_stronger_signal(
+            self, tmp_path, monkeypatch):
+        """max(), not replace: a strong lexical hit is not dragged down by a
+        weak cosine."""
+        r0 = handle_record_decision(decision_params(
+            tmp_path, summary="Throttling bursty inbound traffic at the edge"))
+        self._stub_cosines(monkeypatch, {r0["entry"]["id"]: 0.30})
+        r = self._get(tmp_path, semantic={"enabled": True})
+        assert r["top_relevance"] >= 0.20
+        assert "no_confident_match" not in r
+
+
+class TestMcpbBundleStaging:
+    """The Claude Desktop .mcpb bundle must stage every first-party module.
+
+    Third instance of the same bug found by this audit: build-mcpb.sh
+    hand-picked server.py + semantic_index.py and omitted mirror.py.
+    server.py imports mirror inside a try/except so it can never fail loudly
+    -- the desktop bundle just shipped with the mirror feature silently
+    missing, exactly like the pip package did before b5acffa.
+    """
+
+    def test_build_script_stages_every_top_level_module(self):
+        script = (_REPO_ROOT / "scripts" / "build-mcpb.sh").read_text(encoding="utf-8")
+        modules = {p.name for p in _REPO_ROOT.glob("*.py")} - _NOT_SHIPPED
+        missing = sorted(m for m in modules if f'"$ROOT/{m}"' not in script)
+        assert not missing, (
+            f"scripts/build-mcpb.sh does not stage: {missing} -- the desktop "
+            f"bundle would ship without them")
+
+    def test_mirror_specifically_is_staged(self):
+        script = (_REPO_ROOT / "scripts" / "build-mcpb.sh").read_text(encoding="utf-8")
+        assert '"$ROOT/mirror.py"' in script
+
+
+class TestManifestToolsMatchServer:
+    """mcpb/manifest.json advertises the tool list to Claude Desktop.
+
+    It had drifted badly: it still advertised record_decision /
+    record_pipeline / record_constraint, which were folded into record_entry
+    and are no longer in server.TOOLS at all, while omitting record_entry
+    itself plus export_snapshot, import_snapshot and mirror. So the bundle
+    promised three tools that do not exist over MCP and hid four that do.
+    """
+
+    def _manifest_names(self):
+        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+        return sorted(t["name"] for t in manifest["tools"])
+
+    def test_manifest_advertises_exactly_the_server_tools(self):
+        import server as srv
+        assert self._manifest_names() == sorted(t["name"] for t in srv.TOOLS)
+
+    def test_manifest_advertises_no_retired_tool(self):
+        import server as srv
+        live = {t["name"] for t in srv.TOOLS}
+        retired = {"record_decision", "record_pipeline", "record_constraint"}
+        assert not retired & live, "retired names came back into TOOLS"
+        assert not retired & set(self._manifest_names())
+
+    def test_manifest_tools_are_all_callable_handlers(self):
+        import server as srv
+        assert all(n in srv.HANDLERS for n in self._manifest_names())
+
+
+class TestVersionConsistency:
+    """One release, five version literals, and CI syncs only one of them.
+
+    pyproject.toml, server.json (twice: the server version and the pypi
+    package version), mcpb/manifest.json and server.py all carry the number
+    verbatim, because each format requires a literal. Nothing checked they
+    agreed, so a partial bump ships a wheel whose initialize response,
+    registry entry and desktop bundle all claim different versions.
+    """
+
+    def _versions(self):
+        pyproject = _PYPROJECT.read_text(encoding="utf-8")
+        m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
+        assert m, "no version in pyproject.toml"
+        server_json = json.loads(_SERVER_JSON.read_text(encoding="utf-8"))
+        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+        import server as srv
+        return {
+            "pyproject.toml": m.group(1),
+            "server.json:version": server_json["version"],
+            "server.json:packages[0].version": server_json["packages"][0]["version"],
+            "mcpb/manifest.json": manifest["version"],
+            "server.py:__version__": srv.__version__,
+        }
+
+    def test_all_five_version_literals_agree(self):
+        versions = self._versions()
+        assert len(set(versions.values())) == 1, (
+            "version literals disagree -- bump them together: "
+            + json.dumps(versions, indent=2))
+
+    def test_initialize_response_reports_the_packaged_version(self):
+        """The wire version a client sees must be the packaged one, not a
+        literal frozen into the transport code."""
+        payload = json.loads(_handle_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
+        assert payload["result"]["serverInfo"]["version"] == \
+            self._versions()["pyproject.toml"]
