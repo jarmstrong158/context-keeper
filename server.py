@@ -1546,6 +1546,7 @@ def _record_decision_impl(params):
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "verified_at": now_iso(),
+        "verified_sha": _verified_sha(base_dir),
     }
     # Preserve the deprecated `rationale` field on disk if the caller
     # passed it explicitly. Lets old MCP clients (and old test
@@ -1627,6 +1628,7 @@ def _record_pipeline_impl(params):
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "verified_at": now_iso(),
+        "verified_sha": _verified_sha(base_dir),
     }
     entries.append(entry)
     write_json_file(pipe_path, entries)
@@ -1668,6 +1670,7 @@ def _record_constraint_impl(params):
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "verified_at": now_iso(),
+        "verified_sha": _verified_sha(base_dir),
     }
     entries.append(entry)
     write_json_file(con_path, entries)
@@ -2465,6 +2468,7 @@ def handle_update_entry(params):
             entry[key] = val
 
     entry["verified_at"] = now_iso()
+    entry["verified_sha"] = _verified_sha(base_dir)
     entry["updated_at"] = now_iso()
 
     write_json_file(file_path, entries)
@@ -2487,7 +2491,7 @@ _MERGE_BACKFILL_FIELDS = ("summary", "problem", "why_chosen", "what_we_tried",
                           "reason", "triggering_incident")
 
 
-def _merge_entry_fields(target, source):
+def _merge_entry_fields(target, source, base_dir=None):
     """Fold source's unique content into target in place; return a summary of
     what changed. Never overwrites a non-empty target field."""
     added_tags = []
@@ -2513,6 +2517,7 @@ def _merge_entry_fields(target, source):
             backfilled.append(field)
     target["updated_at"] = now_iso()
     target["verified_at"] = now_iso()
+    target["verified_sha"] = _verified_sha(base_dir)
     return {"tags_added": added_tags, "fields_backfilled": backfilled}
 
 
@@ -2555,7 +2560,7 @@ def handle_deprecate_entry(params):
             return {"error": "Entry moved during merge; retry."}
         dep = entries[by_id[entry_id]]
         keep = entries[by_id[merge_into]]
-        merge_result = _merge_entry_fields(keep, dep)
+        merge_result = _merge_entry_fields(keep, dep, base_dir)
         dep["status"] = "deprecated"
         dep["deprecated_reason"] = reason
         dep["superseded_by"] = merge_into
@@ -2663,6 +2668,21 @@ def handle_get_compaction_report(params):
             "with the user before making changes. Missing entries may need to be re-recorded."
         )
     return report
+
+
+def _verified_sha(base_dir):
+    """HEAD at the moment an entry is verified, or "" outside a repo.
+
+    Server-set, never a tool parameter: it is an observation about the machine
+    doing the write, not something a caller should be able to assert. Keeping
+    it off the schema also keeps it off the tools/list token budget (con-004).
+    """
+    if code_drift is None:
+        return ""
+    try:
+        return code_drift.head_sha(base_dir)
+    except Exception:
+        return ""
 
 
 def handle_verify_quality(params):

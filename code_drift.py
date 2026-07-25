@@ -52,6 +52,16 @@ def repo_root(base_dir):
     return out.strip() if out and out.strip() else None
 
 
+def head_sha(base_dir):
+    """Current HEAD, or "" when there is no repo / no commits yet.
+
+    Stamped onto an entry when it is verified so drift can later be measured
+    from an exact point in history rather than from a wall-clock reading.
+    """
+    out = _git(["rev-parse", "HEAD"], base_dir)
+    return out.strip() if out and out.strip() else ""
+
+
 def is_path_scope(scope):
     """True when `scope` looks like a file or directory rather than a domain."""
     if not scope or not isinstance(scope, str):
@@ -88,7 +98,7 @@ def _norm(path):
     return p.rstrip("/")
 
 
-def changed_paths_since(root, since_iso):
+def changed_paths_since(root, since_iso=None):
     """{normalised path: [(unix_ts, subject), ...]} for commits after `since_iso`.
 
     One `git log` for the whole store rather than one per entry: a store with 40
@@ -98,30 +108,38 @@ def changed_paths_since(root, since_iso):
     that, every entry inherits the oldest entry's window and a freshly verified
     entry keeps reporting drift it has already been checked against.
     """
-    out = _git([
-        "log", f"--since={since_iso}", "--name-only", "--no-merges",
-        f"--max-count={MAX_COMMITS}", "--pretty=format:\x01%ct\x02%s",
-    ], root, timeout=30)
+    args = ["log", "--name-only", "--no-merges",
+            f"--max-count={MAX_COMMITS}", "--pretty=format:\x01%H\x02%ct\x02%s"]
+    if since_iso:
+        args.insert(1, f"--since={since_iso}")
+    out = _git(args, root, timeout=30)
     if out is None:
-        return None
+        return None, {}
 
     changes = {}
-    ts, subject = 0, ""
+    # Position in the log, newest-first. This is what makes SHA comparison
+    # possible without a second git call: a commit is "after" the verified
+    # point exactly when it sits at a lower index than that point.
+    order = {}
+    idx, ts, subject = -1, 0, ""
     for line in out.splitlines():
         if line.startswith("\x01"):
-            head = line[1:]
-            raw_ts, _, subject = head.partition("\x02")
+            parts = line[1:].split("\x02", 2)
+            sha = parts[0].strip()
             try:
-                ts = int(raw_ts)
-            except ValueError:
+                ts = int(parts[1])
+            except (IndexError, ValueError):
                 ts = 0
-            subject = subject.strip()
+            subject = parts[2].strip() if len(parts) > 2 else ""
+            idx += 1
+            if sha:
+                order[sha] = idx
             continue
         p = _norm(line)
         if not p:
             continue
-        changes.setdefault(p, []).append((ts, subject))
-    return changes
+        changes.setdefault(p, []).append((idx, ts, subject))
+    return changes, order
 
 
 def _touches(scope_norm, changed_path):
@@ -161,34 +179,69 @@ def scan(entries, base_dir, root=None):
         return {}
 
     oldest = min(t for _, _, t in scoped)
-    changed = changed_paths_since(root, oldest.astimezone(timezone.utc).isoformat())
+    changed, order = changed_paths_since(
+        root, oldest.astimezone(timezone.utc).isoformat())
     if changed is None:
         return None
+
+    # The window above is derived from TIMESTAMPS, so it can fail to contain a
+    # commit an entry was verified at — most obviously when the timestamp is
+    # wrong, which is the whole reason for preferring the SHA. Widen once,
+    # bounded by MAX_COMMITS, if any SHA we were given is not in it. Retrying
+    # only when a SHA is genuinely missing keeps the common case at one call.
+    wanted = {(e.get("verified_sha") or "").strip()
+              for e, _, _ in scoped if (e.get("verified_sha") or "").strip()}
+    if wanted - set(order):
+        wider, wider_order = changed_paths_since(root, None)
+        if wider is not None:
+            changed, order = wider, wider_order
 
     report = {}
     for e, scope_norm, t in scoped:
         # The git window is bounded by the OLDEST entry in the store, so every
-        # commit must be re-filtered against THIS entry's verification time.
-        # Skipping that step makes verifying an entry do nothing: it keeps
-        # reporting the oldest entry's drift no matter how recently it was
-        # checked, which defeats the whole point of the flag.
+        # commit must be re-filtered against THIS entry's verification point.
+        # Skipping that makes verifying an entry do nothing: it keeps reporting
+        # the oldest entry's drift no matter how recently it was checked.
+        #
+        # Prefer the SHA when the entry carries one and it is still reachable.
+        # A timestamp is a soft boundary — clock skew between machines, a
+        # rebase, or an amended commit all move it, and a store that syncs
+        # across a desktop and a phone has two clocks. A SHA names an exact
+        # point in history and cannot drift out from under the entry.
+        sha = (e.get("verified_sha") or "").strip()
+        sha_idx = order.get(sha) if sha else None
+
         cutoff = t.timestamp()
-        commits, latest, latest_ts = 0, "", -1
+        commits, latest, latest_ts, latest_idx = 0, "", -1, 1 << 30
         for p, events in changed.items():
             if not _touches(scope_norm, p):
                 continue
-            for ts, subject in events:
-                if ts <= cutoff:
-                    continue
-                commits += 1
-                if ts > latest_ts:
-                    latest_ts, latest = ts, subject
+            for c_idx, ts, subject in events:
+                if sha_idx is not None:
+                    # Newest-first ordering: a lower index is a later commit.
+                    if c_idx >= sha_idx:
+                        continue
+                    commits += 1
+                    if c_idx < latest_idx:
+                        latest_idx, latest = c_idx, subject
+                else:
+                    if ts <= cutoff:
+                        continue
+                    commits += 1
+                    if ts > latest_ts:
+                        latest_ts, latest = ts, subject
         abs_scope = os.path.join(root, scope_norm.replace("/", os.sep))
         report[e.get("id")] = {
             "scope": scope_norm,
             "enforced_by": (e.get("enforced_by") or "").strip(),
             "scope_exists": os.path.exists(abs_scope),
             "verified_at": _entry_time(e),
+            # Which boundary actually decided this count, so a reader can tell
+            # an exact answer from a best-effort one. An entry recorded before
+            # SHA stamping, or one whose commit has been rebased away, falls
+            # back to the timestamp and says so rather than pretending.
+            "verified_against": "sha" if sha_idx is not None else "timestamp",
+            "verified_sha": sha,
             "commits_since_verified": commits,
             "last_change": latest,
         }

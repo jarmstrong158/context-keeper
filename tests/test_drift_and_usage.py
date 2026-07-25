@@ -337,3 +337,85 @@ class TestPerEntryCutoff:
         assert report["dec-all"]["commits_since_verified"] == 3
         assert report["dec-mid"]["commits_since_verified"] == 2
         assert report["dec-mid"]["last_change"] == "three"
+
+
+class TestVerifyAgainstSha:
+    """A timestamp is a soft boundary. Clock skew between machines, a rebase,
+    or an amended commit all move it — and a store that syncs between a desktop
+    and a phone has two clocks. A SHA names an exact point in history.
+
+    The fallback matters as much as the feature: an entry recorded before SHA
+    stamping, or one whose commit has been rebased away, must degrade to the
+    timestamp and SAY so rather than silently reporting a different basis.
+    """
+
+    def _sha(self, root):
+        return git(["rev-parse", "HEAD"], root).stdout.strip()
+
+    def test_counts_from_the_sha_not_the_clock(self, tmp_path):
+        make_repo(tmp_path)
+        commit(tmp_path, "a.py", "x = 1\n", "one")
+        sha = self._sha(tmp_path)
+        commit(tmp_path, "a.py", "x = 2\n", "two")
+        commit(tmp_path, "a.py", "x = 3\n", "three")
+
+        # verified_at deliberately lies (far in the past). The SHA must win.
+        e = entry("dec-1", "a.py", PAST, verified_sha=sha)
+        d = code_drift.scan([e], str(tmp_path))["dec-1"]
+        assert d["verified_against"] == "sha"
+        assert d["commits_since_verified"] == 2, "timestamp leaked into the count"
+        assert d["last_change"] == "three"
+
+    def test_a_future_timestamp_cannot_hide_real_drift(self, tmp_path):
+        """The inverse: a clock running ahead would zero the count under the
+        timestamp path. The SHA is immune."""
+        make_repo(tmp_path)
+        commit(tmp_path, "a.py", "x = 1\n", "one")
+        sha = self._sha(tmp_path)
+        commit(tmp_path, "a.py", "x = 2\n", "two")
+        e = entry("dec-1", "a.py", "2099-01-01T00:00:00+00:00", verified_sha=sha)
+        d = code_drift.scan([e], str(tmp_path))["dec-1"]
+        assert d["commits_since_verified"] == 1
+
+    def test_verifying_at_head_clears_drift(self, tmp_path):
+        make_repo(tmp_path)
+        commit(tmp_path, "a.py", "x = 1\n", "one")
+        commit(tmp_path, "a.py", "x = 2\n", "two")
+        e = entry("dec-1", "a.py", PAST, verified_sha=self._sha(tmp_path))
+        d = code_drift.scan([e], str(tmp_path))["dec-1"]
+        assert d["commits_since_verified"] == 0
+        assert code_drift.issues_for(d) == []
+
+    def test_unknown_sha_falls_back_to_the_timestamp(self, tmp_path):
+        """A rebase or amend can erase the commit an entry was verified at.
+        That must degrade, not crash or silently report zero."""
+        make_repo(tmp_path)
+        commit(tmp_path, "a.py", "x = 1\n", "one")
+        e = entry("dec-1", "a.py", PAST, verified_sha="0" * 40)
+        d = code_drift.scan([e], str(tmp_path))["dec-1"]
+        assert d["verified_against"] == "timestamp"
+        assert d["commits_since_verified"] == 1
+
+    def test_entries_without_a_sha_still_work(self, tmp_path):
+        """Everything recorded before this feature has no verified_sha."""
+        make_repo(tmp_path)
+        commit(tmp_path, "a.py", "x = 1\n", "one")
+        d = code_drift.scan([entry("dec-1", "a.py", PAST)], str(tmp_path))["dec-1"]
+        assert d["verified_against"] == "timestamp"
+        assert d["commits_since_verified"] == 1
+
+    def test_head_sha_is_empty_outside_a_repo(self, tmp_path):
+        assert code_drift.head_sha(str(tmp_path)) == ""
+
+    def test_recording_stamps_the_current_head(self, tmp_path):
+        """The write paths stamp it server-side, so it is an observation about
+        the machine doing the write rather than something a caller asserts."""
+        from server import handle_record_entry
+        make_repo(tmp_path)
+        commit(tmp_path, "a.py", "x = 1\n", "one")
+        (tmp_path / ".context").mkdir(exist_ok=True)
+        r = handle_record_entry({
+            "project_dir": str(tmp_path), "kind": "constraint",
+            "rule": "R" * 40, "reason": "R" * 80, "scope": "a.py",
+        })
+        assert r["entry"]["verified_sha"] == self._sha(tmp_path)
