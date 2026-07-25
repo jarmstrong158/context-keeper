@@ -296,3 +296,44 @@ class TestCommitCapture:
         """con-001: Windows hook stdout is cp1252 and non-ASCII raises."""
         ctx = ccr.build_context('git commit -m "Chose git-as-CAS instead of a lock server"')
         ctx.encode("ascii")
+
+
+class TestPerEntryCutoff:
+    """The git window is bounded by the oldest entry in the store, so every
+    commit must be re-filtered against each entry's own verification time.
+
+    Without that, verifying an entry does nothing: it keeps reporting the
+    oldest entry's drift however recently it was checked. That bug shipped and
+    was caught by refreshing a real entry and watching the flag refuse to clear.
+    """
+
+    def test_verifying_an_entry_clears_its_drift(self, tmp_path):
+        make_repo(tmp_path)
+        commit(tmp_path, "watched.py", "x = 1\n", "first")
+        old = entry("dec-old", "other.py", PAST)  # holds the window wide open
+        commit(tmp_path, "other.py", "y = 1\n", "touch other")
+        fresh = entry("dec-fresh", "watched.py", "2099-01-01T00:00:00+00:00")
+
+        report = code_drift.scan([old, fresh], str(tmp_path))
+        assert report["dec-old"]["commits_since_verified"] > 0
+        assert report["dec-fresh"]["commits_since_verified"] == 0, \
+            "a freshly verified entry inherited the oldest entry's window"
+
+    def test_each_entry_counts_only_commits_after_its_own_check(self, tmp_path):
+        import time as _t
+        from datetime import datetime, timezone
+        make_repo(tmp_path)
+        commit(tmp_path, "shared.py", "a = 1\n", "one")
+        _t.sleep(1.1)  # git timestamps are whole seconds
+        midpoint = datetime.now(timezone.utc).isoformat()
+        _t.sleep(1.1)
+        commit(tmp_path, "shared.py", "a = 2\n", "two")
+        commit(tmp_path, "shared.py", "a = 3\n", "three")
+
+        report = code_drift.scan([
+            entry("dec-all", "shared.py", PAST),
+            entry("dec-mid", "shared.py", midpoint),
+        ], str(tmp_path))
+        assert report["dec-all"]["commits_since_verified"] == 3
+        assert report["dec-mid"]["commits_since_verified"] == 2
+        assert report["dec-mid"]["last_change"] == "three"

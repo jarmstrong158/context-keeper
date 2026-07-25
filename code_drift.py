@@ -80,31 +80,38 @@ def _norm(path):
 
 
 def changed_paths_since(root, since_iso):
-    """{normalised path: (commit_count, latest_subject)} for commits after `since_iso`.
+    """{normalised path: [(unix_ts, subject), ...]} for commits after `since_iso`.
 
     One `git log` for the whole store rather than one per entry: a store with 40
-    scoped entries would otherwise pay 40 process spawns per quality scan.
+    scoped entries would otherwise pay 40 process spawns per quality scan. The
+    window is bounded by the OLDEST entry, so each commit carries its timestamp
+    and callers filter down to their own entry's verification time — without
+    that, every entry inherits the oldest entry's window and a freshly verified
+    entry keeps reporting drift it has already been checked against.
     """
     out = _git([
         "log", f"--since={since_iso}", "--name-only", "--no-merges",
-        f"--max-count={MAX_COMMITS}", "--pretty=format:\x01%s",
+        f"--max-count={MAX_COMMITS}", "--pretty=format:\x01%ct\x02%s",
     ], root, timeout=30)
     if out is None:
         return None
 
     changes = {}
-    subject = ""
+    ts, subject = 0, ""
     for line in out.splitlines():
         if line.startswith("\x01"):
-            subject = line[1:].strip()
+            head = line[1:]
+            raw_ts, _, subject = head.partition("\x02")
+            try:
+                ts = int(raw_ts)
+            except ValueError:
+                ts = 0
+            subject = subject.strip()
             continue
         p = _norm(line)
         if not p:
             continue
-        count, first_subject = changes.get(p, (0, subject))
-        # git log is newest-first, so the first subject seen for a path is the
-        # most recent one that touched it.
-        changes[p] = (count + 1, first_subject)
+        changes.setdefault(p, []).append((ts, subject))
     return changes
 
 
@@ -151,12 +158,22 @@ def scan(entries, base_dir, root=None):
 
     report = {}
     for e, scope_norm, t in scoped:
-        # A per-entry log would be exact about *when*; this shared window is
-        # bounded by the oldest entry, so re-filter per entry by asking git
-        # only about the paths that actually moved.
-        hits = [(p, v) for p, v in changed.items() if _touches(scope_norm, p)]
-        commits = sum(c for _, (c, _) in hits)
-        latest = hits[0][1][1] if hits else ""
+        # The git window is bounded by the OLDEST entry in the store, so every
+        # commit must be re-filtered against THIS entry's verification time.
+        # Skipping that step makes verifying an entry do nothing: it keeps
+        # reporting the oldest entry's drift no matter how recently it was
+        # checked, which defeats the whole point of the flag.
+        cutoff = t.timestamp()
+        commits, latest, latest_ts = 0, "", -1
+        for p, events in changed.items():
+            if not _touches(scope_norm, p):
+                continue
+            for ts, subject in events:
+                if ts <= cutoff:
+                    continue
+                commits += 1
+                if ts > latest_ts:
+                    latest_ts, latest = ts, subject
         abs_scope = os.path.join(root, scope_norm.replace("/", os.sep))
         report[e.get("id")] = {
             "scope": scope_norm,
