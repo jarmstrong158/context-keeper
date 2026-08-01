@@ -2918,6 +2918,178 @@ def _verified_sha(base_dir):
         return ""
 
 
+# ============================================================
+# Mojibake detection and repair
+#
+# con-008-dc30 stopped the CAUSE: stdin defaulted to cp1252 on Windows, so a
+# client's raw UTF-8 bytes were mis-decoded before json.loads ever ran, and an
+# em-dash landed in the store as three characters. Forcing UTF-8 on the stdio
+# transport means no new entry is corrupted.
+#
+# It did nothing for entries already written. A fix that stops the bleeding
+# and leaves the wound is half a fix, and the damage is invisible in exactly
+# the place it matters: the text is still readable enough that nobody
+# re-reads it, so a corrupted rationale just quietly degrades every future
+# retrieval that surfaces it.
+# ============================================================
+
+# Sequences that only occur when UTF-8 bytes were decoded as cp1252. Requiring
+# one of these before attempting a repair keeps the round-trip check below
+# from "fixing" text that merely happens to survive the transform.
+_MOJIBAKE_MARKERS = (
+    "â€",      # â€  - the em/en-dash and smart-quote family
+    "Ã©",      # Ã©  - accented latin
+    "Ã¨",      # Ã¨
+    "Ã¼",      # Ã¼
+    "Ã±",      # Ã±
+    "â",      # â„  - trademark/numero
+    "â",      # â ˆ - maths
+    "Â ",      # Â   - non-breaking space
+    "Â·",      # Â·
+)
+
+
+def looks_like_mojibake(text):
+    """Cheap pre-filter: does this string carry a known misdecode signature?"""
+    return isinstance(text, str) and any(m in text for m in _MOJIBAKE_MARKERS)
+
+
+def demojibake(text):
+    """Repair cp1252-misdecoded UTF-8, or return None if that isn't what this is.
+
+    The repair is the exact inverse of the corruption, so it is verified as
+    one: re-applying the corruption to the candidate must reproduce the
+    input byte for byte. Anything that fails that check is left alone —
+    a partial or approximate repair of someone's recorded reasoning is
+    worse than leaving it legibly broken, because it looks fixed.
+    """
+    if not looks_like_mojibake(text):
+        return None
+    try:
+        repaired = text.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    if repaired == text:
+        return None
+    try:
+        if repaired.encode("utf-8").decode("cp1252") != text:
+            return None
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    return repaired
+
+
+# Entry fields that hold prose and are therefore worth repairing. Ids, tags
+# and timestamps are excluded: they are machine-facing, and rewriting an id
+# would break every related_to pointing at it.
+_MOJIBAKE_FIELDS = (
+    "summary", "problem", "why_chosen", "what_we_tried", "tradeoffs",
+    "rationale", "rule", "reason", "triggering_incident", "purpose",
+    "when_to_invoke", "name", "deprecated_reason",
+)
+
+
+def _entry_mojibake_fields(entry):
+    """Names of this entry's fields that carry repairable mojibake."""
+    hits = []
+    for field in _MOJIBAKE_FIELDS:
+        if demojibake(entry.get(field)) is not None:
+            hits.append(field)
+    for i, alt in enumerate(entry.get("alternatives") or []):
+        if not isinstance(alt, dict):
+            continue
+        for key in ("option", "reason_rejected"):
+            if demojibake(alt.get(key)) is not None:
+                hits.append(f"alternatives[{i}].{key}")
+    return hits
+
+
+def _repair_entry_mojibake(entry):
+    """Repair in place. Returns the list of field names changed."""
+    changed = []
+    for field in _MOJIBAKE_FIELDS:
+        fixed = demojibake(entry.get(field))
+        if fixed is not None:
+            entry[field] = fixed
+            changed.append(field)
+    for i, alt in enumerate(entry.get("alternatives") or []):
+        if not isinstance(alt, dict):
+            continue
+        for key in ("option", "reason_rejected"):
+            fixed = demojibake(alt.get(key))
+            if fixed is not None:
+                alt[key] = fixed
+                changed.append(f"alternatives[{i}].{key}")
+    return changed
+
+
+def handle_repair_mojibake(params):
+    """Repair cp1252-misdecoded UTF-8 across a store. Dry run by default.
+
+    Deliberately NOT in TOOLS (con-004): a one-time migration for stores
+    written before con-008-dc30, reachable from the CLI. Pass
+    {"apply": true} to write; the default reports what it would change and
+    touches nothing.
+
+    `verified_at` is deliberately NOT refreshed. Fixing an encoding is not
+    a claim that anyone re-confirmed the entry is still true, and quietly
+    resetting the staleness clock would erase exactly the signal
+    prune_stale and the drift check exist to raise. `updated_at` IS bumped,
+    so the corrected copy wins the mirror's newest-wins merge and the
+    repair propagates instead of being overwritten by a corrupt remote.
+    """
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    if not os.path.exists(base_dir):
+        return {"error": "No context directory found."}
+
+    apply_changes = bool(params.get("apply"))
+    report = []
+    repaired_entries = []
+    for type_name, path in _resolve_paths(base_dir).items():
+        entries, load_err = _load_entries_for_write(path)
+        if load_err is not None:
+            return load_err
+        dirty = False
+        for entry in entries:
+            fields = _entry_mojibake_fields(entry)
+            if not fields:
+                continue
+            report.append({
+                "id": entry.get("id"),
+                "type": type_name,
+                "fields": fields,
+                "preview": (demojibake(entry.get(fields[0])) or "")[:120],
+            })
+            if apply_changes:
+                _repair_entry_mojibake(entry)
+                entry["updated_at"] = now_iso()
+                repaired_entries.append((entry, type_name))
+                dirty = True
+        if dirty:
+            write_json_file(path, entries)
+            _maybe_export_projections(base_dir, type_name)
+
+    for entry, type_name in repaired_entries:
+        _mirror_out(entry, type_name, base_dir)
+
+    return {
+        "success": True,
+        "applied": apply_changes,
+        "entries_affected": len(report),
+        "fields_affected": sum(len(r["fields"]) for r in report),
+        "details": report,
+        "note": (
+            "Dry run: nothing was written. Re-run with {\"apply\": true} to "
+            "repair." if not apply_changes else
+            "Repaired in place. verified_at was left alone on purpose -- an "
+            "encoding fix is not a re-verification -- while updated_at was "
+            "bumped so the corrected copy wins the mirror merge."
+        ),
+    }
+
+
 def handle_verify_quality(params):
     """Scan entries for quality issues and return a flagged list.
 
@@ -3045,6 +3217,23 @@ def handle_verify_quality(params):
         # Carried into every session and never actually sought.
         if usage is not None:
             issues.extend(usage.issues_for(usage.stats_for(base_dir, eid, usage_data)))
+
+        # Text corrupted before con-008-dc30 forced UTF-8 on the transport.
+        # The store has to be able to report this itself: the damage is
+        # legible enough that nobody re-reads the entry, so it degrades
+        # every retrieval that surfaces it without ever announcing itself.
+        garbled = _entry_mojibake_fields(e)
+        if garbled:
+            issues.append({
+                "type": "mojibake",
+                "detail": (
+                    f"{len(garbled)} field(s) carry cp1252-misdecoded UTF-8 "
+                    f"({', '.join(garbled[:4])}). Written before the transport "
+                    "was forced to UTF-8 (con-008). Repair with the "
+                    "repair_mojibake handler: "
+                    "context-keeper repair_mojibake '{\"apply\": true}'"
+                ),
+            })
 
         if issues:
             flagged.append({
@@ -3366,6 +3555,9 @@ HANDLERS = {
     # Hidden by design (never in tools/list): a one-time backfill the CLI
     # runs when adopting the rules projection. See handle_export_rules.
     "export_rules": handle_export_rules,
+    # Hidden by design: a one-time migration for stores written before
+    # con-008-dc30. verify_quality flags the damage; this repairs it.
+    "repair_mojibake": handle_repair_mojibake,
 }
 
 # ============================================================

@@ -171,6 +171,34 @@ its mechanics context-keeper was leaving on the table.
   the prompt cache. Anthropic's auto-memory index errors rather than silently
   dropping content past its read limit; same principle.
 
+- **The store can now report — and repair — its own encoding damage.**
+  `con-008` fixed the *cause* of mojibake in v0.11: stdin defaulted to cp1252
+  on Windows, so a client's raw UTF-8 bytes were mis-decoded before
+  `json.loads` ever ran and an em-dash landed in the store as `â€"`. Forcing
+  UTF-8 on the transport meant no new entry was corrupted. It did nothing for
+  entries already written, and nothing ever looked.
+
+  That damage is invisible in the worst possible way: the text stays legible
+  enough that nobody re-reads the entry, so a corrupted rationale quietly
+  degrades every retrieval that surfaces it. `verify_quality` now flags it as
+  `mojibake`, and a `repair_mojibake` handler fixes it:
+
+  ```bash
+  context-keeper repair_mojibake '{}'                # dry run, writes nothing
+  context-keeper repair_mojibake '{"apply": true}'   # repair
+  ```
+
+  The repair is the exact inverse of the corruption and is **verified as
+  one** — re-applying the corruption to the candidate must reproduce the
+  input byte for byte, and anything failing that check is left alone. A
+  partial repair of someone's recorded reasoning is worse than legible
+  damage, because it looks fixed. `verified_at` is deliberately not
+  refreshed: an encoding fix is not a claim that anyone re-confirmed the
+  entry is still true, and resetting the staleness clock would erase the
+  signal `prune_stale` and the drift check exist to raise. `updated_at` *is*
+  bumped, so the corrected copy wins the mirror's newest-wins merge rather
+  than being overwritten by a corrupt remote.
+
 Enable the projection in `.context/config.json` and backfill once:
 
 ```json
