@@ -4655,10 +4655,22 @@ class TestGlobalScopeFlag:
         return [i["type"] for i in (entry or {}).get("issues", [])]
 
     def test_flagged_when_enforced_by_names_a_real_file(self, tmp_path):
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_thing.py").write_text("x = 1", encoding="utf-8")
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="global",
+            enforced_by="tests/test_thing.py::TestThing::test_case"))
+        assert "global_scope" in self._issues(tmp_path, rec["id"])
+
+    def test_traversal_in_enforced_by_is_not_suggested(self, tmp_path):
+        """A `..` component cannot become a repo-relative glob, and it would
+        let a scope reach outside the project. Windows os.path.exists
+        normalizes such a path and reports True even when a component is
+        missing, so this only failed on POSIX -- caught by CI, not locally."""
         (tmp_path / "server.py").write_text("x = 1", encoding="utf-8")
         rec = handle_record_constraint(constraint_params(
             tmp_path, scope="global", enforced_by="tests/../server.py::TestThing"))
-        assert "global_scope" in self._issues(tmp_path, rec["id"])
+        assert "global_scope" not in self._issues(tmp_path, rec["id"])
 
     def test_flagged_when_a_tag_names_a_real_directory(self, tmp_path):
         (tmp_path / "hooks").mkdir()

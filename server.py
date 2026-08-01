@@ -1487,6 +1487,12 @@ def _scope_to_paths(scope):
         return []
     if any(ch in _GLOB_META or ch in _YAML_UNSAFE or ord(ch) < 32 for ch in s):
         return []
+    # A `..` component cannot become a meaningful glob -- the harness matches
+    # patterns against repo-relative paths, which never contain one -- and it
+    # would let a scope reach outside the project. Caught here because this is
+    # the single chokepoint every scope passes through on its way to a pattern.
+    if ".." in s.split("/"):
+        return []
     s = s.strip("/")
     if not s:
         return []
