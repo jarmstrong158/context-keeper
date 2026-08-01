@@ -39,6 +39,8 @@ Both halves must work for the system to be useful. Retrieval without capture mea
 
 **This does not reach subagents.** SessionStart does not fire for them and they do not inherit the parent's injected context, so a subagent begins with no project memory. When dispatching one for non-trivial work, either put the relevant constraints in its prompt or tell it to call `get_project_summary` first.
 
+**Surfaces 1 and 3 are on the critical path — treat their cost as a budget.** A PreToolUse hook runs before the tool does, so every millisecond it spends delays every Edit and Write in every project. `hooks/scope_guard.py` must import `store_paths` (json + os only), never `server` — importing `server` pulls `mirror` → `urllib.request` → `http.client` → `email.parser` plus `secrets`/`usage`/`code_drift`, roughly doubling the hook's runtime for machinery it never touches. `TestEditPathHookCost` in `tests/test_server.py` is the authority on this and fails if either property is broken. The same rule applies to any hook added on Pre/PostToolUse later. Wire edit-path hooks with a `timeout` — nothing else bounds a hook that hangs.
+
 ## When to Record
 
 ### Record a Decision when:

@@ -47,6 +47,13 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+# store_paths, NOT server. This hook runs before every Edit/Write, so its
+# cost is paid on the critical path of each one; importing server would add
+# ~73ms per edit for machinery this hook never touches (mirror's urllib
+# stack, the semantic index, drift scanning). store_paths carries the
+# resolution rules and the raw reads, and imports only json and os.
+import store_paths
+
 MAX_INJECT = 3
 
 # Events this hook knows how to answer. Anything else (or a payload with no
@@ -73,14 +80,16 @@ def _load_state(path):
         return {}
 
 
-def _confirm_absolute_enabled():
-    """Read the opt-in escalation flag; any problem reading it means off."""
-    try:
-        import server
-        cfg = server.read_config(server.CONTEXT_DIR)
-        return bool((cfg.get("scope_guard") or {}).get("confirm_absolute"))
-    except Exception:
-        return False
+def _confirm_absolute_enabled(context_dir):
+    """Read the opt-in escalation flag; any problem reading it means off.
+
+    Reads the config raw, with no defaults merged, which is safe here
+    precisely because the default is False: a missing file, a missing key
+    and an explicit false are all the same answer, so there is no default
+    to drift away from.
+    """
+    return bool((store_paths.read_raw_config(context_dir).get("scope_guard")
+                 or {}).get("confirm_absolute"))
 
 
 def _save_state(path, state):
@@ -108,14 +117,15 @@ def main():
     if not file_path:
         return
 
-    try:
-        import server
-    except Exception:
-        return
-    if server.CONSTRAINTS_PATH is None:
+    context_dir = store_paths.resolve_context_dir()
+    if context_dir is None:
         return
 
-    constraints = server.read_json_file(server.CONSTRAINTS_PATH)
+    constraints = store_paths.read_json_file(
+        store_paths.constraints_path(context_dir))
+    if not constraints:
+        return
+
     path_norm = _norm(file_path)
     hits = []
     for c in constraints:
@@ -131,7 +141,7 @@ def main():
 
     # Once-per-session dedupe, keyed to the session id from the payload.
     session_id = str(payload.get("session_id") or "unknown")
-    state_path = os.path.join(server.CONTEXT_DIR, "scope_guard_state.json")
+    state_path = os.path.join(context_dir, "scope_guard_state.json")
     state = _load_state(state_path)
     if state.get("session_id") != session_id:
         state = {"session_id": session_id, "injected": []}
@@ -173,7 +183,7 @@ def main():
     # would be theatre.
     if event == "PreToolUse":
         absolutes = [c for c in fresh if c.get("hardness", "absolute") == "absolute"]
-        if absolutes and _confirm_absolute_enabled():
+        if absolutes and _confirm_absolute_enabled(context_dir):
             ids = ", ".join(str(c.get("id")) for c in absolutes)
             out["permissionDecision"] = "ask"
             out["permissionDecisionReason"] = _ascii(

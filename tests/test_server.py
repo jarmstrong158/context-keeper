@@ -4004,3 +4004,89 @@ class TestScopeGuardPreToolUse:
         out = _run_scope_guard(
             tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
         out.encode("ascii")  # raises if the hook emitted anything non-ASCII
+
+
+# ===========================================================================
+# Edit-path latency: what a PreToolUse hook is allowed to cost
+#
+# PostToolUse ran after the tool, so its cost trailed the edit. PreToolUse
+# runs BEFORE it, which puts every millisecond on the critical path of every
+# Edit and Write in every project. Importing server cost ~73ms of machinery
+# this hook never touches (mirror's urllib.request -> http.client ->
+# email.parser stack, secrets, usage, code_drift) and took a hook run to
+# ~142ms; going through store_paths instead put it at ~69ms against a ~62ms
+# bare-interpreter floor.
+#
+# These tests defend the PROPERTY, not the measurement: a hook on the edit
+# path must not import the heavy module. Timing assertions would be flaky on
+# shared CI; "did this module get imported" is exact.
+# ===========================================================================
+
+_EDIT_PATH_HOOKS = ["scope_guard.py"]
+
+
+def _modules_after_running_hook(hook_name, payload):
+    """Run a hook in a fresh interpreter; report whether it imported server."""
+    repo = str(Path(__file__).parent.parent)
+    hook = str(Path(repo) / "hooks" / hook_name)
+    probe = (
+        "import sys, io, json, runpy\n"
+        f"sys.path.insert(0, {repo!r})\n"
+        f"sys.stdin = io.StringIO({payload!r})\n"
+        "try:\n"
+        f"    runpy.run_path({hook!r}, run_name='__main__')\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "sys.stderr.write('server' in sys.modules and 'HEAVY' or 'LIGHT')\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                          text=True, timeout=60)
+    return proc.stderr.strip()[-5:]
+
+
+class TestEditPathHookCost:
+    def test_scope_guard_does_not_import_server(self, tmp_path):
+        """server costs ~73ms to import and this hook needs none of it.
+        store_paths carries the resolution rules and the raw reads. If this
+        fails, someone reached for `import server` and doubled the latency of
+        every edit in every project."""
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        payload = json.dumps({
+            "session_id": "cost-probe",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(tmp_path / "hooks" / "a.py")},
+        })
+        env_before = os.environ.get("CONTEXT_KEEPER_PROJECT")
+        os.environ["CONTEXT_KEEPER_PROJECT"] = str(tmp_path)
+        try:
+            verdict = _modules_after_running_hook("scope_guard.py", payload)
+        finally:
+            if env_before is None:
+                os.environ.pop("CONTEXT_KEEPER_PROJECT", None)
+            else:
+                os.environ["CONTEXT_KEEPER_PROJECT"] = env_before
+        assert verdict == "LIGHT", (
+            "hooks/scope_guard.py imported server. It runs before every Edit "
+            "and Write; use store_paths for project resolution and raw reads.")
+
+    def test_store_paths_imports_nothing_expensive(self):
+        """store_paths is the cheap half by construction. Anything it imports
+        is paid on every edit, so the allowlist is stdlib essentials only."""
+        source = (Path(__file__).parent.parent / "store_paths.py").read_text(
+            encoding="utf-8")
+        imported = set(re.findall(r"^import (\w+)", source, re.M))
+        imported |= set(re.findall(r"^from (\w+) import", source, re.M))
+        assert imported <= {"json", "os"}, (
+            f"store_paths imports {sorted(imported - {'json', 'os'})}. It is on "
+            "the edit-path critical section; keep it to json and os.")
+
+    def test_resolution_logic_has_exactly_one_implementation(self):
+        """The hook and the server must agree on which project they are
+        looking at. Two copies of the precedence order (env > Xylem pointer >
+        cwd > parent walk) would drift, and the copy that drifts is the one
+        nothing executes."""
+        import server as srv
+        import store_paths
+        assert srv._resolve_project_dir is store_paths._resolve_project_dir
+        assert srv.CONTEXT_DIR_NAME is store_paths.CONTEXT_DIR_NAME

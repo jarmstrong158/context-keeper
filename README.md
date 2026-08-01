@@ -124,6 +124,28 @@ its mechanics context-keeper was leaving on the table.
   this escalates on **scope, not on violation** — nothing here reads the diff,
   so it cannot know the edit actually breaks the rule.
 
+- **The edit path got a latency budget it can't quietly lose.** Moving to
+  PreToolUse means the hook runs *before* the tool, so its cost lands on the
+  critical path of every Edit and Write rather than trailing them. Measured on
+  Windows, the hook cost **~142ms**, of which **~73ms was `import server`** —
+  `mirror` pulling in `urllib.request` → `http.client` → `email.parser`, plus
+  `secrets`, `usage`, `code_drift`, none of which this hook touches. Worse, a
+  path matching *no* constraint paid the same 142ms as a hit, and that is most
+  edits.
+
+  Store location and raw reads now live in `store_paths.py`, which imports
+  `json` and `os` and nothing else. `server.py` imports its resolution from
+  there rather than defining its own, so the precedence order (env var → Xylem
+  pointer → cwd → parent walk) has exactly one implementation — a second copy
+  would drift, and the copy that drifts is the one nothing executes.
+
+  **~142ms → ~69ms**, against a ~62ms bare-interpreter floor. The remainder is
+  Python process startup, which a shell hook cannot avoid. `TestEditPathHookCost`
+  now fails if an edit-path hook imports `server` again, or if `store_paths`
+  grows an import beyond `json`/`os` — the property is pinned, not just fixed.
+  Wire the hook with `"timeout": 5` (shown below) to bound the pathological
+  case; nothing else caps a hook that hangs.
+
 - **Over-budget summaries are now floored and reported.** Truncating the
   session-start summary popped lines from the end, and with a small enough
   budget it walked straight through the constraints block and emptied the
@@ -562,7 +584,8 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "python /path/to/context-keeper/hooks/scope_guard.py"
+            "command": "python /path/to/context-keeper/hooks/scope_guard.py",
+            "timeout": 5
           }
         ]
       }

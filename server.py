@@ -45,80 +45,40 @@ except Exception:  # never let a mirror import problem break the server
 # them together or that test fails the build.
 __version__ = "0.16.0"
 
-CONTEXT_DIR_NAME = ".context"
+# Store location and raw reads live in store_paths so the hooks can have them
+# without paying for this module's imports (~73ms, mostly mirror -> urllib).
+# Re-exported here because every existing caller and test refers to them
+# through server. One implementation, two import costs.
+from store_paths import (  # noqa: E402
+    CONTEXT_DIR_NAME,
+    _read_json_file_checked,
+    _resolve_project_dir,
+    _xylem_active_project_file,
+    _xylem_session_project,
+)
+
+
+def read_json_file(path):
+    """Soft read for retrieval paths: missing or corrupt both yield [].
+
+    Write paths must use _load_entries_for_write instead — silently
+    treating a corrupt store as empty turns the next append into a
+    full-history wipe.
+
+    Deliberately a wrapper here rather than an import of store_paths'
+    identical function: every read server makes must pass through THIS
+    module's _read_json_file_checked, so patching that one symbol still
+    intercepts all of them. TestStaleIndexWrites simulates a concurrent
+    edit by counting reads through it, and an import would have routed
+    half of them past the patch point.
+    """
+    entries, _err = _read_json_file_checked(path)
+    return entries
 
 # Where the scoped-constraint rules projection writes. A subdirectory of
 # .claude/rules/ rather than the directory itself, so regeneration can retire
 # its own stale files without ever considering a hand-written rule.
 RULES_DIR_DEFAULT = os.path.join(".claude", "rules", "context-keeper")
-
-
-def _xylem_active_project_file():
-    """Path to the shared Xylem session pointer (overridable for tests)."""
-    override = os.environ.get("XYLEM_ACTIVE_PROJECT_FILE")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    return os.path.join(os.path.expanduser("~"), ".xylem", "active_project.json")
-
-
-def _xylem_session_project():
-    """The session's project path from the shared Xylem pointer the SessionStart
-    hook writes, or None. Never raises — a missing/garbage pointer is just 'no
-    session hint'."""
-    try:
-        with open(_xylem_active_project_file(), encoding="utf-8") as f:
-            proj = json.load(f).get("project")
-    except (OSError, ValueError, AttributeError):
-        return None
-    return proj if isinstance(proj, str) and os.path.isdir(proj) else None
-
-
-def _resolve_project_dir():
-    """Resolve the project directory with a safe cwd fallback.
-
-    Order of precedence:
-      1. CONTEXT_KEEPER_PROJECT env var, if set (trusted — user opted in)
-      2. The Xylem session pointer (~/.xylem/active_project.json, override
-         with XYLEM_ACTIVE_PROJECT_FILE) written by the SessionStart hook.
-         Also an explicit opt-in — it exists so a persistent server follows
-         the session's project instead of the dir it was launched from — so
-         it outranks the cwd-based discovery below.
-      3. cwd, ONLY if it already contains a .context/ directory
-      4. Walk parent dirs from cwd, returning the first ancestor that
-         already contains a .context/ directory (git-style discovery)
-      5. None — refuse to default, callers must pass project_dir explicitly
-
-    Steps 3 and 4 only resolve to directories that ALREADY contain
-    .context/. We never create one implicitly, so the footgun where
-    Claude Code is launched from a parent directory and context-keeper
-    silently pollutes it stays fixed. The upward walk just lets the
-    server find your project when launched from a subdirectory of it.
-    """
-    explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
-    if explicit:
-        return explicit
-    # The Xylem SessionStart hook records which project this session is in; honor
-    # it like CONTEXT_KEEPER_PROJECT (an explicit opt-in) so a persistent server
-    # follows the session's project instead of the dir it was launched from.
-    session = _xylem_session_project()
-    if session:
-        return session
-    cwd = os.getcwd()
-    if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
-        return cwd
-    # Walk up the parent chain looking for an existing .context/ dir.
-    # Stops at the filesystem root (parent == current). Bounded iteration
-    # for safety in case a pathological FS confuses os.path.dirname.
-    current = cwd
-    for _ in range(64):
-        parent = os.path.dirname(current)
-        if not parent or parent == current:
-            break
-        if os.path.isdir(os.path.join(parent, CONTEXT_DIR_NAME)):
-            return parent
-        current = parent
-    return None
-
 
 PROJECT_DIR = _resolve_project_dir()
 CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME) if PROJECT_DIR else None
@@ -595,38 +555,6 @@ TOOLS = [
 
 def ensure_context_dir(path=None):
     os.makedirs(path or CONTEXT_DIR, exist_ok=True)
-
-
-def _read_json_file_checked(path):
-    """Read a JSON entry file, distinguishing missing from corrupt.
-
-    Returns (entries, error). A missing file is ([], None) — a fresh
-    store. A file that exists but cannot be parsed
-    (or isn't a list) returns ([], "<description>") so write paths can
-    refuse instead of silently treating the store as empty and wiping
-    history on the next write.
-    """
-    if not os.path.exists(path):
-        return [], None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        return [], f"unparseable JSON ({e})"
-    if not isinstance(data, list):
-        return [], "top-level value is not a JSON list"
-    return data, None
-
-
-def read_json_file(path):
-    """Soft read for retrieval paths: missing or corrupt both yield [].
-
-    Write paths must use _load_entries_for_write instead — silently
-    treating a corrupt store as empty turns the next append into a
-    full-history wipe.
-    """
-    entries, _err = _read_json_file_checked(path)
-    return entries
 
 
 def _load_entries_for_write(path):
