@@ -71,6 +71,37 @@ def _norm(path):
     return str(path).replace("\\", "/").lower()
 
 
+def _scope_covers(scope, path):
+    """Does `scope` cover `path`? Matched on path COMPONENTS, not substring.
+
+    A raw `scope in path` check was wrong in a way that only looked
+    harmless while this hook ran after the edit: `src/` fired on
+    `mysrc/main.py`, `hooks/` on `webhooks/send.py`, and `server.py` on
+    `test_server.py`. On PreToolUse a false positive is worse than noise
+    -- it states an unrelated rule right before an unrelated edit, and the
+    once-per-session dedupe then BURNS that constraint, so the file it
+    really governs never gets it.
+
+    A scope whose last component has a dot is treated as a file and must
+    match the tail of the path exactly. Otherwise it is a directory and
+    its components must appear consecutively, as whole components, with
+    at least one component after them.
+    """
+    s = _norm(scope).strip("/")
+    if not s:
+        return False
+    parts = [p for p in _norm(path).split("/") if p]
+    s_parts = s.split("/")
+    if "." in s_parts[-1]:  # file scope: match the tail exactly
+        return parts[-len(s_parts):] == s_parts
+    # Directory scope: the run must be followed by at least one component,
+    # so a scope never matches the directory entry itself.
+    for i in range(len(parts) - len(s_parts)):
+        if parts[i:i + len(s_parts)] == s_parts:
+            return True
+    return False
+
+
 def _load_state(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -126,7 +157,6 @@ def main():
     if not constraints:
         return
 
-    path_norm = _norm(file_path)
     hits = []
     for c in constraints:
         if c.get("status", "active") == "deprecated":
@@ -134,7 +164,7 @@ def main():
         scope = (c.get("scope") or "global").strip()
         if not scope or scope.lower() == "global":
             continue
-        if _norm(scope) in path_norm:
+        if _scope_covers(scope, file_path):
             hits.append(c)
     if not hits:
         return

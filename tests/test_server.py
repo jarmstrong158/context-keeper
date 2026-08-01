@@ -4090,3 +4090,98 @@ class TestEditPathHookCost:
         import store_paths
         assert srv._resolve_project_dir is store_paths._resolve_project_dir
         assert srv.CONTEXT_DIR_NAME is store_paths.CONTEXT_DIR_NAME
+
+
+# ===========================================================================
+# Scope matching: components, not substrings
+#
+# `scope in path` fired a constraint scoped to `src/` on `mysrc/main.py`, and
+# one scoped to `server.py` on `test_server.py`. That was survivable while the
+# hook ran AFTER the edit. On PreToolUse it states an unrelated rule right
+# before an unrelated edit -- and the once-per-session dedupe then burns that
+# constraint, so the file it actually governs never receives it.
+# ===========================================================================
+
+_SCOPE_CASES = [
+    # (scope, path, covered?)
+    ("src/", "C:/proj/src/main.py", True),
+    ("src/", "C:/proj/mysrc/main.py", False),
+    ("src/", "C:/proj/src2/main.py", False),
+    ("hooks/", "C:/proj/hooks/a.py", True),
+    ("hooks/", "C:/proj/webhooks/send.py", False),
+    ("hooks/", "C:/proj/hooks/nested/deep.py", True),
+    ("server.py", "C:/proj/server.py", True),
+    ("server.py", "C:/proj/test_server.py", False),
+    ("server.py", "C:/proj/pkg/server.py", True),
+    ("tests/test_server.py", "C:/proj/tests/test_server.py", True),
+    ("tests/test_server.py", "C:/proj/tests/test_server.py.bak", False),
+    ("api/", "C:/proj/rapid/api2/x.py", False),
+    # A directory scope must not match the directory entry itself, only
+    # things inside it.
+    ("hooks/", "C:/proj/hooks", False),
+]
+
+
+class TestScopeCovers:
+    def _fn(self):
+        import importlib.util
+        path = Path(__file__).parent.parent / "hooks" / "scope_guard.py"
+        spec = importlib.util.spec_from_file_location("_sg_probe", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._scope_covers
+
+    @pytest.mark.parametrize("scope,path,expected", _SCOPE_CASES)
+    def test_scope_covers(self, scope, path, expected):
+        assert self._fn()(scope, path) is expected, f"{scope} vs {path}"
+
+    def test_backslash_paths_normalize(self):
+        """Windows hands the hook backslashes; scopes are recorded with
+        forward slashes."""
+        assert self._fn()("hooks/", r"C:\proj\hooks\a.py") is True
+        assert self._fn()("hooks/", r"C:\proj\webhooks\a.py") is False
+
+    def test_agrees_with_the_rules_projection_on_directory_scopes(self):
+        """The hook and the .claude/rules/ projection are two deliveries of
+        the same rule. If they disagree about which files a scope covers,
+        one of them is lying about coverage."""
+        from server import _scope_to_paths
+        covers = self._fn()
+        for scope in ("src/", "hooks/", "tests/"):
+            patterns = _scope_to_paths(scope)
+            assert patterns, scope
+            # The projection anchors on the scope's own components; so must
+            # the hook. A sibling directory merely ENDING in the scope name
+            # must be covered by neither.
+            sibling = f"C:/proj/my{scope.strip('/')}/file.py"
+            assert covers(scope, sibling) is False, sibling
+
+
+class TestScopeGuardFalsePositives:
+    """End-to-end: the constraint must not be spent on the wrong file."""
+
+    def test_sibling_directory_does_not_consume_the_constraint(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="hooks/", rule="Hook output must be ASCII only"))
+        # An edit to webhooks/ must NOT fire...
+        decoy = _run_scope_guard(
+            tmp_path, str(tmp_path / "webhooks" / "send.py"), "sess-fp",
+            event="PreToolUse")
+        assert decoy == ""
+        # ...and must therefore leave the constraint available for the file
+        # it actually governs, in the same session.
+        real = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-fp",
+            event="PreToolUse")
+        assert rec["id"] in real
+
+    def test_test_file_does_not_consume_a_source_file_constraint(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="server.py", rule="Keep the schema payload bounded"))
+        decoy = _run_scope_guard(
+            tmp_path, str(tmp_path / "test_server.py"), "sess-fp2",
+            event="PreToolUse")
+        assert decoy == ""
+        real = _run_scope_guard(
+            tmp_path, str(tmp_path / "server.py"), "sess-fp2", event="PreToolUse")
+        assert rec["id"] in real
