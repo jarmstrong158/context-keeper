@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "context-keeper-mcp"
-version = "0.15.0"
+version = "0.16.0"
 description = "MCP server that maintains project context (decisions, pipelines, constraints) across Claude conversations"
 readme = "README.md"
 license = "MIT"
@@ -52,6 +52,7 @@ context-keeper = "server:main"
 [tool.hatch.build.targets.sdist]
 include = [
     "server.py",
+    "store_paths.py",
     "mirror.py",
     "semantic_index.py",
     "code_drift.py",
@@ -70,6 +71,7 @@ include = [
 
 [tool.hatch.build.targets.wheel.force-include]
 "server.py" = "server.py"
+"store_paths.py" = "store_paths.py"
 "mirror.py" = "mirror.py"
 "semantic_index.py" = "semantic_index.py"
 "code_drift.py" = "code_drift.py"

@@ -155,6 +155,262 @@
           "context-keeper"
         ]
       }
+    },
+    {
+      "id": "k-56bcacdc",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Project resolution is now per-call in _base_dir_from_params (env > shared Xylem session pointer > cwd/.context discovery) instead of the static import-time CONTEXT_DIR, so a persistent server follows whichever project the session is in.",
+      "why": "Nearly every handler already routes the default project through _base_dir_from_params, so making just that function (and _resolve_project_dir) resolve per call flows to all of them with minimal blast radius. The new source is a shared pointer file (~/.xylem/active_project.json) the Xylem SessionStart hook writes, honored like CONTEXT_KEEPER_PROJECT (an explicit opt-in, trusted even before .context exists) and slotted between env and cwd discovery. cwd discovery still only resolves to a dir that already has .context, so the never-pollute-a-parent guarantee is untouched.  Problem: context-keeper resolved its project once at module import (PROJECT_DIR/CONTEXT_DIR constants), so when the MCP server is launched from a parent dir and pinned via CONTEXT_KEEPER_PROJECT, every default (no project_dir param) call \u2014 including the SessionStart summary hook \u2014 targeted that one frozen project regardless of which project the session was actually in. Part of the Xylem-stack audit fix 1b.",
+      "tags": [
+        "context-keeper",
+        "resolution",
+        "xylem",
+        "session",
+        "per-call",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-015-5701"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.952012+00:00",
+      "updated_at": "2026-08-01T11:08:46.952012+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-2e1f5b67",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Entry staleness is verified against the artifact the entry describes (commits on its scope path since verified_at), not against wall-clock age. verify_quality gains code_drift, orphaned_scope and unused; prune_stale's date check stays as the weaker complement.",
+      "why": "An entry's health is a property of the thing it describes, so the check should read that thing. scope already names a file or directory on most entries, and git already records every change to it, so the signal was available and unused: no new dependency, no new user obligation, and it degrades to the previous behaviour wherever there is no work tree. It also composes with the existing similar-entry contradiction detection - that catches two live entries disagreeing with each other, this catches one entry disagreeing with the code it describes.  Problem: prune_stale flags entries unverified for more than stale_threshold_days. That measures how long since someone looked, which does not decide whether an entry is still true. A decision about code nobody has touched in a year is fine; a decision about a function rewritten yesterday is already wrong, and by wall-clock it looks fresher. The store therefore had no way to notice its own rot, and separately no way to notice entries carried into every session that nobody ever actually wanted.",
+      "tags": [
+        "staleness",
+        "verification",
+        "retrieval",
+        "quality",
+        "git",
+        "architecture",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-016-1bf6"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.952012+00:00",
+      "updated_at": "2026-08-01T11:08:46.952012+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-f0510521",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Migrated to MCP protocol revision 2026-07-28 by HAND, stdlib only, as a DUAL-ERA server answering both modern (per-request _meta) and legacy (initialize handshake) clients. mirror.py was also upgraded to send modern client metadata ahead of the remote's migration.",
+      "why": "Hand-written so pyproject dependencies stays empty and the Desktop bundle keeps working. Dual-era rather than modern-only because the bundle ships to Claude Desktop installs we do not control, and per the spec legacy clients have no fall-forward mechanism: a modern-only server would strand anyone on an older Desktop build with no diagnostic path. Era detection keys on presence of io.modelcontextprotocol/protocolVersion in params._meta, since modern clients send it on every request and legacy clients never do. Legacy responses are byte-identical to pre-migration, asserted by test, so no modern field leaks into an old client's view.  Problem: Revision 2026-07-28 removes the initialize/initialized handshake, makes server/discover mandatory, and requires resultType plus ttlMs/cacheScope on cacheable results. The obvious migration is to adopt the official mcp SDK, which is what the other Python servers in this suite did. That is not available here: zero dependencies is an advertised property of this project and the .mcpb Claude Desktop bundle installs with no pip step, so a dependency would break that install path outright.",
+      "tags": [
+        "mcp",
+        "protocol-migration",
+        "2026-07-28",
+        "dual-era",
+        "mirror",
+        "zero-dependency",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-017-1a52"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.952012+00:00",
+      "updated_at": "2026-08-01T11:08:46.952012+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-7b4ce46c",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.16: scoped constraints project into Claude Code's own .claude/rules/*.md with paths: frontmatter (opt-in rules_export), regenerated whole on every constraint write.",
+      "why": "Reusing the dec-008 DECISIONS.md projection contract meant no new architecture: JSON stays canonical, the markdown is derived, regenerated whole on the write path, and never parsed back in - a regenerated projection has no drift surface. Writing into the harness's own rules format rather than inventing another injection channel means the delivery is the harness's job, not a hook's, so it works with zero hook wiring and survives hook API changes. Two safety properties made it acceptable to point a generator at a directory inside the user's repo: it owns a SUBDIRECTORY (.claude/rules/context-keeper/) rather than .claude/rules/ itself, and it will only delete files carrying its own generated marker, so a deprecated constraint's file is reaped while a hand-written rule in the same folder is untouched. The marker is a block-level HTML comment, which Claude Code strips before the file enters context - so it identifies the file to both the tool and a human at zero token cost.  Problem: A scoped constraint only became visible through context-keeper's own hooks, and the earliest of those (scope_guard on PostToolUse) fired AFTER the edit had already been written. Claude Code has a native surface that fires earlier and needs no hook at all: a .claude/rules/*.md file carrying `paths:` frontmatter is loaded by the harness when Claude READS a matching file. context-keeper was storing exactly the data that surface consumes (a rule, a reason, a scope path) and not emitting it.",
+      "tags": [
+        "hooks",
+        "claude-code",
+        "context-injection",
+        "projection",
+        "constraints",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-018-c8aa"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.952012+00:00",
+      "updated_at": "2026-08-01T11:08:46.952012+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-140b51c8",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.16: scope_guard moves to PreToolUse (one script serves either wiring, defaulting to PostToolUse), and the session-start summary's truncation gets a floor at the constraints block plus explicit reporting.",
+      "why": "PreToolUse additionalContext is injected next to the tool result - verified against the hooks reference before building on it, precisely because con-002 exists to record what happens when you assume a hook surface reaches the model and it doesn't. Reading hook_event_name from the payload and echoing it back means ONE script serves PreToolUse, PostToolUse, or both wired at once during an upgrade, and an absent field defaults to PostToolUse so every existing installation keeps working with no config change. For truncation, the floor keeps the constraints block - the part a session genuinely cannot function without - and the response now carries summary_truncated / summary_lines_dropped / summary_truncation_note. Those keys are emitted ONLY when truncation happened, so the untruncated common case stays byte-identical and dec-012's cache-stable prefix is preserved. The principle is borrowed from Claude Code's own auto-memory index, which errors when it exceeds its read limit rather than silently dropping the tail: an over-budget summary is a condition to surface, not to absorb.  Problem: Two silent-failure holes. (1) scope_guard fired on PostToolUse, so a scoped constraint reached the model only after the edit had been written - a review note, not a guardrail, while the hook's own docstring claimed it delivered the rule \"at the exact moment it is about to matter\". (2) The summary truncation loop pops lines from the end until the token budget is met, with no lower bound: a small enough budget walks up through the decisions and into the constraints block and empties the summary, which is dec-009's failure (a healthy-looking store injecting nothing) reachable by a different route.",
+      "tags": [
+        "hooks",
+        "claude-code",
+        "context-injection",
+        "constraints",
+        "retrieval",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-019-9c32"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.952012+00:00",
+      "updated_at": "2026-08-01T11:08:46.952012+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-c106b982",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Force UTF-8 on the MCP stdio transport (reconfigure stdin/stdout) at server startup; never rely on the interpreter's default stdio codec.",
+      "why": "On Windows, stdin defaults to cp1252. A JS MCP client's JSON.stringify emits non-ASCII (em-dash, arrow, checkmark) as RAW UTF-8 bytes on the wire, not backslash-u escapes. cp1252 stdin mis-decodes those bytes BEFORE json.loads runs, so an em-dash is persisted as 3-char mojibake. The on-disk json.dump is fine (ensure_ascii) -- the corruption is purely at the INPUT boundary. This was the upstream source of mojibake that corrupted the knowledge base.",
+      "tags": [
+        "encoding",
+        "windows",
+        "stdio",
+        "mcp",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-008-dc30"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.952012+00:00",
+      "updated_at": "2026-08-01T11:08:46.952012+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-238cb401",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "A constraint must not restate a number that an enforcing test already owns. Name the test as the authority and carry the value only as a dated snapshot. Two places holding the same threshold will drift, and the prose is the copy that drifts silently because nothing executes it.",
+      "why": "con-004 read \"at or under 2500 estimated tokens\" while TestToolSchemaBudget asserted 3150 and the real payload was 2927. Anyone reading the rule alone would have concluded the constraint was being violated; anyone reading the test would have concluded it was fine. Both were reading the same constraint. The test had been deliberately and correctly adjusted several times - raised to 4350 during the record_entry transition, tightened back to 3150 after retiring the deprecated aliases - and the rule text was never updated alongside, because nothing fails when prose goes stale.",
+      "tags": [
+        "constraints",
+        "drift",
+        "testing",
+        "documentation",
+        "single-source-of-truth",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-009-6bdc"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.952012+00:00",
+      "updated_at": "2026-08-01T11:08:46.952012+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-10d0fe4f",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "A hook that runs on the edit path (PreToolUse / PostToolUse on Edit|Write) must import store_paths, never server, and store_paths itself must import nothing beyond json and os. Wire edit-path hooks with an explicit timeout.",
+      "why": "A PreToolUse hook runs BEFORE the tool, so its cost is paid on the critical path of every Edit and Write in every project on the machine - unlike PostToolUse, where it merely trails the edit. Importing server pulls mirror -> urllib.request -> http.client -> email.parser plus secrets, usage and code_drift, none of which an edit-path hook touches. That is the difference between a hook that costs roughly the interpreter's own startup and one that costs double it, on every edit, forever. Nothing bounds a hook that hangs except an explicit timeout.",
+      "tags": [
+        "hooks",
+        "performance",
+        "claude-code",
+        "latency",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-010-acde"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T11:08:46.953011+00:00",
+      "updated_at": "2026-08-01T11:08:46.953011+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
     }
   ],
   "imported": {
@@ -179,8 +435,18 @@
       "con-004",
       "con-005",
       "con-006",
-      "con-007"
+      "con-007",
+      "dec-015-5701",
+      "dec-016-1bf6",
+      "dec-017-1a52",
+      "dec-018-c8aa",
+      "dec-019-9c32",
+      "con-008-dc30",
+      "con-009-6bdc",
+      "con-010-acde"
     ],
-    "agentsync": []
+    "agentsync": [],
+    "agentsync_last": {},
+    "import": []
   }
 }

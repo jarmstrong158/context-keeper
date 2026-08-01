@@ -7,6 +7,7 @@ so Claude maintains context across conversations. Zero external dependencies.
 
 import json
 import os
+import re
 import secrets
 import sys
 import uuid
@@ -42,77 +43,42 @@ except Exception:  # never let a mirror import problem break the server
 # mcpb/manifest.json, which the packaging formats require verbatim -- so
 # tests/test_server.py::TestVersionConsistency asserts all five agree. Bump
 # them together or that test fails the build.
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
-CONTEXT_DIR_NAME = ".context"
-
-
-def _xylem_active_project_file():
-    """Path to the shared Xylem session pointer (overridable for tests)."""
-    override = os.environ.get("XYLEM_ACTIVE_PROJECT_FILE")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    return os.path.join(os.path.expanduser("~"), ".xylem", "active_project.json")
-
-
-def _xylem_session_project():
-    """The session's project path from the shared Xylem pointer the SessionStart
-    hook writes, or None. Never raises — a missing/garbage pointer is just 'no
-    session hint'."""
-    try:
-        with open(_xylem_active_project_file(), encoding="utf-8") as f:
-            proj = json.load(f).get("project")
-    except (OSError, ValueError, AttributeError):
-        return None
-    return proj if isinstance(proj, str) and os.path.isdir(proj) else None
+# Store location and raw reads live in store_paths so the hooks can have them
+# without paying for this module's imports (~73ms, mostly mirror -> urllib).
+# Re-exported here because every existing caller and test refers to them
+# through server. One implementation, two import costs.
+from store_paths import (  # noqa: E402
+    CONTEXT_DIR_NAME,
+    _read_json_file_checked,
+    _resolve_project_dir,
+    _xylem_active_project_file,
+    _xylem_session_project,
+)
 
 
-def _resolve_project_dir():
-    """Resolve the project directory with a safe cwd fallback.
+def read_json_file(path):
+    """Soft read for retrieval paths: missing or corrupt both yield [].
 
-    Order of precedence:
-      1. CONTEXT_KEEPER_PROJECT env var, if set (trusted — user opted in)
-      2. The Xylem session pointer (~/.xylem/active_project.json, override
-         with XYLEM_ACTIVE_PROJECT_FILE) written by the SessionStart hook.
-         Also an explicit opt-in — it exists so a persistent server follows
-         the session's project instead of the dir it was launched from — so
-         it outranks the cwd-based discovery below.
-      3. cwd, ONLY if it already contains a .context/ directory
-      4. Walk parent dirs from cwd, returning the first ancestor that
-         already contains a .context/ directory (git-style discovery)
-      5. None — refuse to default, callers must pass project_dir explicitly
+    Write paths must use _load_entries_for_write instead — silently
+    treating a corrupt store as empty turns the next append into a
+    full-history wipe.
 
-    Steps 3 and 4 only resolve to directories that ALREADY contain
-    .context/. We never create one implicitly, so the footgun where
-    Claude Code is launched from a parent directory and context-keeper
-    silently pollutes it stays fixed. The upward walk just lets the
-    server find your project when launched from a subdirectory of it.
+    Deliberately a wrapper here rather than an import of store_paths'
+    identical function: every read server makes must pass through THIS
+    module's _read_json_file_checked, so patching that one symbol still
+    intercepts all of them. TestStaleIndexWrites simulates a concurrent
+    edit by counting reads through it, and an import would have routed
+    half of them past the patch point.
     """
-    explicit = os.environ.get("CONTEXT_KEEPER_PROJECT")
-    if explicit:
-        return explicit
-    # The Xylem SessionStart hook records which project this session is in; honor
-    # it like CONTEXT_KEEPER_PROJECT (an explicit opt-in) so a persistent server
-    # follows the session's project instead of the dir it was launched from.
-    session = _xylem_session_project()
-    if session:
-        return session
-    cwd = os.getcwd()
-    if os.path.isdir(os.path.join(cwd, CONTEXT_DIR_NAME)):
-        return cwd
-    # Walk up the parent chain looking for an existing .context/ dir.
-    # Stops at the filesystem root (parent == current). Bounded iteration
-    # for safety in case a pathological FS confuses os.path.dirname.
-    current = cwd
-    for _ in range(64):
-        parent = os.path.dirname(current)
-        if not parent or parent == current:
-            break
-        if os.path.isdir(os.path.join(parent, CONTEXT_DIR_NAME)):
-            return parent
-        current = parent
-    return None
+    entries, _err = _read_json_file_checked(path)
+    return entries
 
+# Where the scoped-constraint rules projection writes. A subdirectory of
+# .claude/rules/ rather than the directory itself, so regeneration can retire
+# its own stale files without ever considering a hand-written rule.
+RULES_DIR_DEFAULT = os.path.join(".claude", "rules", "context-keeper")
 
 PROJECT_DIR = _resolve_project_dir()
 CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME) if PROJECT_DIR else None
@@ -152,6 +118,13 @@ DEFAULT_CONFIG = {
     # from decisions.json on every decision write. The markdown is
     # read-only output — never parsed back in, never merged.
     "markdown_export": {"enabled": False, "path": "DECISIONS.md"},
+    # Opt-in derived projection: mirror scoped constraints into Claude
+    # Code's own .claude/rules/ format, one file per scope, each carrying
+    # `paths:` frontmatter. The harness then loads the rule when Claude
+    # READS a covered file -- earlier than the scope_guard hook can fire,
+    # and with no hook wired at all. Same contract as markdown_export:
+    # derived, regenerated whole, never parsed back in.
+    "rules_export": {"enabled": False, "path": RULES_DIR_DEFAULT},
     # Opt-in periodic constraint re-injection. SessionStart injects the
     # constraints once at turn one; as a long session fills with tool
     # output those rules get buried. When enabled, the PostToolUse
@@ -162,6 +135,12 @@ DEFAULT_CONFIG = {
     # the model, and no wall-clock timer exists — the hook counts tool
     # calls (the thing actually burying context), not seconds.
     "constraint_reinjection": {"enabled": False, "every_n_tools": 25},
+    # Opt-in escalation for the scope_guard hook when wired under PreToolUse:
+    # an edit to a file covered by an ABSOLUTE constraint returns
+    # permissionDecision "ask" so the user confirms, instead of only
+    # annotating the tool result. Default off -- it interrupts, and it
+    # escalates on scope, not on an actual violation (nothing reads the diff).
+    "scope_guard": {"confirm_absolute": False},
 }
 
 USAGE_GUIDANCE = (
@@ -576,38 +555,6 @@ TOOLS = [
 
 def ensure_context_dir(path=None):
     os.makedirs(path or CONTEXT_DIR, exist_ok=True)
-
-
-def _read_json_file_checked(path):
-    """Read a JSON entry file, distinguishing missing from corrupt.
-
-    Returns (entries, error). A missing file is ([], None) — a fresh
-    store. A file that exists but cannot be parsed
-    (or isn't a list) returns ([], "<description>") so write paths can
-    refuse instead of silently treating the store as empty and wiping
-    history on the next write.
-    """
-    if not os.path.exists(path):
-        return [], None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        return [], f"unparseable JSON ({e})"
-    if not isinstance(data, list):
-        return [], "top-level value is not a JSON list"
-    return data, None
-
-
-def read_json_file(path):
-    """Soft read for retrieval paths: missing or corrupt both yield [].
-
-    Write paths must use _load_entries_for_write instead — silently
-    treating a corrupt store as empty turns the next append into a
-    full-history wipe.
-    """
-    entries, _err = _read_json_file_checked(path)
-    return entries
 
 
 def _load_entries_for_write(path):
@@ -1482,6 +1429,264 @@ def _maybe_export_markdown(base_dir):
 
 
 # ============================================================
+# .claude/rules/ projection (scoped constraints, path-triggered)
+#
+# The scope_guard hook delivers a scoped constraint when the agent edits a
+# covered file. Claude Code's own `.claude/rules/*.md` files with `paths:`
+# frontmatter fire earlier — the harness loads them when Claude *reads* a
+# matching file, before an edit is written. Projecting scoped constraints
+# into that format buys pre-read delivery from the harness itself, with no
+# hook and no tool call.
+#
+# Same contract as the DECISIONS.md projection (dec-008): JSON stays
+# canonical, the markdown is derived, regenerated whole, and never parsed
+# back in. This projection additionally owns its own subdirectory so a
+# regeneration can retire the files of deprecated constraints without ever
+# touching a hand-written rule.
+# ============================================================
+
+# Written into every generated file and required before regeneration will
+# delete one. Block-level HTML comments are stripped from a rules file before
+# it enters the model's context, so this marker is free: it identifies the
+# file to the tool and to a human reader without costing context tokens.
+_RULES_MARKER = "<!-- context-keeper:generated -->"
+
+# Characters that make a scope unprojectable, for two different reasons with
+# one shared consequence: the rule silently never fires.
+#
+#   Glob metacharacters — Claude Code reads `[` as the start of a bracket
+#   expression, and a pattern whose bracket never closes matches nothing.
+#
+#   A double quote (or a control character) — each pattern is emitted as a
+#   double-quoted YAML scalar, so an embedded quote closes it early and the
+#   whole frontmatter block stops parsing. The harness then loads NO rule
+#   from that file, not even the patterns that were fine.
+#
+# Both are skipped and REPORTED rather than emitted, because a rule file that
+# never fires is indistinguishable from coverage.
+_GLOB_META = set("[]{}*?")
+_YAML_UNSAFE = set('"')
+
+
+def _scope_to_paths(scope):
+    """Glob patterns for a constraint scope, or [] if it can't be expressed.
+
+    Directory scopes match everything beneath them; file scopes match the
+    file. Each gets a repo-root-anchored form and a `**/`-prefixed form, so
+    a scope recorded as `hooks/` still fires in a nested checkout.
+    """
+    s = str(scope or "").replace("\\", "/").strip()
+    if not s or s.lower() == "global":
+        return []
+    if any(ch in _GLOB_META or ch in _YAML_UNSAFE or ord(ch) < 32 for ch in s):
+        return []
+    s = s.strip("/")
+    if not s:
+        return []
+    if "." in os.path.basename(s):  # looks like a file, not a directory
+        return [s, f"**/{s}"]
+    return [f"{s}/**/*", f"**/{s}/**/*"]
+
+
+def _rule_slug(scope):
+    """Readable, filesystem-safe filename stem for a scope."""
+    s = str(scope or "").replace("\\", "/").strip().strip("/")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-.").lower()
+    return slug or "scope"
+
+
+def _rule_filenames(scopes):
+    """Map each scope to a unique .md filename, deterministically.
+
+    Two different scopes can slugify to the same stem (`a/b` and `a-b`).
+    Resolving collisions in sorted scope order keeps the mapping stable
+    across regenerations, so a rename never churns the output directory.
+    """
+    names = {}
+    used = set()
+    for scope in sorted(scopes):
+        stem = _rule_slug(scope)
+        candidate = stem
+        n = 2
+        while candidate in used:
+            candidate = f"{stem}-{n}"
+            n += 1
+        used.add(candidate)
+        names[scope] = candidate + ".md"
+    return names
+
+
+def render_scope_rule(scope, constraints):
+    """Render one `.claude/rules/` file for a single constraint scope."""
+    paths = _scope_to_paths(scope)
+    lines = ["---", "paths:"]
+    lines.extend(f'  - "{p}"' for p in paths)
+    lines.append("---")
+    lines.append("")
+    lines.append(_RULES_MARKER)
+    lines.append(
+        "<!-- Regenerated whole from .context/constraints.json by context-keeper. "
+        "Do not edit by hand: your edits are overwritten on the next constraint "
+        "write. Change the constraint instead. -->"
+    )
+    lines.append("")
+    lines.append(f"# Project constraints for `{scope}`")
+    lines.append("")
+    lines.append(
+        "You are working in a file this project has recorded rules about. "
+        "These are not suggestions from a linter — they were written down "
+        "because something went wrong without them."
+    )
+    lines.append("")
+
+    # Absolute before advisory, then by id, so the file is stable across
+    # regenerations regardless of the order entries landed in the store.
+    def _key(c):
+        return (0 if c.get("hardness", "absolute") == "absolute" else 1,
+                str(c.get("id", "")))
+
+    for c in sorted(constraints, key=_key):
+        hardness = c.get("hardness", "absolute")
+        lines.append(f"## [{c.get('id', '?')}] {hardness}")
+        lines.append("")
+        lines.append((c.get("rule") or "").strip() or "(no rule text)")
+        lines.append("")
+        reason = (c.get("reason") or "").strip()
+        if reason:
+            lines.append(f"**Why:** {reason}")
+        incident = (c.get("triggering_incident") or "").strip()
+        if incident:
+            lines.append(f"**What happened:** {incident}")
+        enforced = (c.get("enforced_by") or "").strip()
+        if enforced:
+            # Named, never executed — see the enforced_by note in CLAUDE.md.
+            lines.append(f"**Checked by:** `{enforced}`")
+        lines.append("")
+    return "\n".join(lines)
+
+
+class RulesPathOutsideProject(ValueError):
+    """The configured rules directory resolves outside the project root."""
+
+
+def _rules_dir(base_dir, cfg=None, out_dir=None):
+    """Absolute path of the generated rules directory for a .context dir.
+
+    The result MUST stay inside the project. This directory is not merely
+    written to — it is reaped, so every marker-carrying .md file in it is a
+    deletion candidate on each regeneration. A `../../..` or absolute path
+    in config would point that deletion at a directory the user never
+    associated with context-keeper.
+
+    Containment is also just correct: Claude Code only discovers
+    `.claude/rules/` inside the working tree, so a rules directory outside
+    the project could never load anyway. There is no legitimate use to
+    preserve here, which is why this raises instead of falling back.
+    """
+    if cfg is None:
+        cfg = read_config(base_dir)
+    if not out_dir:
+        out_dir = (cfg.get("rules_export") or {}).get("path") or RULES_DIR_DEFAULT
+    project_dir = os.path.dirname(os.path.abspath(base_dir))
+    if not os.path.isabs(out_dir):
+        out_dir = os.path.join(project_dir, out_dir)
+    resolved = os.path.realpath(out_dir)
+    root = os.path.realpath(project_dir)
+    # commonpath (not startswith) so `/proj-evil` is not read as inside `/proj`.
+    try:
+        contained = os.path.commonpath([resolved, root]) == root
+    except ValueError:  # different drives on Windows
+        contained = False
+    if not contained:
+        raise RulesPathOutsideProject(
+            f"rules_export.path resolves to {resolved}, which is outside the "
+            f"project at {root}. Refusing: this directory gets reaped on every "
+            "regeneration, and Claude Code only loads .claude/rules/ from "
+            "inside the working tree anyway."
+        )
+    return resolved
+
+
+def _write_scope_rules(base_dir, cfg=None, out_dir=None):
+    """Regenerate the scoped-constraint rules directory.
+
+    Returns (dir, files_written, scopes_skipped). Only active constraints
+    with a real (non-global) scope produce a file: a global constraint has
+    no path to trigger on and is already session-start material, so writing
+    it here would just duplicate the injection unconditionally.
+    """
+    out_dir = _rules_dir(base_dir, cfg, out_dir)
+    constraints = [c for c in read_json_file(os.path.join(base_dir, "constraints.json"))
+                   if c.get("status", "active") == "active"]
+
+    by_scope = {}
+    skipped = []
+    for c in constraints:
+        scope = (c.get("scope") or "global").strip()
+        if not _scope_to_paths(scope):
+            if scope and scope.lower() != "global":
+                skipped.append({"id": c.get("id"), "scope": scope})
+            continue
+        by_scope.setdefault(scope, []).append(c)
+
+    names = _rule_filenames(by_scope.keys())
+    os.makedirs(out_dir, exist_ok=True)
+
+    written = []
+    for scope, members in by_scope.items():
+        path = os.path.join(out_dir, names[scope])
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(render_scope_rule(scope, members))
+        os.replace(tmp, path)
+        written.append(names[scope])
+
+    # Retire files for scopes that no longer have an active constraint.
+    # Only files carrying our marker are removed, so a hand-written rule
+    # dropped into this directory is left alone rather than deleted.
+    keep = set(written)
+    for name in sorted(os.listdir(out_dir)):
+        if not name.endswith(".md") or name in keep:
+            continue
+        stale_path = os.path.join(out_dir, name)
+        try:
+            with open(stale_path, "r", encoding="utf-8") as f:
+                if _RULES_MARKER not in f.read(2048):
+                    continue
+            os.remove(stale_path)
+        except OSError:
+            pass
+
+    return out_dir, len(written), skipped
+
+
+def _maybe_export_rules(base_dir):
+    """Render-on-write: regenerate the rules directory when rules_export.enabled.
+
+    Runs on the same write paths as the DECISIONS.md projection and with the
+    same guarantee — a projection failure never fails the canonical write.
+    """
+    try:
+        cfg = read_config(base_dir)
+        if (cfg.get("rules_export") or {}).get("enabled"):
+            _write_scope_rules(base_dir, cfg)
+    except Exception:
+        pass
+
+
+def _maybe_export_projections(base_dir, type_name):
+    """Regenerate the derived projections a write to `type_name` can affect.
+
+    One place decides which store feeds which projection, so a new write
+    path only has to say what it wrote.
+    """
+    if type_name == "decisions":
+        _maybe_export_markdown(base_dir)
+    elif type_name == "constraints":
+        _maybe_export_rules(base_dir)
+
+
+# ============================================================
 # Tool handlers
 # ============================================================
 
@@ -1576,7 +1781,7 @@ def _record_decision_impl(params):
             superseded.append(sid)
 
     write_json_file(dec_path, entries)
-    _maybe_export_markdown(base_dir)
+    _maybe_export_projections(base_dir, "decisions")
     _mirror_out(entry, "decisions", base_dir)
     # Superseded siblings changed status in the same write -- mirror them too
     # so the remote reflects the demotion, not just the new decision.
@@ -1674,6 +1879,7 @@ def _record_constraint_impl(params):
     }
     entries.append(entry)
     write_json_file(con_path, entries)
+    _maybe_export_projections(base_dir, "constraints")
     _mirror_out(entry, "constraints", base_dir)
     return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
 
@@ -2317,14 +2523,31 @@ def handle_get_project_summary(params):
     # and injected an EMPTY summary for any store over budget (found by the
     # token-reduction measurement: 78-entry stores were injecting ~0 tokens
     # of memory at session start).
+    #
+    # Trimming has a FLOOR and is REPORTED. Popping from the end walks up
+    # through decisions and into the constraints block, and with a small
+    # enough budget it empties the summary entirely -- which is exactly the
+    # v0.9 failure (dec-009) in a different guise: a store that looks
+    # healthy injecting nothing. The floor keeps the constraints block,
+    # which is the part a session cannot function without, and the response
+    # says out loud when the cap bit. Anthropic's own auto-memory index
+    # errors rather than silently dropping past its read limit; the same
+    # principle applies here -- an over-budget summary is a condition to
+    # surface, not to absorb.
+    summary_truncated = False
+    lines_dropped = 0
     if estimate_tokens(summary_text) > budget:
-        # Keep constraints (built first), trim decisions/pipelines from the end
-        while lines and estimate_tokens("\n".join(lines)) > budget:
+        floor = 1 + len(con_lines) + (1 if con_lines else 0)  # header + constraints
+        original_len = len(lines)
+        while len(lines) > floor and estimate_tokens("\n".join(lines)) > budget:
             lines.pop()
         # Don't leave a dangling section header (e.g. "Pipelines (3):") or a
         # trailing blank line after trimming the entries out from under it.
-        while lines and (not lines[-1].strip() or lines[-1].rstrip().endswith(":")):
+        while len(lines) > floor and (
+                not lines[-1].strip() or lines[-1].rstrip().endswith(":")):
             lines.pop()
+        lines_dropped = original_len - len(lines)
+        summary_truncated = lines_dropped > 0
         summary_text = "\n".join(lines)
 
     # Task focus, appended AFTER everything above and after truncation.
@@ -2397,7 +2620,7 @@ def handle_get_project_summary(params):
             "injected",
         )
 
-    return {
+    result = {
         "initialized": True,
         "project_name": project_name,
         "summary": summary_text,
@@ -2414,6 +2637,19 @@ def handle_get_project_summary(params):
         "stale_entries": stale if stale else None,
         "usage_guidance": USAGE_GUIDANCE,
     }
+    if summary_truncated:
+        # Emitted only when it happened, so the common case stays byte-stable
+        # for the session-start prompt cache (dec-012's cache-stable prefix).
+        result["summary_truncated"] = True
+        result["summary_lines_dropped"] = lines_dropped
+        result["summary_truncation_note"] = (
+            f"The summary exceeded the {budget}-token budget and {lines_dropped} "
+            "line(s) were dropped from the end; constraints were kept. Entries "
+            "that fell off are still in the store -- reach them with get_context "
+            "or query_entries, or raise token_budget. Consider deprecating "
+            "entries that have stopped earning their place."
+        )
+    return result
 
 
 # Min lengths enforced when a structured field is *updated*. Without this,
@@ -2472,8 +2708,7 @@ def handle_update_entry(params):
     entry["updated_at"] = now_iso()
 
     write_json_file(file_path, entries)
-    if type_name == "decisions":
-        _maybe_export_markdown(base_dir)
+    _maybe_export_projections(base_dir, type_name)
     _mirror_out(entry, type_name, base_dir)
 
     return {"success": True, "entry": entry}
@@ -2566,8 +2801,7 @@ def handle_deprecate_entry(params):
         dep["superseded_by"] = merge_into
         dep["updated_at"] = now_iso()
         write_json_file(file_path, entries)
-        if type_name == "decisions":
-            _maybe_export_markdown(base_dir)
+        _maybe_export_projections(base_dir, type_name)
         # Mirror BOTH sides of the merge: the deprecation on `dep` and the
         # survivor's folded-in content on `keep`. Without this the remote keeps
         # showing the merged-away entry as active -- the exact stale-status
@@ -2596,8 +2830,7 @@ def handle_deprecate_entry(params):
         entry["superseded_by"] = superseded_by
 
     write_json_file(file_path, entries)
-    if type_name == "decisions":
-        _maybe_export_markdown(base_dir)
+    _maybe_export_projections(base_dir, type_name)
     _mirror_out(entry, type_name, base_dir)
 
     return {"success": True, "id": entry_id, "status": "deprecated"}
@@ -2862,6 +3095,51 @@ def handle_export_markdown(params):
     }
 
 
+def handle_export_rules(params):
+    """Manual regeneration of the .claude/rules/ scoped-constraint projection.
+
+    Deliberately NOT in TOOLS. con-004 caps the tools/list payload every
+    client pays for at session start, and this is a backfill operation --
+    run once when adopting the projection, after which render-on-write
+    keeps it current with no tool call. It stays in HANDLERS so the CLI
+    (`context-keeper export_rules '{}'`) and scripted callers can reach it,
+    the same hidden-handler pattern the retired record_* aliases use.
+    """
+    base_dir = _base_dir_from_params(params)
+    if base_dir is None:
+        return UNRESOLVED_PROJECT_ERROR
+    if not os.path.exists(base_dir):
+        return {"error": "No context directory found."}
+    try:
+        out_dir, count, skipped = _write_scope_rules(base_dir, out_dir=params.get("path"))
+    except RulesPathOutsideProject as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Failed to write rules projection: {e}"}
+    result = {
+        "success": True,
+        "path": out_dir,
+        "rules_written": count,
+        "note": (
+            "Derived projection regenerated whole from constraints.json. Do not "
+            "hand-edit; set config rules_export.enabled=true to regenerate "
+            "automatically on every constraint write. Only scoped constraints "
+            "are projected -- a global constraint has no path to trigger on."
+        ),
+    }
+    if skipped:
+        # Silence here would read as "everything is covered". It isn't: these
+        # constraints have a scope that cannot become a safe glob, so no rule
+        # file fires for them and only the session-start block carries them.
+        result["skipped_scopes"] = skipped
+        result["skipped_note"] = (
+            "These scopes contain glob metacharacters ([ ] { } * ?) and were "
+            "skipped -- a pattern Claude Code cannot parse matches nothing, so "
+            "the rule would never fire. Re-record them with a literal path."
+        )
+    return result
+
+
 # ============================================================
 # Team-shared snapshot (Item 5)
 #
@@ -2979,6 +3257,12 @@ def handle_import_snapshot(params):
         entries = stores.get(name, [])
         if entries:
             write_json_file(path, entries)
+            # Entries arriving from a snapshot are still writes to the store,
+            # so the derived projections have to catch up. Without this a
+            # fresh clone imports the constraints and gets no rule files
+            # until someone happens to record another one -- the moment the
+            # rules are most wanted is the moment they would be absent.
+            _maybe_export_projections(base_dir, name)
         imported[name] = len(entries)
     return {
         "success": True,
@@ -3079,6 +3363,9 @@ HANDLERS = {
     # still dispatchable by name so existing CLI/scripted callers don't break.
     "pull_remote": handle_pull_remote,
     "backfill_remote": handle_backfill_remote,
+    # Hidden by design (never in tools/list): a one-time backfill the CLI
+    # runs when adopting the rules projection. See handle_export_rules.
+    "export_rules": handle_export_rules,
 }
 
 # ============================================================

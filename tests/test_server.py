@@ -2122,12 +2122,18 @@ import subprocess
 _HOOK = str(Path(__file__).parent.parent / "hooks" / "scope_guard.py")
 
 
-def _run_scope_guard(project: Path, file_path: str, session_id: str = "s1"):
-    payload = json.dumps({
+def _run_scope_guard(project: Path, file_path: str, session_id: str = "s1",
+                     event: str = None):
+    payload = {
         "session_id": session_id,
         "tool_name": "Edit",
         "tool_input": {"file_path": file_path},
-    })
+    }
+    # Omitted entirely by default: that is the pre-upgrade payload shape, and
+    # every existing installation has this hook wired under PostToolUse.
+    if event is not None:
+        payload["hook_event_name"] = event
+    payload = json.dumps(payload)
     env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
     proc = subprocess.run(
         [sys.executable, _HOOK], input=payload, capture_output=True,
@@ -3692,3 +3698,636 @@ class TestVersionConsistency:
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
         assert payload["result"]["serverInfo"]["version"] == \
             self._versions()["pyproject.toml"]
+
+
+# ===========================================================================
+# .claude/rules/ projection: scoped constraints as path-triggered rules
+#
+# Claude Code loads a rule file with `paths:` frontmatter when it READS a
+# matching file -- earlier than the scope_guard hook, which fires after the
+# write. These tests pin the properties that make the projection safe to
+# point at a directory inside the user's repo: it only ever writes its own
+# generated files, and it only ever deletes its own.
+# ===========================================================================
+
+from server import (
+    _RULES_MARKER,
+    _rule_filenames,
+    _scope_to_paths,
+    handle_export_rules,
+    render_scope_rule,
+)
+
+
+def _enable_rules_export(tmp_path, path=None):
+    ctx = context_dir(tmp_path)
+    ctx.mkdir(exist_ok=True)
+    cfg = {"rules_export": {"enabled": True}}
+    if path:
+        cfg["rules_export"]["path"] = path
+    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+
+def _rules_dir(tmp_path):
+    return tmp_path / ".claude" / "rules" / "context-keeper"
+
+
+class TestScopeToGlob:
+    def test_directory_scope_matches_everything_beneath(self):
+        assert _scope_to_paths("hooks/") == ["hooks/**/*", "**/hooks/**/*"]
+
+    def test_file_scope_matches_the_file(self):
+        assert _scope_to_paths("server.py") == ["server.py", "**/server.py"]
+
+    def test_nested_file_scope_keeps_its_directory(self):
+        assert _scope_to_paths("tests/test_server.py") == [
+            "tests/test_server.py", "**/tests/test_server.py"]
+
+    def test_global_scope_produces_no_pattern(self):
+        # A global constraint has no path to trigger on; it is session-start
+        # material and projecting it would load it unconditionally.
+        assert _scope_to_paths("global") == []
+        assert _scope_to_paths("") == []
+
+    def test_glob_metacharacters_are_refused_not_emitted(self):
+        """A '[' Claude Code cannot read as a bracket expression matches
+        NOTHING. Emitting such a pattern would produce a rule that silently
+        never fires -- worse than no rule, because the file exists and looks
+        like coverage."""
+        for scope in ("photos [2024/", "src/*.py", "a{b,c}/", "log?/"):
+            assert _scope_to_paths(scope) == [], scope
+
+
+class TestRuleFilenames:
+    def test_collisions_resolved_deterministically(self):
+        """'a/b' and 'a-b' slugify identically. The mapping must be stable
+        across regenerations or every render churns the output directory."""
+        scopes = ["a/b", "a-b", "hooks/"]
+        first = _rule_filenames(scopes)
+        assert first == _rule_filenames(list(reversed(scopes)))
+        assert len(set(first.values())) == 3
+
+
+class TestRulesProjection:
+    def test_flag_off_by_default_no_directory_created(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        assert not _rules_dir(tmp_path).exists()
+
+    def test_render_on_write_creates_rule_file(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(
+            tmp_path, scope="hooks/", rule="Hook output must be ASCII only"))
+        content = (_rules_dir(tmp_path) / "hooks.md").read_text(encoding="utf-8")
+        assert content.startswith("---\npaths:\n")
+        assert '"hooks/**/*"' in content
+        assert "Hook output must be ASCII only" in content
+        assert "**Why:**" in content
+
+    def test_global_constraints_are_not_projected(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(tmp_path, scope="global"))
+        assert list(_rules_dir(tmp_path).glob("*.md")) == []
+
+    def test_absolute_constraints_sort_before_advisory(self):
+        rendered = render_scope_rule("hooks/", [
+            {"id": "con-002", "rule": "Advisory one", "hardness": "advisory"},
+            {"id": "con-001", "rule": "Absolute one", "hardness": "absolute"},
+        ])
+        assert rendered.index("Absolute one") < rendered.index("Advisory one")
+
+    def test_deprecating_a_constraint_retires_its_rule_file(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        rec = handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        assert (_rules_dir(tmp_path) / "hooks.md").exists()
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": rec["id"],
+            "reason": "No longer applies",
+        })
+        assert not (_rules_dir(tmp_path) / "hooks.md").exists()
+
+    def test_hand_written_rules_in_the_directory_are_never_deleted(self, tmp_path):
+        """The projection points at a directory inside the user's repo. It
+        may only reap files carrying its own marker -- anything else in
+        there belongs to the user."""
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        mine = _rules_dir(tmp_path) / "my-own-rule.md"
+        mine.write_text('---\npaths:\n  - "**/*"\n---\nHand written.',
+                        encoding="utf-8")
+        # A second write triggers a full regeneration + reap pass.
+        handle_record_constraint(constraint_params(tmp_path, scope="server.py"))
+        assert mine.read_text(encoding="utf-8").endswith("Hand written.")
+
+    def test_regenerated_whole_hand_edits_to_generated_files_clobbered(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        target = _rules_dir(tmp_path) / "hooks.md"
+        target.write_text(_RULES_MARKER + "\nHAND EDIT", encoding="utf-8")
+        handle_record_constraint(constraint_params(
+            tmp_path, scope="hooks/", rule="Second rule for the same scope"))
+        content = target.read_text(encoding="utf-8")
+        assert "HAND EDIT" not in content
+        assert "Second rule for the same scope" in content
+
+    def test_generated_marker_is_an_html_comment(self):
+        """Block-level HTML comments are stripped before a rules file enters
+        the model's context, so the marker costs zero context tokens."""
+        assert _RULES_MARKER.startswith("<!--") and _RULES_MARKER.endswith("-->")
+
+    def test_export_rules_backfills_without_flag(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        result = handle_export_rules({"project_dir": str(tmp_path)})
+        assert result["rules_written"] == 1
+        assert (_rules_dir(tmp_path) / "hooks.md").exists()
+
+    def test_unprojectable_scopes_are_reported_not_swallowed(self, tmp_path):
+        """Silence would read as full coverage. These constraints get no rule
+        file at all, so the caller has to be told."""
+        handle_record_constraint(constraint_params(tmp_path, scope="src/*.py"))
+        result = handle_export_rules({"project_dir": str(tmp_path)})
+        assert result["rules_written"] == 0
+        assert result["skipped_scopes"][0]["scope"] == "src/*.py"
+
+    def test_export_rules_is_not_in_tools_list(self):
+        """con-004 caps the tools/list payload every client pays at session
+        start. This is a one-time backfill reachable from the CLI; it stays
+        in HANDLERS and out of TOOLS."""
+        from server import HANDLERS, TOOLS
+        assert "export_rules" in HANDLERS
+        assert "export_rules" not in {t["name"] for t in TOOLS}
+
+    def test_export_rules_unresolved_project(self, tmp_path):
+        result = handle_export_rules({"project_dir": str(tmp_path / "nowhere")})
+        assert "error" in result
+
+
+class TestSummaryTruncationFloor:
+    """dec-009 was a store that looked healthy injecting an empty summary.
+    The truncation loop is fixed, but a small enough budget could still pop
+    the constraints block out from under the session. The floor keeps the
+    part a session cannot function without, and says when it bit."""
+
+    def _store_with_many_entries(self, tmp_path):
+        for i in range(12):
+            handle_record_constraint(constraint_params(
+                tmp_path, scope=f"mod{i}/",
+                rule=f"Rule number {i} with enough text to be substantial"))
+            handle_record_decision(decision_params(
+                tmp_path, summary=f"Decision number {i} with a long summary line"))
+
+    def test_tiny_budget_never_empties_the_summary(self, tmp_path):
+        self._store_with_many_entries(tmp_path)
+        result = handle_get_project_summary({
+            "project_dir": str(tmp_path), "token_budget": 10})
+        assert result["summary"].strip()
+        assert "Absolute Constraints" in result["summary"]
+
+    def test_truncation_is_reported(self, tmp_path):
+        self._store_with_many_entries(tmp_path)
+        result = handle_get_project_summary({
+            "project_dir": str(tmp_path), "token_budget": 100})
+        assert result["summary_truncated"] is True
+        assert result["summary_lines_dropped"] > 0
+        assert "get_context" in result["summary_truncation_note"]
+
+    def test_untruncated_summary_adds_no_keys(self, tmp_path):
+        """The session-start block must stay byte-stable when nothing changed
+        (dec-012's cache-stable prefix), so these keys appear only on the
+        occasion they describe."""
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        result = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert "summary_truncated" not in result
+        assert "summary_lines_dropped" not in result
+
+
+# ===========================================================================
+# scope_guard under PreToolUse: the rule arrives BEFORE the write
+#
+# PostToolUse delivers a scoped constraint after the edit has landed, which
+# makes it a review note rather than a guardrail. PreToolUse additionalContext
+# is injected next to the tool result, so the same hook wired one event
+# earlier states the rule while the model can still act on it. One script
+# serves both wirings so an upgrade is a config change, not a rewrite.
+# ===========================================================================
+
+
+class TestScopeGuardPreToolUse:
+    def _record_scoped(self, tmp_path, **overrides):
+        params = constraint_params(
+            tmp_path,
+            rule="Hook output must be ASCII only in this project",
+            scope="hooks/",
+            tags=["hooks"],
+        )
+        params.update(overrides)
+        return handle_record_constraint(params)
+
+    def test_answers_with_the_event_it_was_called_on(self, tmp_path):
+        """Echoing the wrong hookEventName is how a hook silently does
+        nothing -- the harness routes on this field."""
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+
+    def test_post_tool_use_still_answers_post_tool_use(self, tmp_path):
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PostToolUse")
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+    def test_missing_event_defaults_to_post_tool_use(self, tmp_path):
+        """Back-compat: every installation predating this change is wired
+        under PostToolUse and sends no hook_event_name we rely on."""
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"))
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+    def test_unknown_event_falls_back_rather_than_echoing_it(self, tmp_path):
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="SomeFutureEvent")
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+    def test_pre_tool_use_wording_is_about_to_write(self, tmp_path):
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "about to write" in ctx
+        assert "BEFORE writing" in ctx
+
+    def test_no_permission_decision_by_default(self, tmp_path):
+        """confirm_absolute is opt-in. Interrupting every edit to a scoped
+        file is not the default anyone wants."""
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
+
+    def test_confirm_absolute_escalates_to_ask(self, tmp_path):
+        self._record_scoped(tmp_path, hardness="absolute")
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        hso = json.loads(out)["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "ask"
+        assert "absolute constraint" in hso["permissionDecisionReason"]
+
+    def test_confirm_absolute_ignores_advisory_constraints(self, tmp_path):
+        self._record_scoped(tmp_path, hardness="advisory")
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
+
+    def test_confirm_absolute_never_asks_after_the_fact(self, tmp_path):
+        """Prompting the user about an edit that already happened is theatre."""
+        self._record_scoped(tmp_path, hardness="absolute")
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PostToolUse")
+        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
+
+    def test_output_is_ascii_only(self, tmp_path):
+        """con-001: Windows hook stdout is cp1252. A non-ASCII byte here
+        raises UnicodeEncodeError and takes the whole hook down."""
+        self._record_scoped(
+            tmp_path,
+            rule="Never use an em-dash — or an arrow → in hook output",
+        )
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        out.encode("ascii")  # raises if the hook emitted anything non-ASCII
+
+
+# ===========================================================================
+# Edit-path latency: what a PreToolUse hook is allowed to cost
+#
+# PostToolUse ran after the tool, so its cost trailed the edit. PreToolUse
+# runs BEFORE it, which puts every millisecond on the critical path of every
+# Edit and Write in every project. Importing server cost ~73ms of machinery
+# this hook never touches (mirror's urllib.request -> http.client ->
+# email.parser stack, secrets, usage, code_drift) and took a hook run to
+# ~142ms; going through store_paths instead put it at ~69ms against a ~62ms
+# bare-interpreter floor.
+#
+# These tests defend the PROPERTY, not the measurement: a hook on the edit
+# path must not import the heavy module. Timing assertions would be flaky on
+# shared CI; "did this module get imported" is exact.
+# ===========================================================================
+
+_EDIT_PATH_HOOKS = ["scope_guard.py"]
+
+
+def _modules_after_running_hook(hook_name, payload):
+    """Run a hook in a fresh interpreter; report whether it imported server."""
+    repo = str(Path(__file__).parent.parent)
+    hook = str(Path(repo) / "hooks" / hook_name)
+    probe = (
+        "import sys, io, json, runpy\n"
+        f"sys.path.insert(0, {repo!r})\n"
+        f"sys.stdin = io.StringIO({payload!r})\n"
+        "try:\n"
+        f"    runpy.run_path({hook!r}, run_name='__main__')\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "sys.stderr.write('server' in sys.modules and 'HEAVY' or 'LIGHT')\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                          text=True, timeout=60)
+    return proc.stderr.strip()[-5:]
+
+
+class TestEditPathHookCost:
+    def test_scope_guard_does_not_import_server(self, tmp_path):
+        """server costs ~73ms to import and this hook needs none of it.
+        store_paths carries the resolution rules and the raw reads. If this
+        fails, someone reached for `import server` and doubled the latency of
+        every edit in every project."""
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        payload = json.dumps({
+            "session_id": "cost-probe",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(tmp_path / "hooks" / "a.py")},
+        })
+        env_before = os.environ.get("CONTEXT_KEEPER_PROJECT")
+        os.environ["CONTEXT_KEEPER_PROJECT"] = str(tmp_path)
+        try:
+            verdict = _modules_after_running_hook("scope_guard.py", payload)
+        finally:
+            if env_before is None:
+                os.environ.pop("CONTEXT_KEEPER_PROJECT", None)
+            else:
+                os.environ["CONTEXT_KEEPER_PROJECT"] = env_before
+        assert verdict == "LIGHT", (
+            "hooks/scope_guard.py imported server. It runs before every Edit "
+            "and Write; use store_paths for project resolution and raw reads.")
+
+    def test_store_paths_imports_nothing_expensive(self):
+        """store_paths is the cheap half by construction. Anything it imports
+        is paid on every edit, so the allowlist is stdlib essentials only."""
+        source = (Path(__file__).parent.parent / "store_paths.py").read_text(
+            encoding="utf-8")
+        imported = set(re.findall(r"^import (\w+)", source, re.M))
+        imported |= set(re.findall(r"^from (\w+) import", source, re.M))
+        assert imported <= {"json", "os"}, (
+            f"store_paths imports {sorted(imported - {'json', 'os'})}. It is on "
+            "the edit-path critical section; keep it to json and os.")
+
+    def test_resolution_logic_has_exactly_one_implementation(self):
+        """The hook and the server must agree on which project they are
+        looking at. Two copies of the precedence order (env > Xylem pointer >
+        cwd > parent walk) would drift, and the copy that drifts is the one
+        nothing executes."""
+        import server as srv
+        import store_paths
+        assert srv._resolve_project_dir is store_paths._resolve_project_dir
+        assert srv.CONTEXT_DIR_NAME is store_paths.CONTEXT_DIR_NAME
+
+
+# ===========================================================================
+# Scope matching: components, not substrings
+#
+# `scope in path` fired a constraint scoped to `src/` on `mysrc/main.py`, and
+# one scoped to `server.py` on `test_server.py`. That was survivable while the
+# hook ran AFTER the edit. On PreToolUse it states an unrelated rule right
+# before an unrelated edit -- and the once-per-session dedupe then burns that
+# constraint, so the file it actually governs never receives it.
+# ===========================================================================
+
+_SCOPE_CASES = [
+    # (scope, path, covered?)
+    ("src/", "C:/proj/src/main.py", True),
+    ("src/", "C:/proj/mysrc/main.py", False),
+    ("src/", "C:/proj/src2/main.py", False),
+    ("hooks/", "C:/proj/hooks/a.py", True),
+    ("hooks/", "C:/proj/webhooks/send.py", False),
+    ("hooks/", "C:/proj/hooks/nested/deep.py", True),
+    ("server.py", "C:/proj/server.py", True),
+    ("server.py", "C:/proj/test_server.py", False),
+    ("server.py", "C:/proj/pkg/server.py", True),
+    ("tests/test_server.py", "C:/proj/tests/test_server.py", True),
+    ("tests/test_server.py", "C:/proj/tests/test_server.py.bak", False),
+    ("api/", "C:/proj/rapid/api2/x.py", False),
+    # A directory scope must not match the directory entry itself, only
+    # things inside it.
+    ("hooks/", "C:/proj/hooks", False),
+]
+
+
+class TestScopeCovers:
+    def _fn(self):
+        import importlib.util
+        path = Path(__file__).parent.parent / "hooks" / "scope_guard.py"
+        spec = importlib.util.spec_from_file_location("_sg_probe", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._scope_covers
+
+    @pytest.mark.parametrize("scope,path,expected", _SCOPE_CASES)
+    def test_scope_covers(self, scope, path, expected):
+        assert self._fn()(scope, path) is expected, f"{scope} vs {path}"
+
+    def test_backslash_paths_normalize(self):
+        """Windows hands the hook backslashes; scopes are recorded with
+        forward slashes."""
+        assert self._fn()("hooks/", r"C:\proj\hooks\a.py") is True
+        assert self._fn()("hooks/", r"C:\proj\webhooks\a.py") is False
+
+    def test_agrees_with_the_rules_projection_on_directory_scopes(self):
+        """The hook and the .claude/rules/ projection are two deliveries of
+        the same rule. If they disagree about which files a scope covers,
+        one of them is lying about coverage."""
+        from server import _scope_to_paths
+        covers = self._fn()
+        for scope in ("src/", "hooks/", "tests/"):
+            patterns = _scope_to_paths(scope)
+            assert patterns, scope
+            # The projection anchors on the scope's own components; so must
+            # the hook. A sibling directory merely ENDING in the scope name
+            # must be covered by neither.
+            sibling = f"C:/proj/my{scope.strip('/')}/file.py"
+            assert covers(scope, sibling) is False, sibling
+
+
+class TestScopeGuardFalsePositives:
+    """End-to-end: the constraint must not be spent on the wrong file."""
+
+    def test_sibling_directory_does_not_consume_the_constraint(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="hooks/", rule="Hook output must be ASCII only"))
+        # An edit to webhooks/ must NOT fire...
+        decoy = _run_scope_guard(
+            tmp_path, str(tmp_path / "webhooks" / "send.py"), "sess-fp",
+            event="PreToolUse")
+        assert decoy == ""
+        # ...and must therefore leave the constraint available for the file
+        # it actually governs, in the same session.
+        real = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-fp",
+            event="PreToolUse")
+        assert rec["id"] in real
+
+    def test_test_file_does_not_consume_a_source_file_constraint(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="server.py", rule="Keep the schema payload bounded"))
+        decoy = _run_scope_guard(
+            tmp_path, str(tmp_path / "test_server.py"), "sess-fp2",
+            event="PreToolUse")
+        assert decoy == ""
+        real = _run_scope_guard(
+            tmp_path, str(tmp_path / "server.py"), "sess-fp2", event="PreToolUse")
+        assert rec["id"] in real
+
+
+# ===========================================================================
+# Findings from the v0.16 audit. Each of these shipped in the first pass and
+# was found by probing the projection adversarially rather than by reading it.
+# ===========================================================================
+
+import shutil
+
+# Aliased: this module already has a local _rules_dir(tmp_path) helper, and a
+# bare import would silently rebind it for every test defined above.
+from server import RulesPathOutsideProject
+from server import _rules_dir as _server_rules_dir
+
+
+class TestScopeYamlSafety:
+    def test_quote_in_scope_is_refused_not_emitted(self):
+        """Each pattern is emitted as a double-quoted YAML scalar. A quote
+        inside the scope closes it early and the WHOLE frontmatter block
+        stops parsing, so the harness loads no rule from the file at all --
+        not even the patterns that were fine."""
+        assert _scope_to_paths('we"ird/') == []
+
+    def test_control_characters_are_refused(self):
+        assert _scope_to_paths("bad\nscope/") == []
+        assert _scope_to_paths("bad\tscope/") == []
+
+    def test_emitted_frontmatter_always_parses(self, tmp_path):
+        """Whatever survives the filter must produce a frontmatter block that
+        a YAML reader can actually read."""
+        for scope in ("hooks/", "src/api/", "server.py", "tests/test_x.py",
+                      "a-b/", "a_b/", "dir.with.dots/"):
+            rendered = render_scope_rule(scope, [
+                {"id": "con-001", "rule": "r", "reason": "why", "hardness": "absolute"}])
+            assert rendered.startswith("---\npaths:\n")
+            block = rendered.split("---")[1]
+            for line in block.splitlines():
+                line = line.strip()
+                if not line.startswith("- "):
+                    continue
+                value = line[2:]
+                # A well-formed double-quoted scalar: quotes only at the ends.
+                assert value.startswith('"') and value.endswith('"'), (scope, line)
+                assert '"' not in value[1:-1], (scope, line)
+
+    def test_unprojectable_scopes_are_reported(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope='we"ird/'))
+        result = handle_export_rules({"project_dir": str(tmp_path)})
+        assert result["rules_written"] == 0
+        assert result["skipped_scopes"][0]["scope"] == 'we"ird/'
+
+
+class TestRulesPathContainment:
+    """The rules directory is REAPED, not just written: every marker-carrying
+    .md file in it is a deletion candidate on each regeneration. A config
+    value must not be able to aim that at a directory outside the project."""
+
+    def test_parent_traversal_is_refused(self, tmp_path):
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        with pytest.raises(RulesPathOutsideProject):
+            _server_rules_dir(str(ctx), out_dir="../../ESCAPED")
+
+    def test_absolute_path_outside_project_is_refused(self, tmp_path, tmp_path_factory):
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        elsewhere = tmp_path_factory.mktemp("elsewhere")
+        with pytest.raises(RulesPathOutsideProject):
+            _server_rules_dir(str(ctx), out_dir=str(elsewhere))
+
+    def test_sibling_prefix_directory_is_refused(self, tmp_path):
+        """`/proj-evil` must not read as inside `/proj`. A startswith check
+        would have let it through; commonpath does not."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        sibling = str(tmp_path) + "-evil"
+        with pytest.raises(RulesPathOutsideProject):
+            _server_rules_dir(str(ctx), out_dir=sibling)
+
+    def test_absolute_path_inside_project_is_allowed(self, tmp_path):
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        inside = str(tmp_path / "docs" / "rules")
+        assert _server_rules_dir(str(ctx), out_dir=inside) == os.path.realpath(inside)
+
+    def test_export_rules_reports_the_refusal_instead_of_raising(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        result = handle_export_rules({
+            "project_dir": str(tmp_path), "path": "../../ESCAPED"})
+        assert "error" in result
+        assert "outside the project" in result["error"]
+
+    def test_render_on_write_never_raises_on_a_bad_path(self, tmp_path):
+        """A misconfigured path must not take down the constraint write --
+        projections are derived, the JSON store is canonical."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        (ctx / "config.json").write_text(json.dumps(
+            {"rules_export": {"enabled": True, "path": "../../ESCAPED"}}),
+            encoding="utf-8")
+        result = handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        assert result.get("success") is True
+
+
+class TestProjectionsFollowInboundWrites:
+    """Entries arriving from a snapshot or the mirror are still writes to the
+    store. If the projections only follow LOCAL writes, a fresh clone imports
+    its constraints and gets no rule files until someone happens to record
+    another one -- the moment the rules are most wanted is the moment they
+    are absent."""
+
+    def _rules_dir(self, tmp_path):
+        return tmp_path / ".claude" / "rules" / "context-keeper"
+
+    def test_import_snapshot_regenerates_the_rules_projection(self, tmp_path,
+                                                              tmp_path_factory):
+        source = tmp_path_factory.mktemp("snapsrc")
+        handle_record_constraint(constraint_params(
+            source, scope="shared/", rule="A rule that travels in a snapshot"))
+        handle_export_snapshot({"project_dir": str(source)})
+
+        dest = tmp_path
+        context_dir(dest).mkdir(parents=True, exist_ok=True)
+        (context_dir(dest) / "config.json").write_text(
+            json.dumps({"rules_export": {"enabled": True}}), encoding="utf-8")
+        shutil.copytree(source / ".context-keeper", dest / ".context-keeper",
+                        dirs_exist_ok=True)
+
+        handle_import_snapshot({"project_dir": str(dest)})
+        assert (self._rules_dir(dest) / "shared.md").exists()
+
+    def test_import_snapshot_regenerates_the_markdown_projection(self, tmp_path,
+                                                                 tmp_path_factory):
+        source = tmp_path_factory.mktemp("snapsrc2")
+        handle_record_decision(decision_params(source, summary="Imported decision"))
+        handle_export_snapshot({"project_dir": str(source)})
+
+        dest = tmp_path
+        context_dir(dest).mkdir(parents=True, exist_ok=True)
+        (context_dir(dest) / "config.json").write_text(
+            json.dumps({"markdown_export": {"enabled": True}}), encoding="utf-8")
+        shutil.copytree(source / ".context-keeper", dest / ".context-keeper",
+                        dirs_exist_ok=True)
+
+        handle_import_snapshot({"project_dir": str(dest)})
+        assert "Imported decision" in (dest / "DECISIONS.md").read_text(encoding="utf-8")
