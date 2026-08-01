@@ -4331,3 +4331,162 @@ class TestProjectionsFollowInboundWrites:
 
         handle_import_snapshot({"project_dir": str(dest)})
         assert "Imported decision" in (dest / "DECISIONS.md").read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# Mojibake: the damage con-008-dc30 stopped causing but never repaired
+#
+# Forcing UTF-8 on the stdio transport meant no NEW entry gets corrupted. It
+# did nothing for entries already written, and that damage is invisible in
+# the worst way: the text stays legible enough that nobody re-reads it, so a
+# corrupted rationale quietly degrades every retrieval that surfaces it.
+# ===========================================================================
+
+from server import (
+    demojibake,
+    handle_repair_mojibake,
+    handle_verify_quality,
+    looks_like_mojibake,
+)
+
+# What "the local store is canonical -- the exact operations" becomes when
+# its UTF-8 bytes are decoded as cp1252.
+_GARBLED = "the local store is canonical â€” the exact operations"
+_CLEAN = "the local store is canonical — the exact operations"
+
+
+class TestDemojibake:
+    def test_repairs_a_known_misdecode(self):
+        assert demojibake(_GARBLED) == _CLEAN
+
+    def test_clean_text_is_left_alone(self):
+        for text in (_CLEAN, "plain ascii text", "already fine — em dash",
+                     "accented café latte", ""):
+            assert demojibake(text) is None, text
+
+    def test_non_strings_are_ignored(self):
+        for value in (None, 42, [], {}, True):
+            assert demojibake(value) is None
+
+    def test_repair_is_verified_as_an_exact_inverse(self):
+        """Re-applying the corruption to the candidate must reproduce the
+        input byte for byte. A partial or approximate repair of someone's
+        recorded reasoning is worse than legible damage: it looks fixed."""
+        repaired = demojibake(_GARBLED)
+        assert repaired.encode("utf-8").decode("cp1252") == _GARBLED
+
+    def test_repair_is_idempotent(self):
+        once = demojibake(_GARBLED)
+        assert demojibake(once) is None
+
+    def test_marker_prefilter_gates_the_transform(self):
+        """Some innocent strings survive the encode/decode round trip. The
+        marker check is what keeps those from being 'repaired'."""
+        assert looks_like_mojibake(_GARBLED) is True
+        assert looks_like_mojibake(_CLEAN) is False
+
+
+class TestRepairMojibake:
+    def _garble(self, tmp_path, entry_id, field, value):
+        path = context_dir(tmp_path) / "decisions.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        for e in entries:
+            if e["id"] == entry_id:
+                e[field] = value
+        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+    def test_dry_run_reports_without_writing(self, tmp_path):
+        rec = handle_record_decision(decision_params(tmp_path))
+        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
+        result = handle_repair_mojibake({"project_dir": str(tmp_path)})
+        assert result["applied"] is False
+        assert result["entries_affected"] == 1
+        on_disk = json.loads(
+            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
+        assert on_disk[0]["why_chosen"] == _GARBLED, "dry run wrote to disk"
+
+    def test_apply_repairs_the_entry(self, tmp_path):
+        rec = handle_record_decision(decision_params(tmp_path))
+        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
+        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
+        on_disk = json.loads(
+            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
+        assert on_disk[0]["why_chosen"] == _CLEAN
+
+    def test_verified_at_is_not_refreshed(self, tmp_path):
+        """An encoding fix is not a claim that anyone re-confirmed the entry
+        is still true. Resetting the staleness clock here would erase the
+        exact signal prune_stale and the drift check exist to raise."""
+        rec = handle_record_decision(decision_params(tmp_path))
+        before = rec["entry"]["verified_at"]
+        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
+        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
+        on_disk = json.loads(
+            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
+        assert on_disk[0]["verified_at"] == before
+
+    def test_updated_at_is_bumped_so_the_repair_wins_the_mirror_merge(self, tmp_path):
+        rec = handle_record_decision(decision_params(tmp_path))
+        before = rec["entry"]["updated_at"]
+        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
+        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
+        on_disk = json.loads(
+            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
+        assert on_disk[0]["updated_at"] >= before
+
+    def test_clean_store_is_a_no_op(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path))
+        result = handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
+        assert result["entries_affected"] == 0
+
+    def test_repairs_nested_alternatives(self, tmp_path):
+        rec = handle_record_decision(decision_params(
+            tmp_path,
+            alternatives=[{"option": _GARBLED, "reason_rejected": _GARBLED}]))
+        result = handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
+        assert result["fields_affected"] == 2
+        on_disk = json.loads(
+            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
+        assert on_disk[0]["alternatives"][0]["option"] == _CLEAN
+
+    def test_ids_are_never_rewritten(self, tmp_path):
+        """Rewriting an id would break every related_to pointing at it."""
+        rec = handle_record_decision(decision_params(tmp_path))
+        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
+        on_disk = json.loads(
+            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
+        assert on_disk[0]["id"] == rec["id"]
+
+    def test_refuses_to_write_over_a_corrupt_store(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path))
+        (context_dir(tmp_path) / "decisions.json").write_text("{ not json",
+                                                              encoding="utf-8")
+        result = handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
+        assert "error" in result
+
+    def test_not_in_tools_list(self):
+        from server import HANDLERS, TOOLS
+        assert "repair_mojibake" in HANDLERS
+        assert "repair_mojibake" not in {t["name"] for t in TOOLS}
+
+
+class TestVerifyQualityFlagsMojibake:
+    def test_flagged_with_a_repair_instruction(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(tmp_path))
+        path = context_dir(tmp_path) / "constraints.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        entries[0]["reason"] = _GARBLED
+        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+        result = handle_verify_quality({"project_dir": str(tmp_path),
+                                        "check_drift": False})
+        entry = next(f for f in result["flagged"] if f["id"] == rec["id"])
+        issue = next(i for i in entry["issues"] if i["type"] == "mojibake")
+        assert "repair_mojibake" in issue["detail"]
+
+    def test_clean_entries_are_not_flagged(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path))
+        result = handle_verify_quality({"project_dir": str(tmp_path),
+                                        "check_drift": False})
+        types = {i["type"] for f in result["flagged"] for i in f["issues"]}
+        assert "mojibake" not in types

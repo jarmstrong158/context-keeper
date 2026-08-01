@@ -153,6 +153,7 @@ Call `verify_quality` periodically — and especially before compaction — to s
 - **code_drift** — commits have landed on the entry's `scope` path since it was last verified. Re-read the code, then either `update_entry` (which refreshes `verified_at`) or deprecate it.
 - **orphaned_scope** — the entry's `scope` path no longer exists. It describes something moved, renamed, or deleted.
 - **unused** — the entry has been injected into context many times and never returned by a targeted query. Sharpen its tags and `retrieval_hints`, or deprecate it.
+- **mojibake** — the entry's text carries cp1252-misdecoded UTF-8, written before `con-008-dc30` forced UTF-8 on the transport. Repair the whole store with `context-keeper repair_mojibake '{"apply": true}'` (omit `apply` for a dry run). Don't hand-edit these: the repair is verified as an exact inverse of the corruption, and an approximate fix of a rationale is worse than legible damage because it looks correct.
 
 `drift_checked: false` in the response means there was no git work tree to compare against — that is "could not look", **not** "nothing drifted". Don't read it as a clean bill of health.
 
