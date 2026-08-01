@@ -1451,11 +1451,21 @@ def _maybe_export_markdown(base_dir):
 # file to the tool and to a human reader without costing context tokens.
 _RULES_MARKER = "<!-- context-keeper:generated -->"
 
-# A scope carrying glob metacharacters cannot be turned into a safe pattern.
-# Claude Code reads `[` as the start of a bracket expression, and a pattern
-# whose bracket never closes matches nothing at all — a rule that silently
-# never fires is worse than no rule, so these scopes are skipped and reported.
+# Characters that make a scope unprojectable, for two different reasons with
+# one shared consequence: the rule silently never fires.
+#
+#   Glob metacharacters — Claude Code reads `[` as the start of a bracket
+#   expression, and a pattern whose bracket never closes matches nothing.
+#
+#   A double quote (or a control character) — each pattern is emitted as a
+#   double-quoted YAML scalar, so an embedded quote closes it early and the
+#   whole frontmatter block stops parsing. The harness then loads NO rule
+#   from that file, not even the patterns that were fine.
+#
+# Both are skipped and REPORTED rather than emitted, because a rule file that
+# never fires is indistinguishable from coverage.
 _GLOB_META = set("[]{}*?")
+_YAML_UNSAFE = set('"')
 
 
 def _scope_to_paths(scope):
@@ -1468,7 +1478,7 @@ def _scope_to_paths(scope):
     s = str(scope or "").replace("\\", "/").strip()
     if not s or s.lower() == "global":
         return []
-    if any(ch in _GLOB_META for ch in s):
+    if any(ch in _GLOB_META or ch in _YAML_UNSAFE or ord(ch) < 32 for ch in s):
         return []
     s = s.strip("/")
     if not s:
@@ -1555,16 +1565,46 @@ def render_scope_rule(scope, constraints):
     return "\n".join(lines)
 
 
+class RulesPathOutsideProject(ValueError):
+    """The configured rules directory resolves outside the project root."""
+
+
 def _rules_dir(base_dir, cfg=None, out_dir=None):
-    """Absolute path of the generated rules directory for a .context dir."""
+    """Absolute path of the generated rules directory for a .context dir.
+
+    The result MUST stay inside the project. This directory is not merely
+    written to — it is reaped, so every marker-carrying .md file in it is a
+    deletion candidate on each regeneration. A `../../..` or absolute path
+    in config would point that deletion at a directory the user never
+    associated with context-keeper.
+
+    Containment is also just correct: Claude Code only discovers
+    `.claude/rules/` inside the working tree, so a rules directory outside
+    the project could never load anyway. There is no legitimate use to
+    preserve here, which is why this raises instead of falling back.
+    """
     if cfg is None:
         cfg = read_config(base_dir)
     if not out_dir:
         out_dir = (cfg.get("rules_export") or {}).get("path") or RULES_DIR_DEFAULT
+    project_dir = os.path.dirname(os.path.abspath(base_dir))
     if not os.path.isabs(out_dir):
-        project_dir = os.path.dirname(os.path.abspath(base_dir))
         out_dir = os.path.join(project_dir, out_dir)
-    return out_dir
+    resolved = os.path.realpath(out_dir)
+    root = os.path.realpath(project_dir)
+    # commonpath (not startswith) so `/proj-evil` is not read as inside `/proj`.
+    try:
+        contained = os.path.commonpath([resolved, root]) == root
+    except ValueError:  # different drives on Windows
+        contained = False
+    if not contained:
+        raise RulesPathOutsideProject(
+            f"rules_export.path resolves to {resolved}, which is outside the "
+            f"project at {root}. Refusing: this directory gets reaped on every "
+            "regeneration, and Claude Code only loads .claude/rules/ from "
+            "inside the working tree anyway."
+        )
+    return resolved
 
 
 def _write_scope_rules(base_dir, cfg=None, out_dir=None):
@@ -3072,6 +3112,8 @@ def handle_export_rules(params):
         return {"error": "No context directory found."}
     try:
         out_dir, count, skipped = _write_scope_rules(base_dir, out_dir=params.get("path"))
+    except RulesPathOutsideProject as e:
+        return {"error": str(e)}
     except Exception as e:
         return {"error": f"Failed to write rules projection: {e}"}
     result = {
@@ -3215,6 +3257,12 @@ def handle_import_snapshot(params):
         entries = stores.get(name, [])
         if entries:
             write_json_file(path, entries)
+            # Entries arriving from a snapshot are still writes to the store,
+            # so the derived projections have to catch up. Without this a
+            # fresh clone imports the constraints and gets no rule files
+            # until someone happens to record another one -- the moment the
+            # rules are most wanted is the moment they would be absent.
+            _maybe_export_projections(base_dir, name)
         imported[name] = len(entries)
     return {
         "success": True,

@@ -615,6 +615,14 @@ def _merge_rows(base_dir, rows):
                 skipped += 1
         if changed:
             server.write_json_file(path, existing)
+            # A pulled entry is a write to the local store, so the derived
+            # projections must catch up. Without this, a constraint recorded
+            # on another device arrives in constraints.json at session start
+            # and produces no .claude/rules/ file until someone happens to
+            # record another one locally. Fail-soft by construction: the
+            # helper swallows projection errors, so this cannot break a pull
+            # (con-006 -- the mirror never fails a local operation).
+            server._maybe_export_projections(base_dir, type_name)
     if conflicts:
         _append_conflicts(base_dir, conflicts)
     return added, updated, skipped

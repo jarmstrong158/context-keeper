@@ -4185,3 +4185,149 @@ class TestScopeGuardFalsePositives:
         real = _run_scope_guard(
             tmp_path, str(tmp_path / "server.py"), "sess-fp2", event="PreToolUse")
         assert rec["id"] in real
+
+
+# ===========================================================================
+# Findings from the v0.16 audit. Each of these shipped in the first pass and
+# was found by probing the projection adversarially rather than by reading it.
+# ===========================================================================
+
+import shutil
+
+# Aliased: this module already has a local _rules_dir(tmp_path) helper, and a
+# bare import would silently rebind it for every test defined above.
+from server import RulesPathOutsideProject
+from server import _rules_dir as _server_rules_dir
+
+
+class TestScopeYamlSafety:
+    def test_quote_in_scope_is_refused_not_emitted(self):
+        """Each pattern is emitted as a double-quoted YAML scalar. A quote
+        inside the scope closes it early and the WHOLE frontmatter block
+        stops parsing, so the harness loads no rule from the file at all --
+        not even the patterns that were fine."""
+        assert _scope_to_paths('we"ird/') == []
+
+    def test_control_characters_are_refused(self):
+        assert _scope_to_paths("bad\nscope/") == []
+        assert _scope_to_paths("bad\tscope/") == []
+
+    def test_emitted_frontmatter_always_parses(self, tmp_path):
+        """Whatever survives the filter must produce a frontmatter block that
+        a YAML reader can actually read."""
+        for scope in ("hooks/", "src/api/", "server.py", "tests/test_x.py",
+                      "a-b/", "a_b/", "dir.with.dots/"):
+            rendered = render_scope_rule(scope, [
+                {"id": "con-001", "rule": "r", "reason": "why", "hardness": "absolute"}])
+            assert rendered.startswith("---\npaths:\n")
+            block = rendered.split("---")[1]
+            for line in block.splitlines():
+                line = line.strip()
+                if not line.startswith("- "):
+                    continue
+                value = line[2:]
+                # A well-formed double-quoted scalar: quotes only at the ends.
+                assert value.startswith('"') and value.endswith('"'), (scope, line)
+                assert '"' not in value[1:-1], (scope, line)
+
+    def test_unprojectable_scopes_are_reported(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope='we"ird/'))
+        result = handle_export_rules({"project_dir": str(tmp_path)})
+        assert result["rules_written"] == 0
+        assert result["skipped_scopes"][0]["scope"] == 'we"ird/'
+
+
+class TestRulesPathContainment:
+    """The rules directory is REAPED, not just written: every marker-carrying
+    .md file in it is a deletion candidate on each regeneration. A config
+    value must not be able to aim that at a directory outside the project."""
+
+    def test_parent_traversal_is_refused(self, tmp_path):
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        with pytest.raises(RulesPathOutsideProject):
+            _server_rules_dir(str(ctx), out_dir="../../ESCAPED")
+
+    def test_absolute_path_outside_project_is_refused(self, tmp_path, tmp_path_factory):
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        elsewhere = tmp_path_factory.mktemp("elsewhere")
+        with pytest.raises(RulesPathOutsideProject):
+            _server_rules_dir(str(ctx), out_dir=str(elsewhere))
+
+    def test_sibling_prefix_directory_is_refused(self, tmp_path):
+        """`/proj-evil` must not read as inside `/proj`. A startswith check
+        would have let it through; commonpath does not."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        sibling = str(tmp_path) + "-evil"
+        with pytest.raises(RulesPathOutsideProject):
+            _server_rules_dir(str(ctx), out_dir=sibling)
+
+    def test_absolute_path_inside_project_is_allowed(self, tmp_path):
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        inside = str(tmp_path / "docs" / "rules")
+        assert _server_rules_dir(str(ctx), out_dir=inside) == os.path.realpath(inside)
+
+    def test_export_rules_reports_the_refusal_instead_of_raising(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        result = handle_export_rules({
+            "project_dir": str(tmp_path), "path": "../../ESCAPED"})
+        assert "error" in result
+        assert "outside the project" in result["error"]
+
+    def test_render_on_write_never_raises_on_a_bad_path(self, tmp_path):
+        """A misconfigured path must not take down the constraint write --
+        projections are derived, the JSON store is canonical."""
+        ctx = context_dir(tmp_path)
+        ctx.mkdir(exist_ok=True)
+        (ctx / "config.json").write_text(json.dumps(
+            {"rules_export": {"enabled": True, "path": "../../ESCAPED"}}),
+            encoding="utf-8")
+        result = handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        assert result.get("success") is True
+
+
+class TestProjectionsFollowInboundWrites:
+    """Entries arriving from a snapshot or the mirror are still writes to the
+    store. If the projections only follow LOCAL writes, a fresh clone imports
+    its constraints and gets no rule files until someone happens to record
+    another one -- the moment the rules are most wanted is the moment they
+    are absent."""
+
+    def _rules_dir(self, tmp_path):
+        return tmp_path / ".claude" / "rules" / "context-keeper"
+
+    def test_import_snapshot_regenerates_the_rules_projection(self, tmp_path,
+                                                              tmp_path_factory):
+        source = tmp_path_factory.mktemp("snapsrc")
+        handle_record_constraint(constraint_params(
+            source, scope="shared/", rule="A rule that travels in a snapshot"))
+        handle_export_snapshot({"project_dir": str(source)})
+
+        dest = tmp_path
+        context_dir(dest).mkdir(parents=True, exist_ok=True)
+        (context_dir(dest) / "config.json").write_text(
+            json.dumps({"rules_export": {"enabled": True}}), encoding="utf-8")
+        shutil.copytree(source / ".context-keeper", dest / ".context-keeper",
+                        dirs_exist_ok=True)
+
+        handle_import_snapshot({"project_dir": str(dest)})
+        assert (self._rules_dir(dest) / "shared.md").exists()
+
+    def test_import_snapshot_regenerates_the_markdown_projection(self, tmp_path,
+                                                                 tmp_path_factory):
+        source = tmp_path_factory.mktemp("snapsrc2")
+        handle_record_decision(decision_params(source, summary="Imported decision"))
+        handle_export_snapshot({"project_dir": str(source)})
+
+        dest = tmp_path
+        context_dir(dest).mkdir(parents=True, exist_ok=True)
+        (context_dir(dest) / "config.json").write_text(
+            json.dumps({"markdown_export": {"enabled": True}}), encoding="utf-8")
+        shutil.copytree(source / ".context-keeper", dest / ".context-keeper",
+                        dirs_exist_ok=True)
+
+        handle_import_snapshot({"project_dir": str(dest)})
+        assert "Imported decision" in (dest / "DECISIONS.md").read_text(encoding="utf-8")

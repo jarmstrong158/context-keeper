@@ -103,11 +103,25 @@ its mechanics context-keeper was leaving on the table.
   context: it identifies the file to the tool and to a human reader at zero
   token cost.
 
-  A scope carrying glob metacharacters (`[ ] { } * ?`) **cannot** be turned
-  into a safe pattern — Claude Code reads `[` as a bracket expression, and one
-  that never closes matches nothing. Those scopes are skipped and **reported**
-  in `skipped_scopes`, because a rule file that silently never fires is worse
-  than no rule: it looks like coverage.
+  A scope is **refused** rather than emitted when it can't become a pattern
+  that actually fires: glob metacharacters (`[ ] { } * ?`), because Claude Code
+  reads `[` as a bracket expression and one that never closes matches nothing;
+  and a double quote or control character, because each pattern is emitted as a
+  double-quoted YAML scalar and an embedded quote closes it early, killing the
+  whole frontmatter block — the harness then loads *no* rule from that file,
+  not even the patterns that were fine. Refused scopes come back in
+  `skipped_scopes`, because a rule file that silently never fires is worse than
+  no rule: it looks like coverage.
+
+  `rules_export.path` is **contained to the project**. This directory is not
+  merely written to, it is reaped — every marker-carrying `.md` file in it is a
+  deletion candidate on each regeneration — so a `../../..` or absolute path in
+  config would aim that deletion at a directory the user never associated with
+  context-keeper. Containment is also just correct: Claude Code only discovers
+  `.claude/rules/` inside the working tree, so an outside directory could never
+  load anyway. A path that escapes is refused with an error, and the constraint
+  write itself still succeeds — projections are derived, the JSON store is
+  canonical, and a misconfigured projection must never fail a record.
 
 - **`scope_guard` now runs under PreToolUse.** It fired on PostToolUse, which
   means the rule arrived *after* the write had already landed — a review note,

@@ -17,9 +17,10 @@ hookEventName, so one script serves either wiring -- and both at once,
 should a config carry the old and new entries during an upgrade (the
 once-per-session dedupe below means the rule still shows up only once).
 
-Matching is a normalized substring check: a constraint scoped to "hooks/"
-fires for any path containing hooks/. Constraints scoped "global" never
-fire here -- they are session-start material.
+Matching is on whole path COMPONENTS (see _scope_covers), not a substring:
+a constraint scoped to "hooks/" fires for hooks/a.py but NOT for
+webhooks/send.py. Constraints scoped "global" never fire here -- they are
+session-start material.
 
 Each constraint is injected at most once per session (state kept in
 .context/scope_guard_state.json), so repeated edits to the same area do
