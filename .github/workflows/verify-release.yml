@@ -1,0 +1,97 @@
+name: Verify release
+
+# A release can half-succeed and look completely fine.
+#
+# v0.16.0 published to PyPI and the MCP registry, then the separate bundle
+# workflow failed on a manifest validation error -- and a release missing an
+# asset is indistinguishable from a release that never had one. The one-click
+# desktop install path was simply gone, and nothing said so.
+#
+# This job runs after a release is published and asserts that every channel
+# actually received it. It fails loudly when one did not, which is the whole
+# point: the failure mode being fixed is silence, not breakage.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (e.g. v0.16.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag and version
+        id: v
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"    >> "$GITHUB_OUTPUT"
+
+      # The publish workflow runs in parallel with this one and PyPI's index
+      # is not instant. Poll rather than race it; a genuine failure still
+      # fails, just after the grace period.
+      - name: PyPI has the version, with both artifacts
+        run: |
+          VERSION="${{ steps.v.outputs.version }}"
+          for attempt in $(seq 1 20); do
+            BODY="$(curl -fsSL https://pypi.org/pypi/context-keeper-mcp/json || echo '{}')"
+            if echo "$BODY" | jq -e --arg v "$VERSION" '.releases[$v] | length > 0' >/dev/null; then
+              echo "$BODY" | jq -r --arg v "$VERSION" '.releases[$v][].filename'
+              echo "$BODY" | jq -e --arg v "$VERSION" \
+                '[.releases[$v][].packagetype] | (index("bdist_wheel") and index("sdist"))' >/dev/null \
+                || { echo "::error::PyPI $VERSION is missing a wheel or an sdist"; exit 1; }
+              echo "PyPI OK"; exit 0
+            fi
+            echo "attempt $attempt: $VERSION not on PyPI yet; waiting"
+            sleep 30
+          done
+          echo "::error::context-keeper-mcp $VERSION never appeared on PyPI"
+          exit 1
+
+      - name: MCP registry has the version
+        run: |
+          VERSION="${{ steps.v.outputs.version }}"
+          for attempt in $(seq 1 20); do
+            BODY="$(curl -fsSL -A 'context-keeper-release-verify' \
+              'https://registry.modelcontextprotocol.io/v0/servers?search=context-keeper&limit=100' || echo '{}')"
+            if echo "$BODY" | jq -e --arg v "$VERSION" \
+                '[.servers[]? | (.server // .) | select(.name | test("jarmstrong158")) | .version] | index($v)' >/dev/null; then
+              echo "MCP registry OK"; exit 0
+            fi
+            echo "attempt $attempt: $VERSION not in the registry yet; waiting"
+            sleep 30
+          done
+          echo "::error::$VERSION never appeared in the MCP registry"
+          exit 1
+
+      # The check that would have caught v0.16.0. The bundle is built by a
+      # separate workflow, so its failure is invisible from here unless
+      # something asserts the asset exists.
+      - name: Release has the .mcpb bundle attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.v.outputs.tag }}"
+          VERSION="${{ steps.v.outputs.version }}"
+          for attempt in $(seq 1 20); do
+            ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name' || true)"
+            echo "$ASSETS"
+            if echo "$ASSETS" | grep -qx "context-keeper-${VERSION}.mcpb"; then
+              echo "Bundle OK"; exit 0
+            fi
+            echo "attempt $attempt: bundle not attached yet; waiting"
+            sleep 30
+          done
+          echo "::error::context-keeper-${VERSION}.mcpb is not attached to $TAG. \
+          The Claude Desktop one-click install path is missing for this release. \
+          Check the 'Build MCPB bundle' workflow."
+          exit 1
