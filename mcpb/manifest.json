@@ -19,13 +19,23 @@
   },
   "icon": "icon.png",
   "license": "MIT",
-  "keywords": ["mcp", "memory", "context", "decisions", "constraints", "claude", "project-memory"],
+  "keywords": [
+    "mcp",
+    "memory",
+    "context",
+    "decisions",
+    "constraints",
+    "claude",
+    "project-memory"
+  ],
   "server": {
     "type": "python",
     "entry_point": "server/server.py",
     "mcp_config": {
       "command": "python",
-      "args": ["${__dirname}/server/server.py"],
+      "args": [
+        "${__dirname}/server/server.py"
+      ],
       "env": {
         "CONTEXT_KEEPER_PROJECT": "${user_config.context_directory}",
         "PYTHONPATH": "${__dirname}/server",
@@ -43,29 +53,74 @@
     }
   },
   "tools_generated": false,
-  "_tools_comment": "Must match server.TOOLS exactly (same names, no extras, no omissions). record_decision/record_pipeline/record_constraint were folded into record_entry and are no longer advertised over MCP; they survive only as internal handlers and CLI aliases. tests/test_server.py::TestManifestToolsMatchServer enforces this.",
   "tools": [
-    { "name": "record_entry", "description": "Unified write tool: record a decision, constraint, or pipeline, with structured rationale validated server-side." },
-    { "name": "get_context", "description": "Relevance-ranked retrieval by query/tags/scope, within a token budget, with honest abstention." },
-    { "name": "query_entries", "description": "Deterministic structured-field filtering (status, origin, tags, scope, hardness, supersession, dates)." },
-    { "name": "get_project_summary", "description": "Concise overview of active decisions, pipelines, and constraints." },
-    { "name": "update_entry", "description": "Update an existing entry by ID; refreshes verified_at." },
-    { "name": "deprecate_entry", "description": "Retire an entry; optionally merge a duplicate into a surviving entry." },
-    { "name": "prune_stale", "description": "Find entries not verified recently, for review." },
-    { "name": "get_compaction_report", "description": "Report whether the last context compaction lost or modified entries." },
-    { "name": "verify_quality", "description": "Scan entries for thin rationale, missing tags, and isolated arcs." },
-    { "name": "export_markdown", "description": "Regenerate DECISIONS.md as a read-only projection of the decisions store." },
-    { "name": "reload_constraints", "description": "Re-surface the constraints-only block on demand mid-session." },
-    { "name": "export_snapshot", "description": "Write the whole store to a committable .context-keeper/memory.json.gz snapshot for sharing project memory with a team." },
-    { "name": "import_snapshot", "description": "Import the committed snapshot into the working store; non-destructive, skips a store that already has entries." },
-    { "name": "mirror", "description": "Sync entries with the optional remote store: op='pull' merges remote into local, op='backfill' upserts local to remote." }
+    {
+      "name": "record_entry",
+      "description": "Unified write tool: record a decision, constraint, or pipeline, with structured rationale validated server-side."
+    },
+    {
+      "name": "get_context",
+      "description": "Relevance-ranked retrieval by query/tags/scope, within a token budget, with honest abstention."
+    },
+    {
+      "name": "query_entries",
+      "description": "Deterministic structured-field filtering (status, origin, tags, scope, hardness, supersession, dates)."
+    },
+    {
+      "name": "get_project_summary",
+      "description": "Concise overview of active decisions, pipelines, and constraints."
+    },
+    {
+      "name": "update_entry",
+      "description": "Update an existing entry by ID; refreshes verified_at."
+    },
+    {
+      "name": "deprecate_entry",
+      "description": "Retire an entry; optionally merge a duplicate into a surviving entry."
+    },
+    {
+      "name": "prune_stale",
+      "description": "Find entries not verified recently, for review."
+    },
+    {
+      "name": "get_compaction_report",
+      "description": "Report whether the last context compaction lost or modified entries."
+    },
+    {
+      "name": "verify_quality",
+      "description": "Scan entries for thin rationale, missing tags, and isolated arcs."
+    },
+    {
+      "name": "export_markdown",
+      "description": "Regenerate DECISIONS.md as a read-only projection of the decisions store."
+    },
+    {
+      "name": "reload_constraints",
+      "description": "Re-surface the constraints-only block on demand mid-session."
+    },
+    {
+      "name": "export_snapshot",
+      "description": "Write the whole store to a committable .context-keeper/memory.json.gz snapshot for sharing project memory with a team."
+    },
+    {
+      "name": "import_snapshot",
+      "description": "Import the committed snapshot into the working store; non-destructive, skips a store that already has entries."
+    },
+    {
+      "name": "mirror",
+      "description": "Sync entries with the optional remote store: op='pull' merges remote into local, op='backfill' upserts local to remote."
+    }
   ],
   "privacy_policies": [
     "https://github.com/jarmstrong158/context-keeper#privacy-policy"
   ],
   "compatibility": {
     "claude_desktop": ">=0.10.0",
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
     "runtimes": {
       "python": ">=3.10"
     }

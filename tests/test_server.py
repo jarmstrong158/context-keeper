@@ -4490,3 +4490,52 @@ class TestVerifyQualityFlagsMojibake:
                                         "check_drift": False})
         types = {i["type"] for f in result["flagged"] for i in f["issues"]}
         assert "mojibake" not in types
+
+
+class TestManifestHasNoEditorialKeys:
+    """The .mcpb manifest is validated against a schema that REJECTS keys it
+    does not recognise, and the packer refuses to build on a validation
+    failure.
+
+    v0.16.0 shipped without its desktop bundle because of this. The manifest
+    carried a `_tools_comment` key -- a maintainer note explaining that
+    `tools` must match `server.TOOLS`. It had been harmless for several
+    releases, then @anthropic-ai/mcpb@2 tightened validation and the pack
+    step started failing. The release itself succeeded (PyPI and the MCP
+    registry both published), so nothing surfaced until someone looked for
+    the .mcpb attachment and found it missing.
+
+    Two lessons, both encoded here. A maintainer note belongs somewhere it
+    cannot break a build -- a test docstring like this one, or a comment in
+    the build script. And the note was restating a rule that
+    TestManifestToolsMatchServer already enforces, which is con-009's
+    complaint exactly: prose duplicating a check will drift from it, and the
+    prose is the copy nothing executes.
+    """
+
+    def test_no_underscore_prefixed_keys(self):
+        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+        editorial = [k for k in manifest if k.startswith("_")]
+        assert not editorial, (
+            f"mcpb/manifest.json carries non-spec key(s) {editorial}. The mcpb "
+            "packer rejects unrecognised keys and the bundle silently fails to "
+            "build. Put maintainer notes in a test docstring or build script "
+            "comment instead."
+        )
+
+    def test_no_underscore_keys_nested_in_tools_or_config(self):
+        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+        offenders = []
+
+        def walk(node, path):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key.startswith("_"):
+                        offenders.append(f"{path}.{key}".lstrip("."))
+                    walk(value, f"{path}.{key}".lstrip("."))
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    walk(item, f"{path}[{i}]")
+
+        walk(manifest, "")
+        assert not offenders, f"non-spec keys in mcpb/manifest.json: {offenders}"
