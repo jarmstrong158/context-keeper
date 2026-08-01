@@ -33,6 +33,23 @@ Context Keeper gives Claude 14 tools to record and retrieve structured project c
 
 All data stored as human-editable JSON files in `.context/` inside your project directory. Zero dependencies by default, semantic retrieval optional.
 
+### How this relates to Claude Code's built-in memory
+
+Claude Code ships [two memory mechanisms of its own](https://code.claude.com/docs/en/claude-md): **CLAUDE.md** files you write by hand, and **auto memory**, where Claude saves freeform notes to `~/.claude/projects/<project>/memory/`. Context Keeper is not a replacement for either — it sits on different ground, and the differences are the reason to run it:
+
+| | Auto memory | Context Keeper |
+|---|---|---|
+| **Shape** | Freeform markdown, an index plus topic files | Typed entries (decision / pipeline / constraint) with server-validated fields |
+| **Depth** | Whatever Claude writes | Schema-enforced: `problem` ≥40 chars, `why_chosen` ≥60, thin entries rejected at capture |
+| **Lifecycle** | Edit or delete the file | `supersedes` (demoted, still recallable), `deprecate`, `merge_into`, drift + staleness scans |
+| **Conflicts** | None | Restatement vs contradiction classified at capture, with origin-based trust precedence |
+| **Retrieval** | Index loaded whole each session | Relevance-ranked within a token budget, with an abstention signal on no-answer queries |
+| **Reach** | Machine-local; explicitly not shared across machines | Cross-device via the mirror, team-shared via a committed snapshot |
+
+They compose rather than compete: auto memory is good at picking up incidental preferences with zero effort, and Context Keeper is for the decisions and rules you want structured, queryable, enforceable, and portable. Running both is fine — and with `rules_export` enabled, Context Keeper writes into the harness's own `.claude/rules/` surface rather than around it.
+
+**Known gap, stated honestly:** subagents do not inherit the main conversation's session-start injection, so a subagent starts without the project summary. If your workflow leans on subagents, have them call `get_project_summary` explicitly — the retrieval-is-unskippable property holds for the main loop only.
+
 ## Capabilities at a glance
 
 Context Keeper is a small, offline-first memory layer; several of its capabilities are easy to miss because they live inside existing tools rather than as separate features. The map below names them in memory-system terms:
@@ -49,6 +66,7 @@ Context Keeper is a small, offline-first memory layer; several of its capabiliti
 | **Hybrid retrieval** | Lexical (tag + word overlap) by default; an opt-in embedding-cosine blend (`semantic.enabled`) adds vector recall, with lexical fallback when the embedder is offline. |
 | **Fact-metadata query** | `query_entries` filters entries by exact predicates over structured fields (status, origin, tags-any/all, scope, hardness, supersession, dates), AND-combined and deterministic — a precise lookup path distinct from `get_context`'s fuzzy relevance ranking. |
 | **Cache-friendly injection** | The session-start memory block is deterministically ordered with a stable prefix and the only per-session-volatile line (quality-scan IDs) emitted last, so an unchanged store injects byte-identical text across sessions. |
+| **Path-triggered rules** | Scoped constraints project into Claude Code's own `.claude/rules/*.md` format with `paths:` frontmatter (`rules_export`), so the harness loads a rule when the agent *reads* a covered file — before an edit, with no hook involved. The `scope_guard` PreToolUse hook covers the write path for clients without rules support. |
 | **Narrative + clustering** | `get_project_summary` clusters decisions by topic above a threshold and renders a compact narrative; the `DECISIONS.md` projection mirrors the store as human-readable prose. |
 | **Data export / offline / privacy** | Plain JSON in `.context/` you can read, edit, grep, and commit; runs fully offline with zero required dependencies and no data leaving the machine. |
 
@@ -61,6 +79,83 @@ The retrieval and honesty properties are measured, not asserted — the harness 
 - **Abstention** — measures whether `get_context` says "nothing relevant" instead of confabulating on no-answer queries; the 0.20 relevance floor is the highest with zero false-abstention on the eval set ([`evals/abstention.py`](evals/abstention.py)).
 
 Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md).
+
+## v0.16: Path-Triggered Rules, and the Rule Before the Edit
+
+Both halves of this release come from reading [Anthropic's own memory
+documentation](https://code.claude.com/docs/en/claude-md) and asking which of
+its mechanics context-keeper was leaving on the table.
+
+- **Scoped constraints project into `.claude/rules/*.md` (opt-in).** Claude
+  Code loads a rule file carrying `paths:` frontmatter when it **reads** a
+  matching file — earlier than any hook can fire, and with no hook wired at
+  all. `rules_export.enabled` mirrors every scoped constraint into
+  `.claude/rules/context-keeper/`, one file per scope, on the write path of
+  every constraint mutation. Same contract as the `DECISIONS.md` projection:
+  JSON stays canonical, the markdown is derived, regenerated whole, and never
+  parsed back in.
+
+  The projection owns a **subdirectory** rather than `.claude/rules/` itself,
+  and reaps only files carrying its own generated marker — so a deprecated
+  constraint's rule file disappears on the next write, while a hand-written
+  rule dropped in the same folder is never touched. The marker is a
+  block-level HTML comment, which Claude Code strips before the file enters
+  context: it identifies the file to the tool and to a human reader at zero
+  token cost.
+
+  A scope carrying glob metacharacters (`[ ] { } * ?`) **cannot** be turned
+  into a safe pattern — Claude Code reads `[` as a bracket expression, and one
+  that never closes matches nothing. Those scopes are skipped and **reported**
+  in `skipped_scopes`, because a rule file that silently never fires is worse
+  than no rule: it looks like coverage.
+
+- **`scope_guard` now runs under PreToolUse.** It fired on PostToolUse, which
+  means the rule arrived *after* the write had already landed — a review note,
+  not a guardrail. PreToolUse `additionalContext` is injected next to the tool
+  result, so the constraint reaches the model while it can still act on it.
+  One script serves either wiring: it reads `hook_event_name` and answers with
+  the matching `hookEventName`, defaulting to PostToolUse when the field is
+  absent, so **existing installs keep working unchanged** and upgrading is a
+  config edit rather than a rewrite.
+
+  Opt-in `scope_guard.confirm_absolute` escalates a PreToolUse hit on an
+  **absolute** constraint to `permissionDecision: "ask"`, pausing for the user
+  instead of only annotating. Default off. The honest limit, stated plainly:
+  this escalates on **scope, not on violation** — nothing here reads the diff,
+  so it cannot know the edit actually breaks the rule.
+
+- **Over-budget summaries are now floored and reported.** Truncating the
+  session-start summary popped lines from the end, and with a small enough
+  budget it walked straight through the constraints block and emptied the
+  summary — the v0.9 failure (a healthy-looking store injecting nothing) in a
+  different guise. Trimming now stops at the constraints block, and the
+  response carries `summary_truncated` / `summary_lines_dropped` /
+  `summary_truncation_note` when the cap bit. Those keys appear **only** when
+  truncation happened, so the untruncated common case stays byte-stable for
+  the prompt cache. Anthropic's auto-memory index errors rather than silently
+  dropping content past its read limit; same principle.
+
+Enable the projection in `.context/config.json` and backfill once:
+
+```json
+{ "rules_export": { "enabled": true } }
+```
+
+```bash
+context-keeper export_rules '{}'
+```
+
+`export_rules` is deliberately **not** in `tools/list` — con-004 caps the
+schema payload every client pays for at session start, and this is a one-time
+backfill. Render-on-write keeps the directory current afterwards with no tool
+call.
+
+**Commit it or ignore it, but match your store.** The generated directory is
+derived from `.context/`. If your working store is gitignored (the default),
+gitignore `.claude/rules/context-keeper/` too — otherwise a fresh clone's first
+constraint write regenerates from a store it doesn't have and reaps every
+committed file. If you share memory through `export_snapshot`, committing the
+rules directory is fine and gives a new teammate the scoped rules immediately.
 
 ## v0.15: Two-Way Mirror (local <-> remote)
 
@@ -461,6 +556,17 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/context-keeper/hooks/scope_guard.py"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",
@@ -468,15 +574,6 @@ Add to your Claude Code hooks config (`~/.claude/settings.json`):
           {
             "type": "command",
             "command": "python /path/to/context-keeper/hooks/commit_capture_reminder.py"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|Write|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python /path/to/context-keeper/hooks/scope_guard.py"
           }
         ]
       },
@@ -507,7 +604,7 @@ The hooks form a complete capture-and-retrieval loop:
 
 - **SessionStart** — imports the server's own handlers and prints the project summary (plus any compaction-discrepancy report and a one-line quality-scan nudge) straight to stdout, which Claude Code injects into context at turn one. It also runs the post-compaction snapshot comparison itself before reading the report — SessionStart fires with source `compact` immediately after compaction, before any Stop hook, so this keeps the injected report fresh. This replaces the older approach of printing an instruction to *call* the tools — a request that reliably lost to a task-focused first turn since the tools are deferred. Stays silent when the project has no `.context/` yet, and emits ASCII-only output so it cannot crash on Windows cp1252 stdout
 - **PostToolUse (Bash)** — fires after every Bash tool call; when the command contains `git commit`, it injects a reminder to record the matching decision/constraint/gotcha **in the same work cycle**. A commit is the single best capture trigger — it's the exact moment something became real enough to persist in version control. Born from field use: during incident-heavy sessions the agent batched capture "for later," and the user had to ask "update context keeper" three times in one night while a dozen commits shipped
-- **PostToolUse (Edit|Write)** — `scope_guard.py`: when the agent edits a file covered by a constraint's `scope` (e.g. a constraint scoped to `hooks/` and an edit to `hooks/session_start.py`), that constraint is injected right then via `additionalContext`. Session start briefs the rules; this enforces them at the moment of edit. Once per constraint per session
+- **PreToolUse (Edit|Write)** — `scope_guard.py`: when the agent is about to write a file covered by a constraint's `scope` (e.g. a constraint scoped to `hooks/` and an edit to `hooks/session_start.py`), that constraint is injected via `additionalContext` **before the write executes**. Session start briefs the rules; this puts them in front of the model at the moment of edit. Once per constraint per session. It was wired under PostToolUse through v0.15 — that still works (the hook detects its own event and defaults to PostToolUse), but the rule arrived after the edit had landed, which made it a review note rather than a guardrail. Optional `scope_guard.confirm_absolute` escalates an absolute-constraint hit to a user confirmation prompt; note it triggers on scope, not on an actual violation
 - **PostToolUse (any tool)** — `constraint_reinject.py`: **opt-in, default off.** When `constraint_reinjection.enabled` is set, it counts tool calls per session and re-injects the constraints-only block every `every_n_tools` calls via `additionalContext`, so rules injected at session start don't decay as tool output buries them. PostToolUse is chosen deliberately: it's a model-visible surface (unlike PreCompact) and its firing rate tracks tool-output volume. Not a timer — an MCP server has no wall-clock in the context window
 - **PreCompact** — snapshots all active `.context/` entries and runs a quality scan (`verify_quality`), printing flagged entries (thin reasoning, missing tags, isolated arcs) to the transcript. Note: PreCompact stdout is user-visible only — Claude Code does not inject it into the model's context, which is why the model-visible quality nudge lives in the SessionStart hook instead
 - **Stop** — safety-net run of the same snapshot comparison SessionStart performs, in case the session ends without a new session starting (idempotent — skips if the snapshot hasn't changed since last comparison)
@@ -533,6 +630,12 @@ your-project/
     .mirror_conflicts.json   # Substance-differing versions overwritten by newest-wins (auto-generated)
     hook.log                 # Hook activity log
     mirror.log               # Mirror (local<->remote) activity log (auto-generated)
+  .claude/
+    rules/
+      context-keeper/        # Scoped-constraint rules projection, one file per
+                             # scope (only when rules_export.enabled). Derived
+                             # and regenerated whole -- do not hand-edit. Files
+                             # without the generated marker are left alone.
 ```
 
 All files are human-readable JSON. You can edit them directly. IDs are sequential and readable: `dec-001`, `pipe-001`, `con-001`.
@@ -552,9 +655,16 @@ Create `.context/config.json` to customize:
     "enabled": false,
     "path": "DECISIONS.md"
   },
+  "rules_export": {
+    "enabled": false,
+    "path": ".claude/rules/context-keeper"
+  },
   "constraint_reinjection": {
     "enabled": false,
     "every_n_tools": 25
+  },
+  "scope_guard": {
+    "confirm_absolute": false
   },
   "semantic": {
     "enabled": false,
@@ -636,6 +746,7 @@ context-keeper <tool> '<json-args>'
 context-keeper get_project_summary '{}'
 context-keeper record_entry '{"kind":"constraint","rule":"...","reason":"..."}'
 context-keeper query_entries '{"kind":"decision","text":"storage","limit":5}'
+context-keeper export_rules '{}'   # backfill the .claude/rules/ projection
 context-keeper --help          # list tools
 ```
 

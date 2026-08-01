@@ -2122,12 +2122,18 @@ import subprocess
 _HOOK = str(Path(__file__).parent.parent / "hooks" / "scope_guard.py")
 
 
-def _run_scope_guard(project: Path, file_path: str, session_id: str = "s1"):
-    payload = json.dumps({
+def _run_scope_guard(project: Path, file_path: str, session_id: str = "s1",
+                     event: str = None):
+    payload = {
         "session_id": session_id,
         "tool_name": "Edit",
         "tool_input": {"file_path": file_path},
-    })
+    }
+    # Omitted entirely by default: that is the pre-upgrade payload shape, and
+    # every existing installation has this hook wired under PostToolUse.
+    if event is not None:
+        payload["hook_event_name"] = event
+    payload = json.dumps(payload)
     env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
     proc = subprocess.run(
         [sys.executable, _HOOK], input=payload, capture_output=True,
@@ -3692,3 +3698,309 @@ class TestVersionConsistency:
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
         assert payload["result"]["serverInfo"]["version"] == \
             self._versions()["pyproject.toml"]
+
+
+# ===========================================================================
+# .claude/rules/ projection: scoped constraints as path-triggered rules
+#
+# Claude Code loads a rule file with `paths:` frontmatter when it READS a
+# matching file -- earlier than the scope_guard hook, which fires after the
+# write. These tests pin the properties that make the projection safe to
+# point at a directory inside the user's repo: it only ever writes its own
+# generated files, and it only ever deletes its own.
+# ===========================================================================
+
+from server import (
+    _RULES_MARKER,
+    _rule_filenames,
+    _scope_to_paths,
+    handle_export_rules,
+    render_scope_rule,
+)
+
+
+def _enable_rules_export(tmp_path, path=None):
+    ctx = context_dir(tmp_path)
+    ctx.mkdir(exist_ok=True)
+    cfg = {"rules_export": {"enabled": True}}
+    if path:
+        cfg["rules_export"]["path"] = path
+    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+
+def _rules_dir(tmp_path):
+    return tmp_path / ".claude" / "rules" / "context-keeper"
+
+
+class TestScopeToGlob:
+    def test_directory_scope_matches_everything_beneath(self):
+        assert _scope_to_paths("hooks/") == ["hooks/**/*", "**/hooks/**/*"]
+
+    def test_file_scope_matches_the_file(self):
+        assert _scope_to_paths("server.py") == ["server.py", "**/server.py"]
+
+    def test_nested_file_scope_keeps_its_directory(self):
+        assert _scope_to_paths("tests/test_server.py") == [
+            "tests/test_server.py", "**/tests/test_server.py"]
+
+    def test_global_scope_produces_no_pattern(self):
+        # A global constraint has no path to trigger on; it is session-start
+        # material and projecting it would load it unconditionally.
+        assert _scope_to_paths("global") == []
+        assert _scope_to_paths("") == []
+
+    def test_glob_metacharacters_are_refused_not_emitted(self):
+        """A '[' Claude Code cannot read as a bracket expression matches
+        NOTHING. Emitting such a pattern would produce a rule that silently
+        never fires -- worse than no rule, because the file exists and looks
+        like coverage."""
+        for scope in ("photos [2024/", "src/*.py", "a{b,c}/", "log?/"):
+            assert _scope_to_paths(scope) == [], scope
+
+
+class TestRuleFilenames:
+    def test_collisions_resolved_deterministically(self):
+        """'a/b' and 'a-b' slugify identically. The mapping must be stable
+        across regenerations or every render churns the output directory."""
+        scopes = ["a/b", "a-b", "hooks/"]
+        first = _rule_filenames(scopes)
+        assert first == _rule_filenames(list(reversed(scopes)))
+        assert len(set(first.values())) == 3
+
+
+class TestRulesProjection:
+    def test_flag_off_by_default_no_directory_created(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        assert not _rules_dir(tmp_path).exists()
+
+    def test_render_on_write_creates_rule_file(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(
+            tmp_path, scope="hooks/", rule="Hook output must be ASCII only"))
+        content = (_rules_dir(tmp_path) / "hooks.md").read_text(encoding="utf-8")
+        assert content.startswith("---\npaths:\n")
+        assert '"hooks/**/*"' in content
+        assert "Hook output must be ASCII only" in content
+        assert "**Why:**" in content
+
+    def test_global_constraints_are_not_projected(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(tmp_path, scope="global"))
+        assert list(_rules_dir(tmp_path).glob("*.md")) == []
+
+    def test_absolute_constraints_sort_before_advisory(self):
+        rendered = render_scope_rule("hooks/", [
+            {"id": "con-002", "rule": "Advisory one", "hardness": "advisory"},
+            {"id": "con-001", "rule": "Absolute one", "hardness": "absolute"},
+        ])
+        assert rendered.index("Absolute one") < rendered.index("Advisory one")
+
+    def test_deprecating_a_constraint_retires_its_rule_file(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        rec = handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        assert (_rules_dir(tmp_path) / "hooks.md").exists()
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": rec["id"],
+            "reason": "No longer applies",
+        })
+        assert not (_rules_dir(tmp_path) / "hooks.md").exists()
+
+    def test_hand_written_rules_in_the_directory_are_never_deleted(self, tmp_path):
+        """The projection points at a directory inside the user's repo. It
+        may only reap files carrying its own marker -- anything else in
+        there belongs to the user."""
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        mine = _rules_dir(tmp_path) / "my-own-rule.md"
+        mine.write_text('---\npaths:\n  - "**/*"\n---\nHand written.',
+                        encoding="utf-8")
+        # A second write triggers a full regeneration + reap pass.
+        handle_record_constraint(constraint_params(tmp_path, scope="server.py"))
+        assert mine.read_text(encoding="utf-8").endswith("Hand written.")
+
+    def test_regenerated_whole_hand_edits_to_generated_files_clobbered(self, tmp_path):
+        _enable_rules_export(tmp_path)
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        target = _rules_dir(tmp_path) / "hooks.md"
+        target.write_text(_RULES_MARKER + "\nHAND EDIT", encoding="utf-8")
+        handle_record_constraint(constraint_params(
+            tmp_path, scope="hooks/", rule="Second rule for the same scope"))
+        content = target.read_text(encoding="utf-8")
+        assert "HAND EDIT" not in content
+        assert "Second rule for the same scope" in content
+
+    def test_generated_marker_is_an_html_comment(self):
+        """Block-level HTML comments are stripped before a rules file enters
+        the model's context, so the marker costs zero context tokens."""
+        assert _RULES_MARKER.startswith("<!--") and _RULES_MARKER.endswith("-->")
+
+    def test_export_rules_backfills_without_flag(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        result = handle_export_rules({"project_dir": str(tmp_path)})
+        assert result["rules_written"] == 1
+        assert (_rules_dir(tmp_path) / "hooks.md").exists()
+
+    def test_unprojectable_scopes_are_reported_not_swallowed(self, tmp_path):
+        """Silence would read as full coverage. These constraints get no rule
+        file at all, so the caller has to be told."""
+        handle_record_constraint(constraint_params(tmp_path, scope="src/*.py"))
+        result = handle_export_rules({"project_dir": str(tmp_path)})
+        assert result["rules_written"] == 0
+        assert result["skipped_scopes"][0]["scope"] == "src/*.py"
+
+    def test_export_rules_is_not_in_tools_list(self):
+        """con-004 caps the tools/list payload every client pays at session
+        start. This is a one-time backfill reachable from the CLI; it stays
+        in HANDLERS and out of TOOLS."""
+        from server import HANDLERS, TOOLS
+        assert "export_rules" in HANDLERS
+        assert "export_rules" not in {t["name"] for t in TOOLS}
+
+    def test_export_rules_unresolved_project(self, tmp_path):
+        result = handle_export_rules({"project_dir": str(tmp_path / "nowhere")})
+        assert "error" in result
+
+
+class TestSummaryTruncationFloor:
+    """dec-009 was a store that looked healthy injecting an empty summary.
+    The truncation loop is fixed, but a small enough budget could still pop
+    the constraints block out from under the session. The floor keeps the
+    part a session cannot function without, and says when it bit."""
+
+    def _store_with_many_entries(self, tmp_path):
+        for i in range(12):
+            handle_record_constraint(constraint_params(
+                tmp_path, scope=f"mod{i}/",
+                rule=f"Rule number {i} with enough text to be substantial"))
+            handle_record_decision(decision_params(
+                tmp_path, summary=f"Decision number {i} with a long summary line"))
+
+    def test_tiny_budget_never_empties_the_summary(self, tmp_path):
+        self._store_with_many_entries(tmp_path)
+        result = handle_get_project_summary({
+            "project_dir": str(tmp_path), "token_budget": 10})
+        assert result["summary"].strip()
+        assert "Absolute Constraints" in result["summary"]
+
+    def test_truncation_is_reported(self, tmp_path):
+        self._store_with_many_entries(tmp_path)
+        result = handle_get_project_summary({
+            "project_dir": str(tmp_path), "token_budget": 100})
+        assert result["summary_truncated"] is True
+        assert result["summary_lines_dropped"] > 0
+        assert "get_context" in result["summary_truncation_note"]
+
+    def test_untruncated_summary_adds_no_keys(self, tmp_path):
+        """The session-start block must stay byte-stable when nothing changed
+        (dec-012's cache-stable prefix), so these keys appear only on the
+        occasion they describe."""
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        result = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert "summary_truncated" not in result
+        assert "summary_lines_dropped" not in result
+
+
+# ===========================================================================
+# scope_guard under PreToolUse: the rule arrives BEFORE the write
+#
+# PostToolUse delivers a scoped constraint after the edit has landed, which
+# makes it a review note rather than a guardrail. PreToolUse additionalContext
+# is injected next to the tool result, so the same hook wired one event
+# earlier states the rule while the model can still act on it. One script
+# serves both wirings so an upgrade is a config change, not a rewrite.
+# ===========================================================================
+
+
+class TestScopeGuardPreToolUse:
+    def _record_scoped(self, tmp_path, **overrides):
+        params = constraint_params(
+            tmp_path,
+            rule="Hook output must be ASCII only in this project",
+            scope="hooks/",
+            tags=["hooks"],
+        )
+        params.update(overrides)
+        return handle_record_constraint(params)
+
+    def test_answers_with_the_event_it_was_called_on(self, tmp_path):
+        """Echoing the wrong hookEventName is how a hook silently does
+        nothing -- the harness routes on this field."""
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+
+    def test_post_tool_use_still_answers_post_tool_use(self, tmp_path):
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PostToolUse")
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+    def test_missing_event_defaults_to_post_tool_use(self, tmp_path):
+        """Back-compat: every installation predating this change is wired
+        under PostToolUse and sends no hook_event_name we rely on."""
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"))
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+    def test_unknown_event_falls_back_rather_than_echoing_it(self, tmp_path):
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="SomeFutureEvent")
+        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+    def test_pre_tool_use_wording_is_about_to_write(self, tmp_path):
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "about to write" in ctx
+        assert "BEFORE writing" in ctx
+
+    def test_no_permission_decision_by_default(self, tmp_path):
+        """confirm_absolute is opt-in. Interrupting every edit to a scoped
+        file is not the default anyone wants."""
+        self._record_scoped(tmp_path)
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
+
+    def test_confirm_absolute_escalates_to_ask(self, tmp_path):
+        self._record_scoped(tmp_path, hardness="absolute")
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        hso = json.loads(out)["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "ask"
+        assert "absolute constraint" in hso["permissionDecisionReason"]
+
+    def test_confirm_absolute_ignores_advisory_constraints(self, tmp_path):
+        self._record_scoped(tmp_path, hardness="advisory")
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
+
+    def test_confirm_absolute_never_asks_after_the_fact(self, tmp_path):
+        """Prompting the user about an edit that already happened is theatre."""
+        self._record_scoped(tmp_path, hardness="absolute")
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PostToolUse")
+        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
+
+    def test_output_is_ascii_only(self, tmp_path):
+        """con-001: Windows hook stdout is cp1252. A non-ASCII byte here
+        raises UnicodeEncodeError and takes the whole hook down."""
+        self._record_scoped(
+            tmp_path,
+            rule="Never use an em-dash — or an arrow → in hook output",
+        )
+        (context_dir(tmp_path) / "config.json").write_text(
+            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
+        out = _run_scope_guard(
+            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
+        out.encode("ascii")  # raises if the hook emitted anything non-ASCII

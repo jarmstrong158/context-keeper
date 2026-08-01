@@ -29,6 +29,16 @@ Context Keeper has two halves:
 
 Both halves must work for the system to be useful. Retrieval without capture means the same entries get stale. Capture without retrieval means you don't know what's already recorded.
 
+**Retrieval surfaces, earliest to latest.** A rule is only useful if it arrives before the thing it governs:
+
+1. `.claude/rules/context-keeper/*.md` (opt-in `rules_export`) — the harness loads a scoped constraint when you **read** a covered file. Earliest surface, no hook, no tool call.
+2. SessionStart injection — the whole summary at turn one, including the "Rules covering what you are working on" block.
+3. `scope_guard` (PreToolUse) — the scoped constraint, immediately before a covered file is **written**.
+4. `constraint_reinject` (PostToolUse, opt-in) — the constraints block again every N tool calls, once session-start has scrolled away.
+5. `get_context` / `query_entries` — on demand, when you go looking.
+
+**This does not reach subagents.** SessionStart does not fire for them and they do not inherit the parent's injected context, so a subagent begins with no project memory. When dispatching one for non-trivial work, either put the relevant constraints in its prompt or tell it to call `get_project_summary` first.
+
 ## When to Record
 
 ### Record a Decision when:
@@ -73,7 +83,8 @@ Call `record_entry` with `kind="pipeline"` and:
 
 Call `record_entry` with `kind="constraint"` and:
 - `rule`, `scope`, `hardness` (absolute for true invariants, advisory for preferences)
-- Set `scope` to a real file/directory path (e.g. `hooks/`, `server.py`) whenever the rule is localized — the scope_guard hook re-injects scoped constraints at the moment a covered file is edited, so a precise scope turns the rule into an active guardrail instead of a session-start memo
+- Set `scope` to a real file/directory path (e.g. `hooks/`, `server.py`) whenever the rule is localized. Scope is now load-bearing three times over: the scope_guard hook injects the constraint before a covered file is written (PreToolUse), the `rules_export` projection turns it into a `.claude/rules/` file the harness loads when a covered file is *read*, and `verify_quality`'s drift check compares commits against that path. A precise scope turns the rule into an active guardrail; `global` leaves it a session-start memo with nothing to check against
+- **Use a literal path, never a glob.** A scope containing `[ ] { } * ?` cannot be projected into a rules file — Claude Code reads `[` as a bracket expression and an unparseable pattern matches nothing, so the rule would exist as a file and never fire. Those scopes are skipped and reported in `export_rules`'s `skipped_scopes`. Write `src/api/` , not `src/**/*.ts`
 - `reason` (required, ≥40 chars) — what goes wrong if it's violated, concretely
 - `triggering_incident` (optional but encouraged) — the specific bug/gotcha/incident that led to this rule (concrete > abstract for future sessions)
 - `enforced_by` (optional) — the test or command that actually checks this rule, e.g. `tests/test_server.py::TestToolSchemaBudget`. Name the check rather than restating what it asserts: a constraint that duplicates a threshold its test owns will drift from it (that is `con-009`, and `con-004` is how it was found). `verify_quality` confirms the name still resolves and a drift flag then says *"run this"* instead of *"go read the code"*. It is **never executed** — stores travel via `import_snapshot` and `mirror`, so a field that ran commands would be a code-execution path into the store.

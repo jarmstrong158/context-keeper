@@ -1,25 +1,42 @@
 #!/usr/bin/env python3
-"""Context Keeper -- PostToolUse(Edit|Write) scoped-constraint injector.
+"""Context Keeper -- scoped-constraint injector for Edit/Write tool calls.
 
 Session-start injection tells the model the project's rules once, at
-turn one, when they are abstract. This hook is the enforcement half: the
-moment the agent edits a file that a constraint's `scope` covers, the
+turn one, when they are abstract. This hook is the enforcement half: when
+the agent touches a file that a constraint's `scope` covers, the
 constraint is injected right there via hookSpecificOutput.additionalContext
 -- the rule arrives at the exact moment it is about to matter.
 
-Wire it under PostToolUse with matcher "Edit|Write|NotebookEdit" (see
-README). Matching is a normalized substring check: a constraint scoped
-to "hooks/" fires for any edit whose path contains hooks/. Constraints
-scoped "global" never fire here -- they are session-start material.
+PREFER WIRING IT UNDER PreToolUse (matcher "Edit|Write|NotebookEdit").
+PostToolUse also works and stays supported, but it fires *after* the write
+has already landed, which makes the rule a review note rather than a
+guardrail. PreToolUse additionalContext is injected next to the tool
+result, so the model sees the constraint before it commits the edit. The
+hook reads hook_event_name from the payload and answers with the matching
+hookEventName, so one script serves either wiring -- and both at once,
+should a config carry the old and new entries during an upgrade (the
+once-per-session dedupe below means the rule still shows up only once).
+
+Matching is a normalized substring check: a constraint scoped to "hooks/"
+fires for any path containing hooks/. Constraints scoped "global" never
+fire here -- they are session-start material.
 
 Each constraint is injected at most once per session (state kept in
 .context/scope_guard_state.json), so repeated edits to the same area do
 not spam the context.
 
+Opt-in escalation: with `scope_guard.confirm_absolute` set in
+.context/config.json, a PreToolUse hit on an ABSOLUTE constraint also
+returns permissionDecision "ask", so the edit pauses for the user instead
+of merely being annotated. Default off -- it interrupts, and most projects
+want the rule stated, not the edit halted. Note the honest limit: this
+escalates on *scope*, not on violation. Nothing here reads the diff, so it
+cannot know the edit actually breaks the rule.
+
 Output is ASCII-only by deliberate constraint (con-001): Windows hook
 stdout is cp1252 and non-ASCII chars raise UnicodeEncodeError. Per
-con-002, PostToolUse additionalContext is one of the few hook surfaces
-the model actually sees.
+con-002, additionalContext on Pre/PostToolUse is one of the few hook
+surfaces the model actually sees.
 """
 
 import json
@@ -31,6 +48,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 MAX_INJECT = 3
+
+# Events this hook knows how to answer. Anything else (or a payload with no
+# event at all, as older Claude Code builds sent) falls back to PostToolUse,
+# which is where every existing installation has it wired.
+_SUPPORTED_EVENTS = ("PreToolUse", "PostToolUse")
+_DEFAULT_EVENT = "PostToolUse"
 
 
 def _ascii(text):
@@ -50,6 +73,16 @@ def _load_state(path):
         return {}
 
 
+def _confirm_absolute_enabled():
+    """Read the opt-in escalation flag; any problem reading it means off."""
+    try:
+        import server
+        cfg = server.read_config(server.CONTEXT_DIR)
+        return bool((cfg.get("scope_guard") or {}).get("confirm_absolute"))
+    except Exception:
+        return False
+
+
 def _save_state(path, state):
     try:
         tmp = path + ".tmp"
@@ -65,6 +98,10 @@ def main():
         payload = json.load(sys.stdin)
     except Exception:
         return  # malformed input -- never block the tool flow
+
+    event = str(payload.get("hook_event_name") or "").strip()
+    if event not in _SUPPORTED_EVENTS:
+        event = _DEFAULT_EVENT
 
     tool_input = payload.get("tool_input") or {}
     file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
@@ -104,29 +141,47 @@ def main():
     if not fresh:
         return
 
-    lines = [
-        f"Scoped constraint(s) apply to the file you just edited ({os.path.basename(file_path)}):"
-    ]
+    basename = os.path.basename(file_path)
+    if event == "PreToolUse":
+        opening = f"Scoped constraint(s) cover the file you are about to write ({basename}):"
+        closing = ("Check your edit against these BEFORE writing it. Full entries "
+                   "via get_context with the id.")
+    else:
+        opening = f"Scoped constraint(s) apply to the file you just edited ({basename}):"
+        closing = ("Check your change against these before moving on. Full entries "
+                   "via get_context with the id.")
+
+    lines = [opening]
     for c in fresh:
         hardness = c.get("hardness", "absolute")
         lines.append(f"  [{c.get('id')}] ({hardness}) {c.get('rule', '?')}")
         reason = (c.get("reason") or "").strip()
         if reason:
             lines.append(f"      why: {reason}")
-    lines.append(
-        "Check your change against these before moving on. Full entries via "
-        "get_context with the id."
-    )
+    lines.append(closing)
 
     state["injected"] = sorted(injected | {c.get("id") for c in fresh})
     _save_state(state_path, state)
 
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": _ascii("[Context Keeper] " + "\n".join(lines)),
-        }
-    }))
+    out = {
+        "hookEventName": event,
+        "additionalContext": _ascii("[Context Keeper] " + "\n".join(lines)),
+    }
+
+    # Opt-in: pause for the user when an absolute rule governs this path.
+    # Only under PreToolUse -- asking about an edit that already happened
+    # would be theatre.
+    if event == "PreToolUse":
+        absolutes = [c for c in fresh if c.get("hardness", "absolute") == "absolute"]
+        if absolutes and _confirm_absolute_enabled():
+            ids = ", ".join(str(c.get("id")) for c in absolutes)
+            out["permissionDecision"] = "ask"
+            out["permissionDecisionReason"] = _ascii(
+                f"{basename} is covered by absolute constraint(s) {ids}. "
+                "Confirm the edit respects them."
+            )
+
+    print(json.dumps({"hookSpecificOutput": out}))
 
 
 if __name__ == "__main__":

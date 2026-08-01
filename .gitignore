@@ -1,5 +1,10 @@
 __pycache__/
 .context/
+# Derived from the gitignored .context/ store, so it is per-machine too --
+# committing it would let a fresh clone's first constraint write reap every
+# file as belonging to a store it does not have. Regenerate with
+# `context-keeper export_rules '{}'`.
+.claude/rules/context-keeper/
 .mcpregistry_*
 .pytest_cache/
 dist/
