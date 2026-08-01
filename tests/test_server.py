@@ -4539,3 +4539,268 @@ class TestManifestHasNoEditorialKeys:
 
         walk(manifest, "")
         assert not offenders, f"non-spec keys in mcpb/manifest.json: {offenders}"
+
+
+# ===========================================================================
+# Closing the delivery gaps measured after v0.16
+#
+# Measuring real stores turned up two problems that compound: the largest
+# store dropped 116 lines at session start with no trace, and 47% of all
+# constraints were `global`-scoped, meaning their ONLY delivery route was
+# that same truncating summary. Everything path-based built in v0.16 routed
+# around half the rules.
+# ===========================================================================
+
+from server import _scope_to_paths, estimate_tokens
+
+_SUBAGENT_HOOK = str(Path(__file__).parent.parent / "hooks" / "subagent_start.py")
+
+
+class TestTruncationLeavesATrail:
+    """A dropped entry used to be undiscoverable, not merely unsummarised.
+    The SessionStart hook prints the summary text and nothing else, so an id
+    that fell off the end could not be asked for -- the agent had no way to
+    learn it existed."""
+
+    def _big_store(self, tmp_path, n=30):
+        for i in range(n):
+            handle_record_decision(decision_params(
+                tmp_path,
+                summary=f"Decision {i} " + "padding " * 20,
+                tags=[f"topic-{i % 3}"]))
+
+    def test_dropped_ids_are_listed_in_the_summary_text(self, tmp_path):
+        self._big_store(tmp_path)
+        r = handle_get_project_summary({"project_dir": str(tmp_path),
+                                        "token_budget": 500})
+        assert r["summary_truncated"] is True
+        assert "retrieve any of these by id with get_context" in r["summary"]
+        # Every id the caller is told about must actually be findable.
+        listed = [t for t in r["summary"].split() if t.startswith("dec-")]
+        assert listed
+        for eid in listed[:5]:
+            got = handle_get_context({"project_dir": str(tmp_path), "id": eid})
+            assert got.get("entry") or got.get("entries"), eid
+
+    def test_the_trail_is_inside_the_budget(self, tmp_path):
+        """The trail is paid for out of the same budget, not appended past
+        it -- otherwise 'fits the budget' quietly stops being true."""
+        self._big_store(tmp_path)
+        for budget in (300, 500, 900):
+            r = handle_get_project_summary({"project_dir": str(tmp_path),
+                                            "token_budget": budget})
+            assert estimate_tokens(r["summary"]) <= budget, budget
+
+    def test_dropped_ids_also_returned_structurally(self, tmp_path):
+        self._big_store(tmp_path)
+        r = handle_get_project_summary({"project_dir": str(tmp_path),
+                                        "token_budget": 500})
+        assert r["summary_dropped_ids"]
+        assert all(i.startswith(("dec-", "pipe-")) for i in r["summary_dropped_ids"])
+
+    def test_no_trail_when_nothing_was_dropped(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path))
+        r = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert "retrieve any of these by id" not in r["summary"]
+        assert "summary_dropped_ids" not in r
+
+    def test_trail_is_deterministic_across_calls(self, tmp_path):
+        """dec-012: an unchanged store must produce byte-identical text or
+        the session-start prompt cache misses every time."""
+        self._big_store(tmp_path)
+        a = handle_get_project_summary({"project_dir": str(tmp_path),
+                                        "token_budget": 500})["summary"]
+        b = handle_get_project_summary({"project_dir": str(tmp_path),
+                                        "token_budget": 500})["summary"]
+        assert a == b
+
+    def test_floor_over_budget_is_reported_even_with_nothing_dropped(self, tmp_path):
+        """The silent case. When the constraints floor alone exceeds the
+        budget, no lines are dropped -- so a truncation-only flag stays
+        False and the summary quietly overspends every session forever.
+        One real store's 19 constraints are 2429 tokens against 2000."""
+        for i in range(12):
+            handle_record_constraint(constraint_params(
+                tmp_path, rule=f"Constraint {i} " + "with substantial text " * 15))
+        r = handle_get_project_summary({"project_dir": str(tmp_path),
+                                        "token_budget": 50})
+        assert "Absolute Constraints" in r["summary"]
+        assert estimate_tokens(r["summary"]) > 50
+        assert r["summary_over_budget"] is True
+        assert "never dropped" in r["summary_over_budget_note"]
+
+    def test_within_budget_summary_reports_neither_flag(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        r = handle_get_project_summary({"project_dir": str(tmp_path)})
+        assert "summary_over_budget" not in r
+        assert "summary_truncated" not in r
+
+    def test_constraints_still_survive_a_tiny_budget(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        self._big_store(tmp_path)
+        r = handle_get_project_summary({"project_dir": str(tmp_path),
+                                        "token_budget": 10})
+        assert "Absolute Constraints" in r["summary"]
+
+
+class TestGlobalScopeFlag:
+    """47% of real constraints were `global`, which excludes them from the
+    drift check, the .claude/rules/ projection and scope_guard alike. Their
+    only route to the model is the summary -- the thing that truncates."""
+
+    def _issues(self, tmp_path, entry_id):
+        r = handle_verify_quality({"project_dir": str(tmp_path),
+                                   "check_drift": False})
+        entry = next((f for f in r["flagged"] if f["id"] == entry_id), None)
+        return [i["type"] for i in (entry or {}).get("issues", [])]
+
+    def test_flagged_when_enforced_by_names_a_real_file(self, tmp_path):
+        (tmp_path / "server.py").write_text("x = 1", encoding="utf-8")
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="global", enforced_by="tests/../server.py::TestThing"))
+        assert "global_scope" in self._issues(tmp_path, rec["id"])
+
+    def test_flagged_when_a_tag_names_a_real_directory(self, tmp_path):
+        (tmp_path / "hooks").mkdir()
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="global", tags=["hooks"]))
+        assert "global_scope" in self._issues(tmp_path, rec["id"])
+
+    def test_not_flagged_without_evidence(self, tmp_path):
+        """A bare 'consider adding a scope' on every global constraint is
+        noise the reader learns to skip, and some rules really are global."""
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="global", tags=["philosophy", "process"]))
+        assert "global_scope" not in self._issues(tmp_path, rec["id"])
+
+    def test_scoped_constraints_are_never_flagged(self, tmp_path):
+        (tmp_path / "hooks").mkdir()
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="hooks/", tags=["hooks"]))
+        assert "global_scope" not in self._issues(tmp_path, rec["id"])
+
+    def test_decisions_are_never_flagged(self, tmp_path):
+        (tmp_path / "hooks").mkdir()
+        rec = handle_record_decision(decision_params(tmp_path, tags=["hooks"]))
+        assert "global_scope" not in self._issues(tmp_path, rec["id"])
+
+    def test_suggestion_is_a_projectable_scope(self, tmp_path):
+        """A suggestion that cannot become a rules pattern is not a fix."""
+        (tmp_path / "hooks").mkdir()
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, scope="global", tags=["hooks"]))
+        r = handle_verify_quality({"project_dir": str(tmp_path),
+                                   "check_drift": False})
+        entry = next(f for f in r["flagged"] if f["id"] == rec["id"])
+        issue = next(i for i in entry["issues"] if i["type"] == "global_scope")
+        suggested = issue["detail"].split("scope='")[1].split("'")[0]
+        assert _scope_to_paths(suggested)
+
+
+class TestSubagentStartHook:
+    """SessionStart does not fire for subagents and they do not inherit the
+    parent's injected context, so every subagent started with no project
+    memory -- on a fan-out, a dozen contributors who never read the rules."""
+
+    def _run(self, project, agent_type="general-purpose"):
+        payload = json.dumps({
+            "session_id": "s1",
+            "hook_event_name": "SubagentStart",
+            "agent_type": agent_type,
+            "agent_id": "a1",
+        })
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
+        proc = subprocess.run([sys.executable, _SUBAGENT_HOOK], input=payload,
+                              capture_output=True, text=True, env=env, timeout=60)
+        return proc.stdout.strip(), proc.returncode
+
+    def test_injects_the_constraints(self, tmp_path):
+        rec = handle_record_constraint(constraint_params(
+            tmp_path, rule="Hook output must be ASCII only"))
+        out, rc = self._run(tmp_path)
+        assert rc == 0 and out
+        hso = json.loads(out)["hookSpecificOutput"]
+        assert hso["hookEventName"] == "SubagentStart"
+        assert rec["id"] in hso["additionalContext"]
+        assert "Hook output must be ASCII only" in hso["additionalContext"]
+
+    def test_points_at_the_tools_for_everything_else(self, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path))
+        out, _ = self._run(tmp_path)
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "get_context" in ctx and "get_project_summary" in ctx
+
+    def test_silent_when_no_constraints_recorded(self, tmp_path):
+        """A header with nothing under it is worse than saying nothing."""
+        context_dir(tmp_path).mkdir(parents=True, exist_ok=True)
+        out, rc = self._run(tmp_path)
+        assert rc == 0 and out == ""
+
+    def test_silent_on_an_unresolved_project(self, tmp_path):
+        out, rc = self._run(tmp_path / "nowhere")
+        assert rc == 0 and out == ""
+
+    def test_malformed_stdin_never_interferes_with_the_spawn(self, tmp_path):
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
+        proc = subprocess.run([sys.executable, _SUBAGENT_HOOK], input="not json",
+                              capture_output=True, text=True, env=env, timeout=60)
+        assert proc.returncode == 0 and proc.stdout.strip() == ""
+
+    def test_caps_the_constraint_count(self, tmp_path):
+        """This fires once per spawned subagent, so a fan-out multiplies it.
+        Absolute rules are kept first when the cap bites."""
+        for i in range(20):
+            handle_record_constraint(constraint_params(
+                tmp_path, rule=f"Advisory rule number {i} about things",
+                hardness="advisory"))
+        keeper = handle_record_constraint(constraint_params(
+            tmp_path, rule="An absolute rule that must survive the cap",
+            hardness="absolute"))
+        out, _ = self._run(tmp_path)
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert keeper["id"] in ctx
+        assert "not shown" in ctx
+
+    def test_output_is_ascii_only(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Never use an em-dash — or an arrow → here"))
+        out, _ = self._run(tmp_path)
+        out.encode("ascii")
+
+
+class TestHotPathHooksStayLight:
+    """con-010 generalised. scope_guard runs before every edit;
+    constraint_reinject's matcher is "" so it runs after EVERY tool call;
+    subagent_start runs once per spawned agent and a fan-out multiplies it.
+    None of them may import server."""
+
+    @pytest.mark.parametrize("hook_name", [
+        "scope_guard.py", "constraint_reinject.py", "subagent_start.py"])
+    def test_hook_does_not_import_server(self, hook_name, tmp_path):
+        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
+        payload = json.dumps({
+            "session_id": "probe",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(tmp_path / "hooks" / "a.py")},
+        })
+        repo = str(Path(__file__).parent.parent)
+        hook = str(Path(repo) / "hooks" / hook_name)
+        probe = (
+            "import sys, io, json, runpy\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            f"sys.stdin = io.StringIO({payload!r})\n"
+            "try:\n"
+            f"    runpy.run_path({hook!r}, run_name='__main__')\n"
+            "except SystemExit:\n    pass\n"
+            "sys.stderr.write('HEAVY' if 'server' in sys.modules else 'LIGHT')\n"
+        )
+        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
+        proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                              text=True, env=env, timeout=60)
+        assert proc.stderr.strip()[-5:] == "LIGHT", (
+            f"hooks/{hook_name} imported server; use store_paths (con-010)")
+
+    def test_constraint_formatting_has_one_implementation(self):
+        import server as srv
+        import store_paths
+        assert srv._constraint_lines is store_paths.constraint_lines

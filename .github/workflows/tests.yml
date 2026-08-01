@@ -28,3 +28,21 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
+
+  # Validate the desktop-bundle manifest on every PR, not at release time.
+  #
+  # v0.16.0 shipped without its .mcpb because the manifest carried a key the
+  # packer rejects, and that was only discovered when the release build
+  # failed -- after PyPI and the registry had already published. The Python
+  # tests cover the specific class (no editorial keys) without needing node;
+  # this runs the real validator, which catches anything else the schema
+  # rejects. One job, not a matrix: the manifest is platform-independent.
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Validate mcpb/manifest.json against the real packer schema
+        run: npx --yes @anthropic-ai/mcpb@2 validate mcpb/manifest.json

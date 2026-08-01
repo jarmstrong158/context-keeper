@@ -43,12 +43,13 @@ except Exception:  # never let a mirror import problem break the server
 # mcpb/manifest.json, which the packaging formats require verbatim -- so
 # tests/test_server.py::TestVersionConsistency asserts all five agree. Bump
 # them together or that test fails the build.
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 # Store location and raw reads live in store_paths so the hooks can have them
 # without paying for this module's imports (~73ms, mostly mirror -> urllib).
 # Re-exported here because every existing caller and test refers to them
 # through server. One implementation, two import costs.
+import store_paths  # noqa: E402
 from store_paths import (  # noqa: E402
     CONTEXT_DIR_NAME,
     _read_json_file_checked,
@@ -79,6 +80,12 @@ def read_json_file(path):
 # .claude/rules/ rather than the directory itself, so regeneration can retire
 # its own stale files without ever considering a hand-written rule.
 RULES_DIR_DEFAULT = os.path.join(".claude", "rules", "context-keeper")
+
+# Cap on the id list that follows a truncated summary. Bare ids are cheap
+# (~4 tokens each) but not free, and past this many the list stops being a
+# lookup aid and becomes its own wall of text -- the count plus a partial
+# list still tells the agent that more exists and how to ask for it.
+MAX_DROPPED_IDS_LISTED = 40
 
 PROJECT_DIR = _resolve_project_dir()
 CONTEXT_DIR = os.path.join(PROJECT_DIR, CONTEXT_DIR_NAME) if PROJECT_DIR else None
@@ -2361,51 +2368,22 @@ def handle_query_entries(params):
     }
 
 
-def _constraint_lines(constraints):
-    """Format active constraints into the Absolute/Advisory line list.
-
-    Single source of truth for how constraints render, so the SessionStart
-    summary, the reload_constraints tool, and the re-injection hook all
-    surface them identically. Absolute first (true invariants), advisory
-    second, a blank line between the two sections when both exist. Each
-    entry is `  [con-XXX] <rule>` — the exact shape get_project_summary
-    has always emitted.
-    """
-    absolute = [c for c in constraints if c.get("hardness") == "absolute"]
-    advisory = [c for c in constraints if c.get("hardness") != "absolute"]
-    lines = []
-    if absolute:
-        lines.append(f"Absolute Constraints ({len(absolute)}):")
-        for c in absolute:
-            lines.append(f"  [{c['id']}] {c['rule']}")
-    if advisory:
-        if lines:
-            lines.append("")
-        lines.append(f"Advisory Constraints ({len(advisory)}):")
-        for c in advisory:
-            lines.append(f"  [{c['id']}] {c['rule']}")
-    return lines
+# Constraint rendering lives in store_paths so the hooks on hot paths can
+# format the block without importing this module (con-010). Re-exported
+# under its long-standing private name because callers and tests refer to
+# it through server.
+_constraint_lines = store_paths.constraint_lines
 
 
 def build_constraints_block(base_dir=None):
     """Return the constraints-only re-injection block.
 
-    Deliberately narrow: the SAME Absolute/Advisory constraint lines
-    SessionStart surfaces, and nothing else from the store — no decisions,
-    no pipelines. The whole point of re-injection is a lightweight rules
-    refresh, not dumping the full store again. Shared by the
-    reload_constraints tool and the constraint_reinject.py hook.
-
-    Returns {"initialized": bool, "count": int, "text": str}.
+    Thin wrapper over store_paths.build_constraints_block that preserves
+    this module's default of CONTEXT_DIR when no base_dir is passed.
     """
     if base_dir is None:
         base_dir = CONTEXT_DIR
-    if base_dir is None or not os.path.exists(base_dir):
-        return {"initialized": False, "count": 0, "text": ""}
-    constraints = [c for c in read_json_file(os.path.join(base_dir, "constraints.json"))
-                   if c.get("status", "active") == "active"]
-    lines = _constraint_lines(constraints)
-    return {"initialized": True, "count": len(constraints), "text": "\n".join(lines)}
+    return store_paths.build_constraints_block(base_dir)
 
 
 def handle_reload_constraints(params):
@@ -2534,12 +2512,52 @@ def handle_get_project_summary(params):
     # errors rather than silently dropping past its read limit; the same
     # principle applies here -- an over-budget summary is a condition to
     # surface, not to absorb.
+    # The id trail below is INSIDE the budget, not appended past it. Truncation
+    # used to make entries vanish from session start: the hook prints this text
+    # and nothing else, so an id that fell off the end was not merely
+    # unsummarised, it was undiscoverable -- the agent had no way to learn
+    # dec-047 existed in order to go ask for it. On the largest real store that
+    # was 116 lines of memory silently gone. Listing the bare ids costs a
+    # fraction of the entries they stand for and turns a silent loss into a
+    # lookup, so it is worth paying for out of the same budget rather than
+    # quietly overspending it.
+    #
+    # Deliberately ids only, in stable store order, and NOT ranked against the
+    # working tree: dec-012's cache-stable prefix needs this text to be
+    # byte-identical across sessions when the store has not changed. Relevance
+    # ranking belongs in the volatile work-focus block appended after, never
+    # here.
+    def _dropped_trail(kept_text):
+        dropped = [e.get("id") for e in decisions + pipelines
+                   if e.get("id") and f"[{e.get('id')}]" not in kept_text]
+        if not dropped:
+            return "", []
+        shown = dropped[:MAX_DROPPED_IDS_LISTED]
+        tail = (f" (+{len(dropped) - len(shown)} more)"
+                if len(dropped) > len(shown) else "")
+        return (
+            f"\n\nNot shown above, over the {budget}-token budget "
+            f"({len(dropped)}) -- retrieve any of these by id with "
+            f"get_context:\n  " + " ".join(shown) + tail
+        ), dropped
+
     summary_truncated = False
     lines_dropped = 0
+    dropped_ids = []
     if estimate_tokens(summary_text) > budget:
         floor = 1 + len(con_lines) + (1 if con_lines else 0)  # header + constraints
         original_len = len(lines)
-        while len(lines) > floor and estimate_tokens("\n".join(lines)) > budget:
+
+        def _total(candidate_lines):
+            text = "\n".join(candidate_lines)
+            trail, _ = _dropped_trail(text)
+            return estimate_tokens(text + trail)
+
+        # Each popped line removes far more than the ~4 tokens its id adds
+        # back to the trail, so this converges. The floor still wins if even
+        # constraints-plus-trail cannot fit: losing the rules is the one
+        # outcome worse than overspending, and summary_truncated reports it.
+        while len(lines) > floor and _total(lines) > budget:
             lines.pop()
         # Don't leave a dangling section header (e.g. "Pipelines (3):") or a
         # trailing blank line after trimming the entries out from under it.
@@ -2549,6 +2567,16 @@ def handle_get_project_summary(params):
         lines_dropped = original_len - len(lines)
         summary_truncated = lines_dropped > 0
         summary_text = "\n".join(lines)
+        trail, dropped_ids = _dropped_trail(summary_text)
+        summary_text += trail
+
+    # Over budget WITHOUT having dropped anything is its own condition, and
+    # the one most likely to go unnoticed: it means the constraints floor
+    # alone did not fit, so the summary silently overspends every session.
+    # One real store's 19 constraints are 2429 tokens against a 2000 budget.
+    # Reporting it separately is what turns "my budget is ignored" into
+    # "these rules cost more than the budget you set".
+    summary_over_budget = estimate_tokens(summary_text) > budget
 
     # Task focus, appended AFTER everything above and after truncation.
     #
@@ -2637,11 +2665,20 @@ def handle_get_project_summary(params):
         "stale_entries": stale if stale else None,
         "usage_guidance": USAGE_GUIDANCE,
     }
+    if summary_over_budget:
+        result["summary_over_budget"] = True
+        result["summary_over_budget_note"] = (
+            f"The summary is {estimate_tokens(summary_text)} tokens against a "
+            f"{budget}-token budget, because the constraints alone exceed it "
+            "and they are never dropped. Shorten or deprecate constraints, or "
+            "raise token_budget -- but know that every session pays this."
+        )
     if summary_truncated:
         # Emitted only when it happened, so the common case stays byte-stable
         # for the session-start prompt cache (dec-012's cache-stable prefix).
         result["summary_truncated"] = True
         result["summary_lines_dropped"] = lines_dropped
+        result["summary_dropped_ids"] = dropped_ids
         result["summary_truncation_note"] = (
             f"The summary exceeded the {budget}-token budget and {lines_dropped} "
             "line(s) were dropped from the end; constraints were kept. Entries "
@@ -3090,6 +3127,49 @@ def handle_repair_mojibake(params):
     }
 
 
+def _project_root_for(base_dir):
+    """The project directory containing a .context/ dir, or None."""
+    return os.path.dirname(os.path.abspath(base_dir)) if base_dir else None
+
+
+def _suggest_scope(entry, project_root):
+    """A concrete scope path this constraint could use, or None.
+
+    `global` scope is not a formatting nit -- it is the difference between
+    a rule that participates and one that does not. A global constraint
+    gets no drift check (no path to compare commits against), no
+    .claude/rules/ projection (no pattern to build), and never fires
+    scope_guard. Its only route to the model is the session-start summary,
+    which is also the thing that truncates first on a large store.
+
+    Only suggests when there is real evidence, because a bare "consider
+    adding a scope" on every global constraint is noise the reader learns
+    to skip -- and some rules genuinely are global.
+    """
+    if not project_root:
+        return None
+
+    def _exists(rel):
+        return rel and os.path.exists(os.path.join(project_root, rel))
+
+    # Strongest evidence: the entry names its own enforcing test/command.
+    # "tests/test_server.py::TestX" -> "tests/test_server.py".
+    enforced = (entry.get("enforced_by") or "").strip()
+    if enforced:
+        candidate = enforced.split("::", 1)[0].strip().replace("\\", "/")
+        candidate = candidate.split()[0] if candidate else ""
+        if _exists(candidate) and _scope_to_paths(candidate):
+            return candidate
+
+    # Next best: a tag that names a real directory or module in the repo.
+    for tag in entry.get("tags", []):
+        for candidate in (f"{tag}/", f"{tag}.py", tag):
+            rel = candidate.rstrip("/")
+            if _exists(rel) and _scope_to_paths(candidate):
+                return candidate
+    return None
+
+
 def handle_verify_quality(params):
     """Scan entries for quality issues and return a flagged list.
 
@@ -3222,6 +3302,24 @@ def handle_verify_quality(params):
         # The store has to be able to report this itself: the damage is
         # legible enough that nobody re-reads the entry, so it degrades
         # every retrieval that surfaces it without ever announcing itself.
+        # A global-scoped constraint is invisible to every path-based
+        # delivery mechanism. Only flagged when a concrete path can be
+        # suggested -- see _suggest_scope.
+        if tname == "constraints" and (e.get("scope") or "global").lower() == "global":
+            suggestion = _suggest_scope(e, _project_root_for(base_dir))
+            if suggestion:
+                issues.append({
+                    "type": "global_scope",
+                    "detail": (
+                        f"Scope is 'global', so this rule gets no drift check, "
+                        f"no .claude/rules/ file, and never fires scope_guard -- "
+                        f"it reaches the model only via the session-start summary. "
+                        f"Evidence suggests scope='{suggestion}'. Set it with "
+                        f"update_entry, or leave it global if the rule really "
+                        f"does apply everywhere."
+                    ),
+                })
+
         garbled = _entry_mojibake_fields(e)
         if garbled:
             issues.append({

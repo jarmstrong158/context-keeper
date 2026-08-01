@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "context-keeper-mcp"
-version = "0.16.0"
+version = "0.17.0"
 description = "MCP server that maintains project context (decisions, pipelines, constraints) across Claude conversations"
 readme = "README.md"
 license = "MIT"
@@ -64,6 +64,7 @@ include = [
     "hooks/commit_capture_reminder.py",
     "hooks/scope_guard.py",
     "hooks/constraint_reinject.py",
+    "hooks/subagent_start.py",
     "LICENSE",
     "README.md",
     "CLAUDE.md",
@@ -84,3 +85,4 @@ include = [
 "hooks/commit_capture_reminder.py" = "hooks/commit_capture_reminder.py"
 "hooks/scope_guard.py" = "hooks/scope_guard.py"
 "hooks/constraint_reinject.py" = "hooks/constraint_reinject.py"
+"hooks/subagent_start.py" = "hooks/subagent_start.py"

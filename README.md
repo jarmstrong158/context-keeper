@@ -80,6 +80,63 @@ The retrieval and honesty properties are measured, not asserted — the harness 
 
 Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md).
 
+## v0.17: Closing the Delivery Gaps
+
+v0.16 got a rule in front of the model *before* the edit. Measuring real
+stores afterwards showed two holes that compound, and one that had been open
+since the beginning.
+
+- **Truncated entries are no longer undiscoverable.** The SessionStart hook
+  prints the summary text and nothing else, so an entry dropped for budget
+  wasn't merely unsummarised — the agent had no way to learn it existed in
+  order to go ask for it. On the largest real store that was **116 lines of
+  memory silently gone**. The summary now ends with the ids it dropped, paid
+  for **inside** the same budget (bare ids cost a fraction of the entries they
+  stand for) and emitted in stable store order so the prompt-cache prefix stays
+  byte-identical. `summary_dropped_ids` carries the same list structurally.
+
+  The constraints floor still wins over the budget when it has to — one real
+  store's 19 constraints are 2429 tokens against a 2000 budget — because
+  losing the rules is worse than overspending. It is reported, never silent.
+
+- **`global` scope is now a flagged quality issue.** 47% of constraints across
+  real projects were `global`, which excludes them from the drift check, the
+  `.claude/rules/` projection *and* `scope_guard` — leaving the truncating
+  summary as their only route to the model. Those two problems multiply.
+  `verify_quality` now flags `global_scope`, but **only when it can name a
+  concrete path** from the entry's `enforced_by` or a tag matching a real
+  directory. A bare "consider adding a scope" on every global rule is noise
+  the reader learns to skip, and some rules genuinely are global.
+
+- **Subagents get the project rules.** `SessionStart` does not fire for
+  subagents and they do not inherit the parent's injected context, so every
+  subagent has been starting with no project memory — on a fan-out, a dozen
+  contributors who never read the rules. The new `subagent_start.py` hook
+  injects the constraints-only block via `SubagentStart`. Constraints only,
+  and capped: this fires once per spawned agent, so a fan-out multiplies it.
+
+  ```json
+  "SubagentStart": [
+    { "hooks": [{ "type": "command",
+                  "command": "python /path/to/context-keeper/hooks/subagent_start.py",
+                  "timeout": 5 }] }
+  ]
+  ```
+
+- **A release can no longer half-fail in silence.** v0.16.0 published to PyPI
+  and the MCP registry, then the bundle workflow failed on manifest
+  validation — and a release missing an asset is indistinguishable from one
+  that never had it. A new `verify-release` workflow asserts all three
+  channels actually received the version, and the manifest is now validated on
+  every PR rather than at release time.
+
+- **`constraint_reinject` came off the heavy import path.** Its matcher is
+  `""`, so it runs after *every* tool call — the hottest hook in the set — and
+  it was importing `server` to format a list of strings. Constraint rendering
+  moved to `store_paths`, so it and `subagent_start` both run within ~5ms of
+  Python's own startup floor. One implementation still, shared by every
+  surface.
+
 ## v0.16: Path-Triggered Rules, and the Rule Before the Edit
 
 Both halves of this release come from reading [Anthropic's own memory

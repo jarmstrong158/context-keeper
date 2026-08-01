@@ -33,6 +33,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+# store_paths, NOT server. This hook's matcher is "" -- it runs after EVERY
+# tool call, so it is the hottest path any hook here sits on. Importing
+# server would add the mirror/urllib stack to every single tool use for a
+# block of formatted strings (con-010).
+import store_paths
+
 
 def _ascii(text):
     return str(text).encode("ascii", "replace").decode("ascii")
@@ -63,14 +69,14 @@ def main():
     except Exception:
         return  # malformed input -- never block the tool flow
 
-    try:
-        import server
-    except Exception:
-        return  # never break the tool flow because memory could not load
-    if server.CONTEXT_DIR is None or not os.path.exists(server.CONTEXT_DIR):
+    context_dir = store_paths.resolve_context_dir()
+    if context_dir is None or not os.path.exists(context_dir):
         return
 
-    cfg = server.read_config(server.CONTEXT_DIR).get("constraint_reinjection") or {}
+    # Raw read, no defaults merged: safe here because the default is False,
+    # so a missing file, a missing key and an explicit false all mean the
+    # same thing and there is no default to drift away from.
+    cfg = store_paths.read_raw_config(context_dir).get("constraint_reinjection") or {}
     if not cfg.get("enabled"):
         return  # opt-in, default off: unchanged behavior when disabled
 
@@ -84,7 +90,7 @@ def main():
     # Per-session tool counter. Reset when the session id changes so a new
     # session does not inherit a stale count from a previous one.
     session_id = str(payload.get("session_id") or "unknown")
-    state_path = os.path.join(server.CONTEXT_DIR, "reinject_state.json")
+    state_path = os.path.join(context_dir, "reinject_state.json")
     state = _load_state(state_path)
     if state.get("session_id") != session_id:
         state = {"session_id": session_id, "tool_count": 0, "last_injected_at": 0}
@@ -96,7 +102,7 @@ def main():
         _save_state(state_path, state)  # persist the advanced counter
         return
 
-    block = server.build_constraints_block(server.CONTEXT_DIR)
+    block = store_paths.build_constraints_block(context_dir)
     if not block.get("initialized") or not block.get("text"):
         # No constraints to surface -- still advance the counter so we do
         # not rescan on literally every tool call once one is recorded.

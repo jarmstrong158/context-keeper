@@ -150,3 +150,48 @@ def resolve_context_dir():
     """The resolved .context/ directory for this process, or None."""
     project = _resolve_project_dir()
     return os.path.join(project, CONTEXT_DIR_NAME) if project else None
+
+
+def constraint_lines(constraints):
+    """Format active constraints into the Absolute/Advisory line list.
+
+    Single source of truth for how constraints render, so the SessionStart
+    summary, the reload_constraints tool, the re-injection hook and the
+    subagent hook all surface them identically. Absolute first (true
+    invariants), advisory second, a blank line between the two sections
+    when both exist.
+
+    Lives here rather than in server.py because two of those callers are
+    hooks on hot paths -- constraint_reinject fires on EVERY tool call --
+    and importing server to format a list of strings would cost them the
+    whole mirror/urllib import stack (con-010).
+    """
+    absolute = [c for c in constraints if c.get("hardness") == "absolute"]
+    advisory = [c for c in constraints if c.get("hardness") != "absolute"]
+    lines = []
+    if absolute:
+        lines.append(f"Absolute Constraints ({len(absolute)}):")
+        for c in absolute:
+            lines.append(f"  [{c['id']}] {c['rule']}")
+    if advisory:
+        if lines:
+            lines.append("")
+        lines.append(f"Advisory Constraints ({len(advisory)}):")
+        for c in advisory:
+            lines.append(f"  [{c['id']}] {c['rule']}")
+    return lines
+
+
+def build_constraints_block(base_dir):
+    """Return the constraints-only block: {initialized, count, text}.
+
+    Deliberately narrow -- the SAME Absolute/Advisory lines SessionStart
+    surfaces, and nothing else from the store. The point of re-injection is
+    a lightweight rules refresh, not dumping the store again.
+    """
+    if base_dir is None or not os.path.exists(base_dir):
+        return {"initialized": False, "count": 0, "text": ""}
+    constraints = [c for c in read_json_file(os.path.join(base_dir, "constraints.json"))
+                   if c.get("status", "active") == "active"]
+    lines = constraint_lines(constraints)
+    return {"initialized": True, "count": len(constraints), "text": "\n".join(lines)}
