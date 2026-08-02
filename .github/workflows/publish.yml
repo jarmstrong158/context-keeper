@@ -26,10 +26,21 @@ jobs:
         run: |
           curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
 
+      # Only a tag push carries a version in GITHUB_REF. This workflow also runs
+      # on `release` and `workflow_dispatch`, where GITHUB_REF is refs/heads/main
+      # -- the old unconditional strip left that string intact and published
+      # `"version": "refs/heads/main"`, which the registry rejected with a 400.
+      # Outside a tag push, server.json is already authoritative:
+      # TestVersionConsistency asserts all five version literals agree.
       - name: Sync server.json version to the release tag
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json
+            echo "Synced server.json to tag version $VERSION"
+          else
+            echo "Not a tag push; using server.json as committed ($(jq -r .version server.json))"
+          fi
 
       - name: Authenticate to MCP Registry (GitHub OIDC)
         run: ./mcp-publisher login github-oidc
