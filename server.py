@@ -58,6 +58,71 @@ from store_paths import (  # noqa: E402
     _xylem_session_project,
 )
 
+SERVER_NAME = "context-keeper"
+
+# --- MCP protocol revision support -----------------------------------------
+#
+# 2026-07-28 removed the initialize/initialized handshake: a modern client
+# declares its version in `params._meta` on every request instead. This server
+# is deliberately DUAL-ERA -- it answers both -- because the .mcpb bundle ships
+# to Claude Desktop installs we do not control, and a modern-only server would
+# strand anyone on an older Desktop build with no way to fall forward.
+#
+# Implemented by hand rather than by adopting the official SDK: zero
+# dependencies is an advertised property of this project (README, and the
+# .mcpb manifest), and the Desktop bundle installs with no pip step at all, so
+# taking a dependency would break that install path outright.
+PROTOCOL_VERSION = "2026-07-28"
+LEGACY_PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_PROTOCOL_VERSIONS = [PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION]
+
+# Reserved by the spec for protocol-defined errors (-32020..-32099).
+UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+_META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+
+# SEP-2549 freshness hints. TOOLS is module-level constant data that cannot
+# change while the process lives, and the catalogue is identical for every
+# caller with no auth-scoped variation, so it is `public`. Tool *results* are
+# project-specific, but tools/call is not a cacheable method.
+CACHE_TTL_MS = 300_000
+CACHEABLE_METHODS = frozenset({"tools/list", "server/discover"})
+
+
+def _request_protocol_version(params):
+    """The protocol version a modern client declared, or None if it is legacy.
+
+    Presence of the `_meta` key is the era signal: modern clients send it on
+    every request, legacy clients never do.
+    """
+    meta = params.get("_meta")
+    if isinstance(meta, dict):
+        version = meta.get(_META_PROTOCOL_VERSION)
+        if isinstance(version, str):
+            return version
+    return None
+
+
+def _result(msg_id, result, *, modern, method=None):
+    """Wrap a result, stamping the fields 2026-07-28 requires.
+
+    Legacy callers get the byte-identical shape they got before this
+    migration; the modern fields are added only for modern callers, so an old
+    Claude Desktop build sees no change at all.
+    """
+    if modern:
+        result = dict(result)
+        result["resultType"] = "complete"
+        meta = dict(result.get("_meta") or {})
+        # No handshake any more, so identity travels on every result.
+        meta[_META_SERVER_INFO] = {"name": SERVER_NAME, "version": __version__}
+        result["_meta"] = meta
+        if method in CACHEABLE_METHODS:
+            result["ttlMs"] = CACHE_TTL_MS
+            result["cacheScope"] = "public"
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
 
 def read_json_file(path):
     """Soft read for retrieval paths: missing or corrupt both yield [].
@@ -3725,25 +3790,56 @@ def _dispatch_message(msg):
     if not isinstance(params, dict):
         params = {}
 
+    # --- Protocol era detection (revision 2026-07-28) ----------------------
+    #
+    # There is no handshake in 2026-07-28: a modern client declares its
+    # protocol version in `params._meta` on every request. A legacy client
+    # opens with `initialize` and never sends `_meta`. Presence of that key is
+    # therefore the era signal, and this server answers both -- deliberately.
+    # The .mcpb bundle ships to Claude Desktop installs we do not control, so
+    # dropping legacy clients would strand users on older Desktop builds.
+    requested_version = _request_protocol_version(params)
+    modern = requested_version is not None
+
+    if modern and requested_version not in SUPPORTED_PROTOCOL_VERSIONS:
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {
+                "code": UNSUPPORTED_PROTOCOL_VERSION,
+                "message": "Unsupported protocol version",
+                "data": {
+                    "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                    "requested": requested_version,
+                },
+            },
+        }
+
+    if method == "server/discover":
+        # MUST be implemented as of 2026-07-28. Clients MAY call it to select a
+        # version up front, or use it on stdio as a backward-compatibility
+        # probe, so it answers regardless of the era the caller declared.
+        return _result(msg_id, {
+            "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+            "capabilities": {"tools": {}},
+        }, modern=True, method="server/discover")
+
     if method == "initialize":
+        # Legacy era only. Modern clients never send this.
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "context-keeper", "version": __version__},
+                "serverInfo": {"name": SERVER_NAME, "version": __version__},
             },
         }
     if method.startswith("notifications/"):
         # Notifications take no reply, per JSON-RPC 2.0.
         return None
     if method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {"tools": TOOLS},
-        }
+        return _result(msg_id, {"tools": TOOLS}, modern=modern, method="tools/list")
     if method == "tools/call":
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
@@ -3752,14 +3848,10 @@ def _dispatch_message(msg):
         handler = HANDLERS.get(tool_name)
 
         if handler is None:
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"})}],
-                    "isError": True,
-                },
-            }
+            return _result(msg_id, {
+                "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"})}],
+                "isError": True,
+            }, modern=modern)
         raised = False
         try:
             result = handler(tool_args)
@@ -3774,11 +3866,7 @@ def _dispatch_message(msg):
         # the exception text as a successful payload.
         if raised:
             tool_result["isError"] = True
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": tool_result,
-        }
+        return _result(msg_id, tool_result, modern=modern)
     return {
         "jsonrpc": "2.0",
         "id": msg_id,

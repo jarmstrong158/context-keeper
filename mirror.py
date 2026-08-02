@@ -60,6 +60,11 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+# Protocol revision this mirror speaks as an MCP *client* to the remote.
+# Kept in step with server.py's PROTOCOL_VERSION.
+MCP_PROTOCOL_VERSION = "2026-07-28"
+MIRROR_CLIENT_VERSION = "0.15"
+
 # Local store name <-> remote singular kind.
 _TYPE_TO_KIND = {
     "decisions": "decision",
@@ -372,17 +377,43 @@ def _rpc_call(cfg, tool_name, arguments):
     Raises on transport error, JSON-RPC error, or tool-level isError so
     callers can fail soft around it.
     """
+    # Speak protocol revision 2026-07-28 as a client: per-request `_meta`
+    # carrying version, identity and capabilities, plus the standard request
+    # headers a Streamable-HTTP server requires.
+    #
+    # This is deliberately done BEFORE the remote is migrated. The extra
+    # `_meta` keys and headers are additive, so the current legacy Worker
+    # ignores them, while a migrated Worker MUST reject a POST with no
+    # `MCP-Protocol-Version` header. Sending them now means the mirror keeps
+    # working across the remote's migration in either order, rather than
+    # breaking in the window between the two deploys.
     body = {
         "jsonrpc": "2.0",
         "id": _next_rpc_id(),
         "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "context-keeper-mirror",
+                    "version": MIRROR_CLIENT_VERSION,
+                },
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        },
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(cfg["url"], data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json, text/event-stream")
-    req.add_header("User-Agent", "context-keeper-mirror/0.15")
+    req.add_header("User-Agent", f"context-keeper-mirror/{MIRROR_CLIENT_VERSION}")
+    # The header value MUST match the `_meta` version in the body, or a
+    # conforming server answers -32020 HeaderMismatch.
+    req.add_header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+    req.add_header("Mcp-Method", "tools/call")
+    req.add_header("Mcp-Name", tool_name)
     with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
         raw = resp.read().decode("utf-8")
         ctype = resp.headers.get("content-type", "")
