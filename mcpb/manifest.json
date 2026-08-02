@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "context-keeper",
   "display_name": "Context Keeper",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Local, zero-dependency project memory for AI assistants: decisions, constraints, and workflows with the rationale behind them.",
   "long_description": "Context Keeper is a local MCP server that gives AI coding assistants persistent project memory — the decisions, constraints, and workflows of a project and the reasoning behind them — so a new session doesn't start from zero or confidently redo what you already ruled out. Structured, rationale-first memory with schema-enforced \"why,\" origin-based trust, hybrid retrieval (full-text + optional local semantic) with honest abstention, a knowledge lifecycle (supersede, contradiction detection, dedup-and-merge, decay, explicit forget), and a structured field query alongside relevance search. Everything is stored as readable JSON in a folder you choose. Zero dependencies by default; nothing leaves your machine.",
   "author": {

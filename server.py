@@ -43,7 +43,7 @@ except Exception:  # never let a mirror import problem break the server
 # mcpb/manifest.json, which the packaging formats require verbatim -- so
 # tests/test_server.py::TestVersionConsistency asserts all five agree. Bump
 # them together or that test fails the build.
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 # Store location and raw reads live in store_paths so the hooks can have them
 # without paying for this module's imports (~73ms, mostly mirror -> urllib).
