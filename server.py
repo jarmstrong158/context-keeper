@@ -219,6 +219,24 @@ DEFAULT_CONFIG = {
     "scope_guard": {"confirm_absolute": False},
 }
 
+# Tunables NOT listed above are module constants, deliberately: a store cannot
+# override them. Naming them here is the point -- an audit found seven scattered
+# across three thousand lines with no way to tell which were configurable, so
+# "can I change this per project?" had no answer short of reading the call site.
+#
+#   ranking.py        _SEM_REL_LO / _SEM_REL_HI   cosine calibration band;
+#                                                 per-store override exists as
+#                                                 semantic.relevance_floor /
+#                                                 relevance_ceiling
+#   server.py         DEFAULT_SIMILAR_THRESHOLD   overridable: similar_threshold
+#                     DEFAULT_SUPERSESSION_THRESHOLD
+#                                                 overridable: supersession_threshold
+#                     _ADVISORY_SUMMARY_CHARS     fixed: presentation width
+#                     _PREDECESSOR_TEXT_CHARS     fixed: presentation width
+#                     MAX_DROPPED_IDS_LISTED      fixed: id-trail cap
+#                     CACHE_TTL_MS                fixed: protocol cache hint
+#   handle_get_project_summary.CLUSTER_THRESHOLD  fixed: when to cluster by topic
+
 USAGE_GUIDANCE = (
     "Context Keeper maintains project memory across conversations. "
     "Call get_project_summary at conversation start to orient yourself. "
