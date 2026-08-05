@@ -1,0 +1,620 @@
+{
+  "_README": [
+    "Golden set for the context-keeper retrieval eval. Run with evals/run_retrieval_eval.py.",
+    "",
+    "AUTHORING RULE, and the main threat to this whole exercise: every question is",
+    "written from the PROBLEM the entry solves -- the symptom you would be staring at",
+    "before you knew the entry existed -- never by paraphrasing its summary. A query",
+    "derived from the summary shares surface tokens with the entry it is supposed to",
+    "find, so lexical scoring hits it for free and recall comes out inflated. The",
+    "questions below are phrased the way someone would ask BEFORE they knew the answer,",
+    "which is the only condition under which the number means anything.",
+    "",
+    "case_type:",
+    "  positive  - a real question; `expected` lists every entry that should come back.",
+    "  negative  - a plausible IN-DOMAIN question with no correct entry. `expected` is",
+    "              empty. Measures false positives: does retrieval invent an answer?",
+    "  history   - the correct answer is a SUPERSEDED entry, so this checks that history",
+    "              stays reachable when you ask for it. Runs against evals/fixtures/",
+    "              (real content, synthesized supersedes edges) because no live store on",
+    "              this machine has a single superseded entry -- see build_history_fixtures.py.",
+    "",
+    "`store` is a repo-relative directory name; fixtures are prefixed 'fixtures/'.",
+    "",
+    "STORES ARE PUBLIC-ONLY. A case's `query` and `notes` paraphrase the entry they target, and this repo is public, so cases may only be drawn from stores whose project repo is also public. Cases sourced from private or remote-less projects were removed for this reason and must not be added back (con-015-12da). tests/test_retrieval_eval.py enforces the allowed store list."
+  ],
+  "cases": [
+    {
+      "id": "ck-01",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "my agent keeps saying it will write things down later and then the session ends and nothing got recorded",
+      "expected": [
+        "dec-003"
+      ],
+      "notes": "Problem-side: capture batched 'for later' under load. Summary says 'anchored to git commits'."
+    },
+    {
+      "id": "ck-02",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "the process died while saving and afterwards the file only had one item in it, everything else was gone",
+      "expected": [
+        "dec-004"
+      ],
+      "notes": "Corrupt-read-as-empty-store then append. No shared vocabulary with 'atomic write'."
+    },
+    {
+      "id": "ck-03",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "rules get explained at the very beginning when they are abstract and by the time it matters nobody remembers them",
+      "expected": [
+        "dec-005",
+        "dec-018-c8aa",
+        "dec-019-9c32"
+      ],
+      "notes": "The delivery-timing problem behind scoped re-injection."
+    },
+    {
+      "id": "ck-04",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "asked about something we never wrote down and it confidently handed back an unrelated item as if it were the answer",
+      "expected": [
+        "dec-010"
+      ],
+      "notes": "Abstention. Query is the symptom; entry says 'no_confident_match below min_relevance'."
+    },
+    {
+      "id": "ck-05",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "the same fact keeps getting written down again and again in slightly different words",
+      "expected": [
+        "dec-006"
+      ],
+      "notes": "Restatement accumulation."
+    },
+    {
+      "id": "ck-06",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "phone and desktop each remember different things and neither can see what the other wrote",
+      "expected": [
+        "dec-012",
+        "dec-013-4eb5"
+      ],
+      "notes": "Two-device split. Entries talk about 'mirror' and 'upsert', not phones."
+    },
+    {
+      "id": "ck-07",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "we changed something on one machine and the other one still shows the old version as if it were current",
+      "expected": [
+        "dec-013-4eb5"
+      ],
+      "notes": "Additive sync skipping existing ids -> stale status. 'confidently wrong'."
+    },
+    {
+      "id": "ck-08",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "big projects get nothing injected at the start while small ones work fine",
+      "expected": [
+        "dec-009"
+      ],
+      "notes": "Truncation loop emitted an EMPTY summary over budget. Size-dependent symptom."
+    },
+    {
+      "id": "ck-09",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "every client pays for our tool descriptions at every single startup and we keep adding fields",
+      "expected": [
+        "con-004",
+        "dec-014"
+      ],
+      "notes": "Per-session token tax."
+    },
+    {
+      "id": "ck-10",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "the written rule and the check that enforces it disagree about the number and only the prose is wrong",
+      "expected": [
+        "con-009-6bdc"
+      ],
+      "notes": "Duplicated threshold drifts; prose drifts silently."
+    },
+    {
+      "id": "ck-11",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "a rule meant for one folder fired on a completely different folder whose name happened to end the same way",
+      "expected": [
+        "con-011-76f8"
+      ],
+      "notes": "hooks/ matching webhooks/. Substring vs component."
+    },
+    {
+      "id": "ck-12",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "typing an em dash into a record ended up stored as three garbage characters on windows",
+      "expected": [
+        "con-008-dc30",
+        "dec-020-9b22"
+      ],
+      "notes": "cp1252 stdin mis-decode; and the repair of already-written damage."
+    },
+    {
+      "id": "ck-13",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "everything before the edit got slower and it turned out most of the time was spent loading code the check never used",
+      "expected": [
+        "con-010-acde"
+      ],
+      "notes": "142ms hook, 73ms of it `import server`."
+    },
+    {
+      "id": "ck-14",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "a loop reported success for every repository even though the operation had actually failed in all of them",
+      "expected": [
+        "con-014-34a5"
+      ],
+      "notes": "Pipeline exit status is the last command's."
+    },
+    {
+      "id": "ck-15",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "an old note about code that got rewritten last week still looks fresh while one about untouched code looks stale",
+      "expected": [
+        "dec-016-1bf6"
+      ],
+      "notes": "Wall-clock age vs commits on the scope path."
+    },
+    {
+      "id": "ck-16",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "the publish failed because one of our text fields was too long for the registry",
+      "expected": [
+        "con-003"
+      ],
+      "notes": "422 expected length <= 100."
+    },
+    {
+      "id": "ck-17",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "a bulk find and replace mangled the punctuation in every source file and added invisible junk at the top",
+      "expected": [
+        "con-005"
+      ],
+      "notes": "PowerShell Get-Content/Set-Content corrupting em-dashes + BOMs."
+    },
+    {
+      "id": "ck-18",
+      "store": "context-keeper",
+      "case_type": "positive",
+      "query": "the store can tell me what is true right now but not what we changed our mind about or why",
+      "expected": [
+        "dec-022-730e",
+        "dec-011"
+      ],
+      "notes": "The supersession gap itself."
+    },
+    {
+      "id": "clark-01",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "the agent spends its day on low value busywork while real orders pile up unshipped",
+      "expected": [
+        "dec-009",
+        "dec-011",
+        "dec-012",
+        "dec-013",
+        "dec-033"
+      ],
+      "notes": "Filler-vs-orders. Entries say 'filler' / 'side_project', query says busywork."
+    },
+    {
+      "id": "clark-02",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "a day where it failed to finish still ended up scoring positively overall",
+      "expected": [
+        "dec-023"
+      ],
+      "notes": "Linear per-order pay banked during the day vs tiny binary outcome."
+    },
+    {
+      "id": "clark-03",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "the headline number fuses the main job with side penalties so the model looks worse than it is",
+      "expected": [
+        "dec-025"
+      ],
+      "notes": "ship_win vs grade-based win."
+    },
+    {
+      "id": "clark-04",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "training is slow and the graphics card is barely being used",
+      "expected": [
+        "dec-016",
+        "dec-017"
+      ],
+      "notes": "CPU/Python-bound sampler; GPU at 74/16 percent."
+    },
+    {
+      "id": "clark-05",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "some generated scenarios are impossible to complete no matter how well it plays",
+      "expected": [
+        "dec-015",
+        "dec-006"
+      ],
+      "notes": "Volume beyond OT-rescuable capacity; trap configs."
+    },
+    {
+      "id": "clark-06",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "we added a bonus for doing the paperwork and behaviour did not change at all afterwards",
+      "expected": [
+        "dec-028",
+        "dec-027"
+      ],
+      "notes": "Dead gate: pending<=0 never satisfied."
+    },
+    {
+      "id": "clark-07",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "an alarm fired about the value estimates getting worse and it turned out to be nothing",
+      "expected": [
+        "dec-026"
+      ],
+      "notes": "False-alarm audit."
+    },
+    {
+      "id": "clark-08",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "we shipped an interface that looked finished but the endpoints returned nothing and any key was accepted",
+      "expected": [
+        "dec-020"
+      ],
+      "notes": "Scrapped FastAPI skeleton overstating readiness."
+    },
+    {
+      "id": "clark-09",
+      "store": "Clark",
+      "case_type": "positive",
+      "query": "the overtime window was generated backwards so there was effectively no overtime available",
+      "expected": [
+        "dec-022"
+      ],
+      "notes": "ot_hard_stop <= eod on independent clocks."
+    },
+    {
+      "id": "cond-01",
+      "store": "Conductor",
+      "case_type": "positive",
+      "query": "the packaged application tried to run a user script by launching a second copy of itself",
+      "expected": [
+        "dec-005-a15e",
+        "con-006"
+      ],
+      "notes": "Frozen sys.executable == Conductor.exe."
+    },
+    {
+      "id": "cond-02",
+      "store": "Conductor",
+      "case_type": "positive",
+      "query": "it reported the job finished successfully with no error but the script provably never executed",
+      "expected": [
+        "con-006",
+        "dec-005-a15e"
+      ],
+      "notes": "run_history success=1, error_msg empty, nothing ran."
+    },
+    {
+      "id": "cond-03",
+      "store": "Conductor",
+      "case_type": "positive",
+      "query": "several copies of the app started at once and the scheduler fired the same job repeatedly until the machine choked",
+      "expected": [
+        "con-004",
+        "dec-004",
+        "con-003"
+      ],
+      "notes": "Port-check race -> multiple instances -> cascading subprocesses."
+    },
+    {
+      "id": "cond-04",
+      "store": "Conductor",
+      "case_type": "positive",
+      "query": "we were shipping and advertising a whole database component that no code ever actually called",
+      "expected": [
+        "dec-006-d1e1"
+      ],
+      "notes": "Redis bundled, badged, never used."
+    },
+    {
+      "id": "cond-05",
+      "store": "Conductor",
+      "case_type": "positive",
+      "query": "worked on my machine but the build sandbox could not find the package at all",
+      "expected": [
+        "con-007-b08f"
+      ],
+      "notes": "Added to requirements.txt only, not pyproject.toml."
+    },
+    {
+      "id": "camb-01",
+      "store": "cambium",
+      "case_type": "positive",
+      "query": "knowledge written for one repository got shared everywhere and mentions filenames nobody else has",
+      "expected": [
+        "dec-003-82c7",
+        "dec-004-f4d5"
+      ],
+      "notes": "Org-scope generalization gate + remediation."
+    },
+    {
+      "id": "camb-02",
+      "store": "cambium",
+      "case_type": "positive",
+      "query": "short query words were matching inside longer unrelated words and inflating the hit count",
+      "expected": [
+        "dec-009-b97e"
+      ],
+      "notes": "'art' in 'start'. Substring -> prefix matching."
+    },
+    {
+      "id": "camb-03",
+      "store": "cambium",
+      "case_type": "positive",
+      "query": "an item that the source system had already retired was still being recommended as current",
+      "expected": [
+        "dec-011-0dc6"
+      ],
+      "notes": "Lifecycle never re-synced from context-keeper."
+    },
+    {
+      "id": "camb-04",
+      "store": "cambium",
+      "case_type": "positive",
+      "query": "two change requests opened back to back and the second one needed manual conflict fixing",
+      "expected": [
+        "con-002-3860"
+      ],
+      "notes": "Promote one at a time."
+    },
+    {
+      "id": "agsy-01",
+      "store": "agentsync",
+      "case_type": "positive",
+      "query": "a second agent using the same name silently took over the first one's reservation and reported success",
+      "expected": [
+        "dec-002-90ef"
+      ],
+      "notes": "One claim per id; overwrite reported as claimed."
+    },
+    {
+      "id": "agsy-02",
+      "store": "agentsync",
+      "case_type": "positive",
+      "query": "there was no way to ask the tool what I myself am currently holding",
+      "expected": [
+        "dec-003-a3f9"
+      ],
+      "notes": "partners excludes self; my_claim added."
+    },
+    {
+      "id": "mer-01",
+      "store": "meristem",
+      "case_type": "positive",
+      "query": "the different creature variants all looked like the same blob with a couple of pixels moved",
+      "expected": [
+        "dec-011-b5c3",
+        "dec-013-e61a"
+      ],
+      "notes": "Silhouette distinctness; closest pair 46px."
+    },
+    {
+      "id": "mer-02",
+      "store": "meristem",
+      "case_type": "positive",
+      "query": "a character walking left was just the same drawing flipped over and walking away showed you its face",
+      "expected": [
+        "dec-021-11f0"
+      ],
+      "notes": "One front view + flip_h; four facings."
+    },
+    {
+      "id": "mer-03",
+      "store": "meristem",
+      "case_type": "positive",
+      "query": "a dark mark repeated at the same spot across every tile in the ground",
+      "expected": [
+        "dec-012-d904"
+      ],
+      "notes": "Crack walk clamped instead of wrapping."
+    },
+    {
+      "id": "mer-04",
+      "store": "meristem",
+      "case_type": "positive",
+      "query": "the party members all read as recolours of one identical body",
+      "expected": [
+        "dec-005-7b51"
+      ],
+      "notes": "'most of the changes are hair or colour'."
+    },
+    {
+      "id": "xy-01",
+      "store": "xylem",
+      "case_type": "positive",
+      "query": "the same information was hand copied into several files and they quietly stopped agreeing",
+      "expected": [
+        "dec-005-d68f",
+        "dec-015-1263"
+      ],
+      "notes": "Three shipped bugs, one root cause."
+    },
+    {
+      "id": "xy-02",
+      "store": "xylem",
+      "case_type": "positive",
+      "query": "the check reported everything healthy without ever actually talking to the thing it was checking",
+      "expected": [
+        "dec-014-58b3"
+      ],
+      "notes": "doctor claimed servers healthy without a real handshake."
+    },
+    {
+      "id": "neg-01",
+      "store": "context-keeper",
+      "case_type": "negative",
+      "query": "how do we rotate the encryption keys used for entries at rest",
+      "expected": [],
+      "notes": "In-domain vocabulary (entries, at rest) but nothing about encryption is recorded."
+    },
+    {
+      "id": "neg-02",
+      "store": "context-keeper",
+      "case_type": "negative",
+      "query": "what is the rate limit on the public search endpoint",
+      "expected": [],
+      "notes": "No public search endpoint exists."
+    },
+    {
+      "id": "neg-03",
+      "store": "context-keeper",
+      "case_type": "negative",
+      "query": "which team owns triage for incoming bug reports",
+      "expected": [],
+      "notes": "Plausible project question; no ownership/process entry."
+    },
+    {
+      "id": "neg-04",
+      "store": "Clark",
+      "case_type": "negative",
+      "query": "what shift differential do we pay warehouse staff for weekend work",
+      "expected": [],
+      "notes": "Domain-adjacent (warehouse, shifts) but payroll is not modelled."
+    },
+    {
+      "id": "neg-05",
+      "store": "Clark",
+      "case_type": "negative",
+      "query": "how is the trained model deployed to the customer's on-premise hardware",
+      "expected": [],
+      "notes": "The API was scrapped; no deployment story is recorded."
+    },
+    {
+      "id": "neg-06",
+      "store": "Conductor",
+      "case_type": "negative",
+      "query": "how do users reset a forgotten password",
+      "expected": [],
+      "notes": "No auth/user-account system recorded."
+    },
+    {
+      "id": "neg-07",
+      "store": "cambium",
+      "case_type": "negative",
+      "query": "what is the retention window before old knowledge items are deleted permanently",
+      "expected": [],
+      "notes": "cambium deprecates, never deletes; no retention policy exists."
+    },
+    {
+      "id": "neg-09",
+      "store": "meristem",
+      "case_type": "negative",
+      "query": "what is the licence for redistributing the generated sprite assets commercially",
+      "expected": [],
+      "notes": "Plausible; no licensing entry."
+    },
+    {
+      "id": "neg-10",
+      "store": "agentsync",
+      "case_type": "negative",
+      "query": "how many concurrent agents can the board support before it degrades",
+      "expected": [],
+      "notes": "No capacity/scaling entry recorded."
+    },
+    {
+      "id": "hist-01",
+      "store": "fixtures/ck_history",
+      "case_type": "history",
+      "query": "did we used to prompt for capture somewhere else before hooking it to commits",
+      "expected": [
+        "dec-002"
+      ],
+      "notes": "Superseded by dec-003. Asks explicitly for the prior approach."
+    },
+    {
+      "id": "hist-02",
+      "store": "fixtures/ck_history",
+      "case_type": "history",
+      "query": "what did the constraint reinjection do before it ran ahead of the edit",
+      "expected": [
+        "dec-005"
+      ],
+      "notes": "Superseded by dec-019-9c32 (PostToolUse -> PreToolUse)."
+    },
+    {
+      "id": "hist-03",
+      "store": "fixtures/ck_history",
+      "case_type": "history",
+      "query": "what was the original sync design before the newest wins merge",
+      "expected": [
+        "dec-012"
+      ],
+      "notes": "Superseded by dec-013-4eb5. The dec-013/con-006 pair that started all this."
+    },
+    {
+      "id": "hist-04",
+      "store": "fixtures/xylem_history",
+      "case_type": "history",
+      "query": "we used to send an authorization header to the workers, what happened to that",
+      "expected": [
+        "dec-004-21df"
+      ],
+      "notes": "Superseded by dec-006-723c (path-token auth)."
+    },
+    {
+      "id": "hist-05",
+      "store": "fixtures/xylem_history",
+      "case_type": "history",
+      "query": "at one point the guidance said the knowledge tool could not be used from a phone",
+      "expected": [
+        "dec-011-7cbf"
+      ],
+      "notes": "Superseded by dec-013-001d once cambium-remote deployed."
+    },
+    {
+      "id": "hist-06",
+      "store": "fixtures/xylem_history",
+      "case_type": "history",
+      "query": "before we pinned versions, what did a fresh install actually track",
+      "expected": [
+        "dec-007-cc30"
+      ],
+      "notes": "Superseded by dec-008-7319 (null source.ref -> pinned tags)."
+    }
+  ]
+}

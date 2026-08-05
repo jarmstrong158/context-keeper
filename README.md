@@ -75,10 +75,26 @@ Context Keeper is a small, offline-first memory layer; several of its capabiliti
 The retrieval and honesty properties are measured, not asserted — the harness is in [`evals/`](evals/) and reproducible with no network required:
 
 - **Token reduction** — session-start injection vs. dumping the full store: **97.3% / 94.1% / 85.5% / 73.3%** across four real stores ([`evals/token_reduction.py`](evals/token_reduction.py)). The meaningful property is that injected cost stays roughly flat as the store grows.
-- **Retrieval quality** — on a held-out 3-store set, the opt-in semantic blend lifts **hit@5 from 80% → 93% and MRR 0.63 → 0.88** ([`evals/retrieval_eval.py`](evals/retrieval_eval.py)).
+- **Retrieval quality** — 59 cases over a frozen 7-store corpus, every question written from the *problem* an entry solves rather than paraphrasing its summary. The opt-in semantic blend lifts **recall@5 from 0.48 → 0.69 and MRR 0.38 → 0.57** ([`evals/run_retrieval_eval.py`](evals/run_retrieval_eval.py)). These are *lower* than the figures published before 2026-08-05 (hit@5 80% → 93%) and that is the point: the old set was partly paraphrase-derived, so queries shared surface tokens with their targets and lexical recall came out flattered. The gain is concentrated in large, prose-heavy stores; small stores are already at 1.000 lexically.
 - **Abstention** — measures whether `get_context` says "nothing relevant" instead of confabulating on no-answer queries; the 0.20 relevance floor is the highest with zero false-abstention on the eval set ([`evals/abstention.py`](evals/abstention.py)).
 
-Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md).
+Every dataset, metric, and caveat is checked into the repo — see [`evals/README.md`](evals/README.md). The corpus is frozen under `evals/fixtures/corpus`, so the numbers reproduce on any clone and a regression test can pin them; `--live` runs against the real stores when you want a current read instead of a comparable one.
+
+## v0.19: Supersession as a Signal, and One Rule for Scope
+
+- **The store could say what was true, and not what changed.** It held 36 entries, 36 active, 0 deprecated, 0 supersedes links — while `dec-013` stated it replaced the old additive-only sync and `con-006` carried "(was additive-only)" inline. `deprecate_entry` had supported `superseded_by` since v0.10 and it had never been used once: nothing asked at the moment the answer was known, and nothing spent the link afterwards.
+
+  `record_*` now names active same-kind entries covering the same subject — `possible supersession of <id>: <summary>` — scored on shared tags and whole-component scope overlap, deliberately **not** the text overlap `similar_entries` already computes (a replacement often shares almost no wording with what it replaces while addressing exactly the same thing). It never links, never blocks the write, and never touches the older entry: a heuristic edge silently demotes a rule that may still be in force.
+
+  `get_context` prepends one compact line for the **immediate** predecessor — what it said and why it changed — because a link is only worth making if retrieval spends it. One level deep; under budget pressure the *line* is dropped and a `predecessor_id` trail is left, never the entry. The remote Worker emits the identical line, so the two transports cannot diverge.
+
+  `scripts/survey_supersessions.py` proposes backfill links **read-only** — it opens no store for writing and calls no lifecycle tool.
+
+- **`con-011` was false.** It requires every surface deciding "does this scope cover this file" to agree; there were five surfaces with four implementations, two of which provably disagreed, and `score_entry` still used the raw substring test the rule exists to forbid — so querying `scope="hooks/"` gave a `webhooks/`-scoped entry the same boost as the real one. `scope_rules.py` is now the only implementation, importing nothing so the PreToolUse hook can load it under `con-010`.
+
+- **Retrieval has a number, and it holds still.** A 59-case golden set with negatives and history cases, plus a regression test pinning the lexical arm. The first pin broke within a day without a line of ranking code changing — it read live stores, so recording three entries moved it. The corpus is frozen now.
+
+- **Internals**: `server.py` 4,270 → 3,787 lines (`ranking.py`, `mojibake.py`, `quality_checks.py`, all re-exported); `verify_quality`'s seven inlined checks became a registry; the test suite split from one 5,213-line file into six themed ones.
 
 ## v0.17: Closing the Delivery Gaps
 

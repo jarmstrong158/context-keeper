@@ -1,0 +1,139 @@
+[
+  {
+    "id": "con-001",
+    "rule": "Keep source runs and exe runs pointed at the same conductor.db. Running from source (python launch.py) is supported and is how the test suite runs; just be aware it defaults to the repo's conductor.db, not the exe's AppData copy (see con-002).",
+    "reason": "Original rule was a blanket 'never run from source', written while the frozen exe was the only sanctioned mode. That was inverted: because conductor.spec freezes launch.py, sys.executable in the exe was Conductor.exe, so every .py worker ran 'Conductor.exe script.py' - which launch.py ignored, exiting 0 and recording a FALSE SUCCESS for a script that never ran. Fixed by _resolve_python() (dec-005-a15e). The genuine underlying concern was only ever DB divergence, which is what this constraint now states.",
+    "scope": "global",
+    "hardness": "advisory",
+    "tags": [
+      "exe",
+      "database",
+      "deployment",
+      "superseded-rationale"
+    ],
+    "status": "active",
+    "created_at": "2026-04-10T02:33:10.308084+00:00",
+    "verified_at": "2026-07-24T21:19:20.618728+00:00",
+    "related_to": [
+      "dec-005-a15e",
+      "con-002"
+    ],
+    "updated_at": "2026-04-10T02:33:10.308084+00:00"
+  },
+  {
+    "id": "con-002",
+    "rule": "The AppData DB is the source of truth: C:/Users/jarms/AppData/Roaming/Redis Operator/conductor.db",
+    "reason": "The exe reads from AppData. The repo has its own conductor.db which is stale. All MCP interactions go through the exe which uses the AppData DB.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "database",
+      "appdata"
+    ],
+    "status": "active",
+    "created_at": "2026-04-10T02:33:10.312176+00:00",
+    "verified_at": "2026-04-10T02:33:10.312176+00:00",
+    "updated_at": "2026-04-10T02:33:10.312176+00:00"
+  },
+  {
+    "id": "con-003",
+    "rule": "Do not recreate the Cowork VM Monitor worker \u2014 it was deleted intentionally",
+    "reason": "Worker #4 caused a fork bomb that exhausted system resources. The VM runs fine without monitoring.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "vm-monitor",
+      "stability"
+    ],
+    "status": "active",
+    "created_at": "2026-04-10T02:33:10.316176+00:00",
+    "verified_at": "2026-04-10T02:33:10.316176+00:00",
+    "updated_at": "2026-04-10T02:33:10.316176+00:00"
+  },
+  {
+    "id": "con-004",
+    "rule": "Conductor's auto-launch logic must use both process detection (tasklist) and file locking. Never trust port-check alone.",
+    "reason": "The exe takes several seconds to bind port 5000 after launching. A port-check alone races during that window and can spawn multiple Conductor instances. Multiple instances = multiple schedulers firing the same cron = cascading subprocess explosions.",
+    "scope": "server.py",
+    "hardness": "absolute",
+    "tags": [
+      "mcp",
+      "auto-launch",
+      "race-condition",
+      "fork-bomb"
+    ],
+    "status": "active",
+    "created_at": "2026-04-10T22:21:08.518917+00:00",
+    "verified_at": "2026-04-10T22:21:08.518917+00:00",
+    "updated_at": "2026-04-10T22:21:08.518917+00:00"
+  },
+  {
+    "id": "con-005",
+    "rule": "All subprocess-spawning scripts (SMTP, HTTP, etc.) must have explicit timeouts",
+    "reason": "Without a timeout, a hung network call keeps the subprocess alive forever. When a scheduler fires repeatedly, dead subprocesses stack up and exhaust resources.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "subprocess",
+      "timeout",
+      "fork-bomb",
+      "stability"
+    ],
+    "status": "active",
+    "created_at": "2026-04-10T22:21:10.806528+00:00",
+    "verified_at": "2026-04-10T22:21:10.806528+00:00",
+    "updated_at": "2026-04-10T22:21:10.806528+00:00"
+  },
+  {
+    "id": "con-006",
+    "rule": "Never use sys.executable to launch user scripts or pip. Always call _resolve_python(); guard the resulting command with _assert_not_self().",
+    "reason": "Under PyInstaller sys.executable is Conductor.exe, not a Python interpreter. Handing a .py file to it re-enters launch.py, which ignores argv: it exits 0 when Conductor is already running, so the scheduler recorded success=1 for scripts that never executed, or it booted a second full Conductor. _resolve_python() finds a real interpreter and raises InterpreterNotFound rather than ever returning the Conductor binary.",
+    "scope": "app.py",
+    "hardness": "absolute",
+    "tags": [
+      "subprocess",
+      "pyinstaller",
+      "frozen",
+      "interpreter",
+      "false-success"
+    ],
+    "triggering_incident": "Frozen-exe audit: simulating the PyInstaller entry point showed run_history success=1, error_msg='', and the user's script provably never ran.",
+    "related_to": [
+      "dec-005-a15e"
+    ],
+    "status": "active",
+    "created_at": "2026-07-24T21:19:20.618728+00:00",
+    "verified_at": "2026-07-24T21:19:20.618728+00:00",
+    "updated_at": "2026-07-24T21:19:20.618728+00:00"
+  },
+  {
+    "id": "con-007-b08f",
+    "rule": "When adding a runtime dependency to a project that ships both requirements.txt and pyproject.toml, add it to BOTH. pyproject.toml is what `pip install .` and `uv sync` read; requirements.txt alone leaves every packaged install broken.",
+    "reason": "requirements.txt is only consulted by an explicit `pip install -r`. Any install path that builds the project - `pip install .`, `uv sync`, a container build, a registry sandbox - reads pyproject.toml and silently omits anything declared only in requirements.txt. The result is an install that looks complete and fails at import, which is the worst shape of failure because the packaging step reports success.",
+    "triggering_incident": "During the MCP 2026-07-28 migration, server.py moved onto the mcp SDK and the dependency was added to requirements.txt only. Nothing local broke, because the developer machine already had mcp installed system-wide. It surfaced when Glama's build sandbox ran `uv sync`, which installed all six pyproject dependencies and not mcp, then died at startup with ModuleNotFoundError: No module named 'mcp'. Fixed in b58f3bd by declaring mcp>=2.0,<3 in pyproject.toml as well.</triggering_incident>\n<parameter name=\"scope\">pyproject.toml",
+    "enforced_by": "",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "packaging",
+      "dependencies",
+      "mcp",
+      "glama",
+      "silent-failure"
+    ],
+    "retrieval_hints": [
+      "ModuleNotFoundError mcp after uv sync",
+      "dependency in requirements.txt but not pyproject",
+      "why did the container build install everything except mcp",
+      "pip install . missing dependency"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-02T12:24:00.352898+00:00",
+    "updated_at": "2026-08-02T12:24:00.352898+00:00",
+    "verified_at": "2026-08-02T12:24:00.352898+00:00",
+    "verified_sha": "b58f3bdbb345765c539bf5ca736e41b21b752184"
+  }
+]

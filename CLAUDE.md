@@ -114,6 +114,27 @@ When a `record_*` call succeeds but the response includes `similar_entries`, do 
 - **`likely_contradiction`** (also raises a top-level `contradiction_note`) — the new entry appears to *reverse* an existing rule, not restate it. Do not leave both live. Decide which is current and `deprecate_entry` the loser with `superseded_by` pointing at the winner. The flag is a heuristic (negation/antonym polarity) — confirm the reversal is real before acting.
 - **Genuinely distinct** — the overlap is incidental; link them: `update_entry` your new entry with `related_to` including the similar ids.
 
+## Acting on supersession_advisory (v0.19+)
+A `record_*` response can also carry `supersession_advisory` — a list reading
+`possible supersession of <id>: <summary>`. It means an **active entry of the same
+kind covers the same subject** as the one you just wrote: shared tags, and/or a
+scope whose whole path components overlap. It is a different signal from
+`similar_entries`, which compares wording — a replacement often shares almost no
+wording with what it replaces ("the merge is additive-only" vs "the merge is
+timestamp-based newest-wins") while addressing exactly the same thing.
+
+Nothing was linked and the older entry was not touched. Only you know whether the
+new entry *replaces* the named one or stands beside it. Resolve it now, while you
+still have the context:
+- **It replaces it** — `deprecate_entry(old_id, reason, superseded_by=new_id)`, or
+  re-record with `supersedes=[old_id]` for a decision.
+- **It doesn't** — `update_entry` with `related_to` and move on.
+
+This exists because reversals were landing as in-place edits. This store held 36
+active entries, 0 deprecated and 0 supersedes links while `dec-013` said it
+replaced the old additive-only sync and `con-006` carried "(was additive-only)"
+inline. The store could say what was true; it could not say what changed, or why.
+
 ## Acting on no_confident_match (v0.10+)
 When `get_context` returns `no_confident_match: true`, the top entry's relevance to your query was below the floor — the returned entries are the closest neighbors but probably nothing was recorded on this exact topic. Do **not** present them as established project decisions. Treat it as "no memory on this" unless an entry genuinely fits on inspection. The entries are still included (not suppressed) so you can judge; `top_relevance` is the score.
 
@@ -123,6 +144,36 @@ When `get_context` returns `no_confident_match: true`, the top entry's relevance
 Two different lifecycle actions:
 - **`record_entry(kind="decision", ..., supersedes=[old_id])`** — the new decision *replaces* an older one that was correct at the time. The old entry becomes `superseded`: demoted in ranking but still recallable, so "why did we change from X to Y?" still works. Use this for the normal evolution of a decision.
 - **`deprecate_entry(id, reason)`** — the entry was wrong, obsolete, or removed. It is filtered out of retrieval entirely. Use this when the history should *not* surface.
+
+**A link you make is spent at retrieval (v0.19+).** When `get_context` returns an
+entry that superseded something, it prepends one compact line for the *immediate*
+predecessor — what it said, and why it changed:
+
+```
+supersedes dec-013: was "mirror sync is additive-only" -- changed because: additive sync froze deprecations out of the mirror
+```
+
+One level deep only; the entry before that is reachable from the predecessor's own
+entry. The reason comes from the predecessor's `deprecated_reason` when it has one,
+falling back to the successor's `problem`. Under budget pressure the **line** is
+dropped and a `predecessor_id` trail is left in its place — never the entry
+(`dec-021-b607`). The remote Worker emits the identical line, so `get_context` reads
+the same over HTTP and stdio; the format lives in `server.py::_predecessor_line` and
+`src/entries.ts::predecessorLine` and edits belong in both.
+
+**Backfilling old in-place supersessions.** `scripts/survey_supersessions.py` scans
+every local store for reversals that were made as edits — entries whose text carries
+was / previously / replaced / no longer, and active same-kind pairs that overlap on
+tags and scope — and writes a proposal file. It is **read-only**: it opens no store
+for writing and calls no lifecycle tool. Review the proposals and make the links
+yourself; a supersedes edge written from a heuristic silently demotes a rule that may
+still be in force.
+
+Its output path is **gitignored on purpose**. The survey reads every `.context` on the
+machine, so its proposals quote whatever those projects recorded — including private
+repos and ones with no remote at all. This repo is public. Do not commit the proposal
+file, and do not add private-project content to `evals/retrieval_golden.json` either,
+for the same reason.
 
 ## When NOT to Record
 - Trivial implementation details (variable names, formatting choices)

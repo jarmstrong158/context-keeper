@@ -411,6 +411,194 @@
           "context-keeper"
         ]
       }
+    },
+    {
+      "id": "k-dc4ffad5",
+      "type": "memory",
+      "kind": "decision",
+      "content": "Mojibake is now a first-class quality issue: verify_quality flags it and a hidden repair_mojibake handler fixes it, verified as an exact inverse. Healed 160 entries / 413 fields across 8 project stores.",
+      "why": "A fix that stops the bleeding and leaves the wound is half a fix, and the missing half is the half the user actually reads. Detection belongs in verify_quality because that is where the store already reports its own damage (thin_reason, code_drift, unused) - a one-off script would have found it once and never again. The repair is the exact inverse of the corruption, so it is VERIFIED as one: re-applying the corruption to the candidate must reproduce the input byte for byte, and anything failing that check is left untouched. That matters because a partial or approximate repair of recorded reasoning is worse than legible damage - it looks fixed, so nobody looks again. A marker pre-filter gates the transform so innocent text that merely survives an encode/decode round trip is never 'repaired'. verified_at is deliberately NOT refreshed: an encoding fix is not a claim anyone re-confirmed the entry is true, and resetting the staleness clock would erase the exact signal prune_stale and the drift check exist to raise. updated_at IS bumped so the corrected copy wins the mirror's newest-wins merge instead of being overwritten by a corrupt remote.  Problem: con-008-dc30 fixed the CAUSE of mojibake in v0.11 by forcing UTF-8 on the stdio transport, so no new entry gets corrupted. It did nothing about entries already written, and nothing ever checked. 160 entries across 8 of this machine's project stores still carried cp1252-misdecoded UTF-8 - balatron alone had 76. The damage is invisible in the worst way: the text stays legible enough that nobody re-reads the entry, so a corrupted rationale silently degrades every retrieval that surfaces it, forever.",
+      "tags": [
+        "data-integrity",
+        "quality",
+        "encoding",
+        "mirror",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-020-9b22"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T18:35:16.801969+00:00",
+      "updated_at": "2026-08-01T18:35:16.801969+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-fb34fa74",
+      "type": "memory",
+      "kind": "decision",
+      "content": "v0.17: truncated entries leave a discoverable id trail inside the budget, global scope becomes a flagged quality issue when a path can be named, subagents get the constraints block via SubagentStart, and a release can no longer half-fail in silence.",
+      "why": "The id trail is paid for INSIDE the token budget rather than appended past it, because \"fits the budget\" quietly stops being true otherwise - bare ids cost a fraction of the entries they stand for, so the trade is cheap and honest. It is emitted in stable store order and deliberately NOT ranked against the working tree: dec-012's cache-stable prefix requires byte-identical text across sessions, and relevance ranking belongs in the volatile work-focus block appended after. The global_scope flag only fires when a concrete path can be named from the entry's own enforced_by or a tag matching a real directory, because a bare \"consider adding a scope\" on every global constraint is noise a reader learns to skip, and some rules genuinely are global. The subagent hook injects constraints ONLY and caps them: it fires once per spawned agent so a fan-out multiplies it, and rules are what a focused subagent cannot afford to miss and cannot infer. Moving constraint rendering into store_paths let that hook and constraint_reinject (matcher \"\", so it runs after EVERY tool call) drop the server import and land within ~5ms of Python's startup floor, while keeping exactly one implementation of the formatter.  Problem: Measuring real stores after v0.16 found two problems that multiply. Truncation made entries UNDISCOVERABLE, not merely unsummarised: the SessionStart hook prints the summary text and nothing else, so an id that fell off the end could not be asked for - balatron was losing 116 lines every session with no trace. Separately, 35 of 75 active constraints (47%) were scoped `global`, which excludes a rule from the drift check, the .claude/rules/ projection AND scope_guard at once, leaving that same truncating summary as its only delivery route. Every path-based mechanism built in v0.16 therefore routed around half the rules, and the half it routed around was competing for space in a block that was evicting itself. Two further gaps: subagents never received any project memory, and v0.16.0 published to PyPI and the registry while its desktop bundle silently failed to build.",
+      "tags": [
+        "retrieval",
+        "hooks",
+        "claude-code",
+        "context-injection",
+        "release",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "dec-021-b607"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T18:35:16.801969+00:00",
+      "updated_at": "2026-08-01T18:35:16.801969+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-fdf32cf0",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Constraint scope matching must compare whole path COMPONENTS, never raw substrings. Every surface that decides \"does this scope cover this file\" (the scope_guard hook, the .claude/rules/ projection's glob patterns, work_focus) must agree on the answer.",
+      "why": "A substring test silently over-matches: `src/` matches `mysrc/main.py`, `hooks/` matches `webhooks/send.py`, `server.py` matches `test_server.py`. The damage is not the stray message. scope_guard injects each constraint at most once per session, so a false positive MARKS THAT CONSTRAINT DELIVERED - and the file it actually governs then never receives it for the rest of the session. An over-eager match therefore causes a silent under-delivery, which is the opposite of what the loose match looks like it is doing. Surfaces that disagree about coverage are worse still: one of them is claiming protection the other does not provide.",
+      "tags": [
+        "hooks",
+        "constraints",
+        "scope",
+        "claude-code",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-011-76f8"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T18:35:16.801969+00:00",
+      "updated_at": "2026-08-01T18:35:16.801969+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-c4f9e6aa",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "A derived projection that DELETES files must resolve its output directory inside the project root and refuse otherwise, and must never fail the canonical write when its own path is misconfigured. Every scope must pass through _scope_to_paths, which rejects anything that cannot become a firing repo-relative pattern - glob metacharacters, a double quote or control char (breaks the YAML frontmatter), or a `..` component - and every rejection must be reported to the caller.",
+      "why": "The rules projection reaps: every marker-carrying .md file in its output directory is a deletion candidate on each regeneration. That makes the configured path a deletion target, so a '../../..' or an absolute path would point it at a directory the user never associated with context-keeper. Containment is also semantically correct - Claude Code only discovers .claude/rules/ inside the working tree, so an outside directory could never load. Separately, patterns are emitted as double-quoted YAML scalars: a scope containing a quote closes the scalar early and breaks the ENTIRE frontmatter block, so the harness loads no rule from that file at all - not even the patterns that were fine. Both failures are silent and both present as coverage, which is the worst property a guardrail can have.",
+      "tags": [
+        "projection",
+        "safety",
+        "constraints",
+        "claude-code",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-012-e6c4"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T18:35:16.801969+00:00",
+      "updated_at": "2026-08-01T18:35:16.801969+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-87421c54",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "mcpb/manifest.json must contain only spec keys - no underscore-prefixed editorial keys at any depth. Maintainer notes about the manifest go in a test docstring or a build-script comment, never in the manifest itself.",
+      "why": "The mcpb packer validates the manifest against a schema that REJECTS unrecognised keys, and refuses to pack on failure. The resulting breakage is silent at the release level: the publish workflow (PyPI + MCP registry) succeeds independently, only the separate bundle workflow fails, and a release missing an asset looks exactly like a release that never had one. Nobody is notified that the one-click Claude Desktop install path is gone.",
+      "tags": [
+        "packaging",
+        "mcpb",
+        "release",
+        "claude-desktop",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-013-4b25"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-01T18:35:16.801969+00:00",
+      "updated_at": "2026-08-01T18:35:16.801969+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
+    },
+    {
+      "id": "k-77ea871f",
+      "type": "memory",
+      "kind": "constraint",
+      "content": "Never test a git command's success by piping it into a conditional, e.g. `if git merge ... | head -2; then`. The pipeline's exit status is the LAST command's, so the guard reports success no matter what git did. Test git directly, or verify the end state afterwards with `git merge-base --is-ancestor` and a local-vs-origin SHA comparison.",
+      "why": "A merge or push that silently fails while the script prints success is worse than one that fails loudly: the operator believes the work landed and stops checking. The failure mode is invisible precisely when it matters most, on a multi-repo sweep where nobody re-reads eleven repositories by hand.",
+      "tags": [
+        "git",
+        "tooling",
+        "verification",
+        "release",
+        "false-success",
+        "context-keeper"
+      ],
+      "scope": "local",
+      "project": "context-keeper",
+      "source": {
+        "system": "context-keeper",
+        "ref": "con-014-34a5"
+      },
+      "created_by": "jonny-desktop",
+      "created_at": "2026-08-02T14:56:03.903222+00:00",
+      "updated_at": "2026-08-02T14:56:03.903222+00:00",
+      "status": "active",
+      "trust": {
+        "recalls": 0,
+        "endorsements": [],
+        "projects": [
+          "context-keeper"
+        ]
+      }
     }
   ],
   "imported": {
@@ -443,7 +631,13 @@
       "dec-019-9c32",
       "con-008-dc30",
       "con-009-6bdc",
-      "con-010-acde"
+      "con-010-acde",
+      "dec-020-9b22",
+      "dec-021-b607",
+      "con-011-76f8",
+      "con-012-e6c4",
+      "con-013-4b25",
+      "con-014-34a5"
     ],
     "agentsync": [],
     "agentsync_last": {},

@@ -1,0 +1,1185 @@
+[
+  {
+    "id": "dec-001",
+    "summary": "Architecture bumped to clark-v2: d_model 256\u00e2\u2020\u2019512, n_sa_layers 2\u00e2\u2020\u20194, lstm_hidden 256\u00e2\u2020\u2019512 (~18M params, was 2.9M)",
+    "rationale": "v1's 2.9M params were too small for the RTX 5070 Ti \u2014 per-step forward was dominated by kernel launch overhead, not compute, so GPU offered only 1.4x speedup over CPU even with bf16 autocast and Tier-2 batching. At 18M params compute dominates, batching actually scales, and Tier-2 gives 8.7x over CPU at n_envs=8. ARCH_VERSION bumped so old checkpoints cleanly fail at load instead of silently mismatching.",
+    "alternatives": [
+      {
+        "option": "Keep clark-v1 architecture, invest in Design B batched updates refactor",
+        "reason_rejected": "~2x additional speedup with real TBPTT bug surface \u2014 architecture bump was ~5 minutes of work and gave much more"
+      },
+      {
+        "option": "Go even bigger (d_model=768, 8 layers)",
+        "reason_rejected": "Checkpoint size, fine-tune cost on real facilities, and diminishing returns without more training data"
+      }
+    ],
+    "constraints_created": [
+      "Clark arch_version must be bumped whenever d_model / n_layers / lstm_hidden change, and old checkpoints must fail at load"
+    ],
+    "tags": [
+      "clark",
+      "architecture",
+      "performance",
+      "model-size"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-11T02:23:53.019811+00:00",
+    "verified_at": "2026-04-11T02:23:53.019811+00:00",
+    "updated_at": "2026-08-01T11:54:51.270350+00:00"
+  },
+  {
+    "id": "dec-002",
+    "summary": "Clark synthetic configs must force-include restock and management tasks",
+    "rationale": "The env's restock drain/refill system runs unconditionally on every pick in facility_env.py \u2014 restock_level drains, pick speed drops to 5% once level hits 0, and the only way to refill is the 'restock' task branch. Without 'restock' in TasksConfig.enabled, the agent cannot refill \u2192 level drains monotonically \u2192 picker throughput craters \u2192 orders pile up \u2192 -86k/day F grades. 67% of v1 pretraining was running on structurally unwinnable configs. Two-part fix: (1) gate all restock drain/penalty code in facility_env.py on self._restock_enabled, (2) force-include both 'restock' and 'management' in synthetic_gen._generate_tasks with min n_tasks=5.",
+    "alternatives": [
+      {
+        "option": "Only gate the env-side drain/penalty, let synthetic_gen choose freely",
+        "reason_rejected": "User-written YAML facilities without restock would silently have zero restock dynamics \u2014 better to force-include so the task is always learnable and the drain system is always exercised"
+      },
+      {
+        "option": "Force-include restock but not management",
+        "reason_rejected": "Management reward path is similarly important for business-rule coverage during training"
+      }
+    ],
+    "constraints_created": [
+      "If facility config omits 'restock' task, env must disable drain/refill and never fire restock penalties",
+      "synthetic_gen must force-include both 'restock' and 'management' in every sampled facility"
+    ],
+    "tags": [
+      "clark",
+      "env",
+      "synthetic-gen",
+      "bugfix",
+      "training-correctness"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-11T02:24:02.494473+00:00",
+    "verified_at": "2026-04-11T02:24:02.494473+00:00",
+    "updated_at": "2026-08-01T11:54:51.270350+00:00"
+  },
+  {
+    "id": "dec-003",
+    "summary": "Clark Tier-2 speedup uses in-process batched envs (Design B), not SubprocVecEnv",
+    "rationale": "Profiling showed env.step is ~2% of wall-clock and model forward is the dominant cost (40% select, 55% update at Tier-1 baseline). Parallelizing env stepping (SubprocVecEnv Design A) fixes the wrong thing and adds subprocess/pickle overhead plus Windows multiprocessing quirks. Design B runs N YearEnvs sequentially in-process but batches their state dicts into one padded ClarkActorCritic.forward_batched call, which amortizes kernel launch across all envs. Variable per-env N_i/M_i handled via worker_pad_mask + task_pad_mask through the attention layers. Benchmark: 8.7x over CPU single-env at n_envs=8 on RTX 5070 Ti with bf16 + 18M-param v2 model. Design A would have been ~4-6x with much more risk.",
+    "alternatives": [
+      {
+        "option": "SubprocVecEnv (Design A) \u2014 multiprocessing, one env per subprocess",
+        "reason_rejected": "Subprocess/pickle overhead, Windows MP quirks, doesn't fix the actual bottleneck (model forward, not env stepping)"
+      },
+      {
+        "option": "Fully-batched PPO update across envs (would give another ~2x)",
+        "reason_rejected": "Real TBPTT bug surface \u2014 each env's LSTM hidden trajectory needs independent tracking in the batch dim. Marginal return not worth the risk vs just bumping model size"
+      }
+    ],
+    "constraints_created": [
+      "Tier-2 batched path requires variable-N/M padding with key_padding_mask through all attention layers",
+      "Padding mask weights must be nan_to_num'd after softmax (all-masked rows produce NaN)"
+    ],
+    "tags": [
+      "clark",
+      "performance",
+      "ppo",
+      "batched-rollout",
+      "architecture"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-11T02:24:14.783195+00:00",
+    "verified_at": "2026-04-11T02:24:14.783195+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-004",
+    "summary": "Use symlog target compression (DreamerV3-style) for the value head instead of EMA-only normalization or PopArt.",
+    "rationale": "Value head saturated three times during training, each triggered by a different distribution shift (uncapped per_order_incomplete, recurring trap configs, stage-3 large-N returns). Resetting fixed the symptom but never the susceptibility. Symlog (`sign(x) * log(1+|x|)`) compresses returns spanning 8 orders of magnitude (-7M to +60k) onto \u00c2\u00b1~16, fully within the value head's natural operating range. Implementation: value head output is interpreted as `symlog(real_value)`; `symexp` is applied at GAE/inference boundaries to recover real values. Reference: Hafner et al. arXiv:2301.04104 \u00c2\u00a74.",
+    "alternatives": [
+      {
+        "option": "PopArt with weight rescaling",
+        "reason_rejected": "Tried, removed: rescaling step doesn't touch Adam optimizer state, causing instability in our single-trajectory per-day-update setting"
+      },
+      {
+        "option": "Per-batch return standardization",
+        "reason_rejected": "Failed on correlated TBPTT chunks (\u00cf\u0192 within a chunk is tiny, MSE explodes)"
+      },
+      {
+        "option": "Larger value head (256\u00e2\u2020\u20191024)",
+        "reason_rejected": "Treats symptom not cause; saturation will recur at the next distribution shift"
+      },
+      {
+        "option": "Per-N bucket normalization",
+        "reason_rejected": "Helps but symlog alone gets kurtosis 74\u00e2\u2020\u20195; per-N is marginal once symlog is in"
+      }
+    ],
+    "constraints_created": [
+      "Stored values in RolloutBuffer are in symlog space; compute_returns must symexp them before GAE",
+      "Value loss MSE is computed in symlog space (target = symlog(returns_real))",
+      "vf_clip is also in symlog space"
+    ],
+    "tags": [
+      "ppo",
+      "value-head",
+      "normalization",
+      "architecture"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T13:08:40.382280+00:00",
+    "verified_at": "2026-05-16T13:08:40.382280+00:00",
+    "updated_at": "2026-05-16T13:08:40.382280+00:00"
+  },
+  {
+    "id": "dec-005",
+    "summary": "Cap per_order_incomplete penalty at -10 \u00c3\u2014 min(N_unshipped, 50) in facility_env.py and year_env.py.",
+    "rationale": "Unbounded -10 \u00c3\u2014 N_unshipped produced -130k single-day rewards on N=4 disasters with 700+ unshipped orders. The fat-tail return distribution made the value head learn huge canceling biases (output std~3000, weights saturated at \u00c2\u00b129). Capping at INCOMPLETE_CAP=50 sets per-event penalty floor at -500, symmetric with the +500 year_completion_bonus. Killed v_loss bimodality (s/m: 228\u00c3\u2014 \u00e2\u2020\u2019 1\u00c3\u2014) and lifted Cmp from ~70% to 92%+ within minutes.",
+    "alternatives": [
+      {
+        "option": "Wider reward clip",
+        "reason_rejected": "Doesn't address the per-event magnitude \u2014 clip is summed across days into the return"
+      }
+    ],
+    "constraints_created": [
+      "INCOMPLETE_CAP constant (=50) must apply consistently in facility_env._finalize_episode AND year_env._process_end_of_day backlog logic"
+    ],
+    "tags": [
+      "reward-shaping",
+      "env-design"
+    ],
+    "status": "deprecated",
+    "superseded_by": "dec-023",
+    "created_at": "2026-05-16T13:08:51.267686+00:00",
+    "verified_at": "2026-05-16T13:08:51.267686+00:00",
+    "deprecated_reason": "Superseded by the completion-dominant reward re-tune. INCOMPLETE_CAP is now 200 (floor -2000), not 50 (-500), and the surrounding reward structure changed (per_order_shipped 5->3, all_orders_complete_bonus is now x total_orders paid only on full completion). dec-005's stated cap value is now factually wrong; the rationale (bound the value-target tail) is preserved and refined in dec-023.",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-006",
+    "summary": "Cap synthetic-config M (task count) at N (worker count) when N \u00e2\u2030\u00a4 15 to prevent recurring \"trap configs.\"",
+    "rationale": "Audit found small-crew + many-task-types configs (e.g., synthetic_4882 N=13/M=9-10) were unsolvable by any policy and produced repeating -50k+ R/W returns for the same cfg seeds across years_per_config=3 repeats. They created persistent secondary modes in the value-target distribution, re-saturating the value head over many updates. Cap was first set at N\u00e2\u2030\u00a48, then extended to N\u00e2\u2030\u00a415 after second-wave traps appeared at mid-N.",
+    "alternatives": [],
+    "constraints_created": [
+      "synthetic_gen.py _generate_tasks() must cap M \u00e2\u2030\u00a4 N when n_workers \u00e2\u2030\u00a4 15",
+      "min_tasks=5 (core 3 + restock + management) is a hard floor regardless of N"
+    ],
+    "tags": [
+      "curriculum",
+      "synthetic-gen",
+      "value-head"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T13:09:00.778324+00:00",
+    "verified_at": "2026-05-16T13:09:00.778324+00:00",
+    "updated_at": "2026-05-16T13:09:00.778324+00:00"
+  },
+  {
+    "id": "dec-007",
+    "summary": "Pick and pack tasks must have SEPARATE per-task demand_signals, computed from queue depth.",
+    "rationale": "Originally both tasks shared `demand = (orders_in_queue + orders_picked_not_audited) / total`. The cross-attention literally couldn't tell pickers-needed from packers-needed. Result: model picked aggressively, dumped on packers, picked_backlog dominated reward (-971/day vs incomplete -437/day). After splitting (pick=queue/total, pack=picked_not_audited/total), Cmp jumped 60-80% \u2192 92% within minutes \u2014 single biggest single-fix improvement of the entire debugging session.",
+    "alternatives": [],
+    "constraints_created": [
+      "state.py _build_task_feats must NEVER share demand_signal between pick and pack"
+    ],
+    "tags": [
+      "state-representation",
+      "pick-pack-balance"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T13:09:09.976766+00:00",
+    "verified_at": "2026-05-16T13:09:09.976766+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-008",
+    "summary": "Allow restock task during OT when restock_level < RESTOCK_PICK_PENALTY_THRESHOLD (0.2).",
+    "rationale": "Audit found 33% of F-days were \"restock collapse cascades\": stock empty mid-day \u00e2\u2020\u2019 picking dropped to 5% speed \u00e2\u2020\u2019 OT triggered \u00e2\u2020\u2019 but OT mask blocked restock \u00e2\u2020\u2019 workers couldn't refill \u00e2\u2020\u2019 picking stayed at 5% through entire OT \u00e2\u2020\u2019 hard-stop hit, day failed with 700+ orders remaining. Real warehouses obviously DO restock during OT in this scenario. After fix, OT success rate climbed from 15% \u00e2\u2020\u2019 73% peak.",
+    "alternatives": [],
+    "constraints_created": [
+      "actions.py OT branch must include restock when restock_level < threshold AND worker.eligible_for('restock')",
+      "Restock must NOT be allowed during OT when stock is fine \u00e2\u20ac\u201d would waste OT on non-shipping work"
+    ],
+    "tags": [
+      "action-mask",
+      "ot-mechanics"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T13:09:18.381232+00:00",
+    "verified_at": "2026-05-16T13:09:18.381232+00:00",
+    "updated_at": "2026-05-16T13:09:18.381232+00:00"
+  },
+  {
+    "id": "dec-009",
+    "summary": "Filler task demand_signal scales DOWN under pressure; filler_during_crunch penalty fires for ALL filler tasks (not just side_project).",
+    "rationale": "Per-worker time tracking (added this session) showed bad-Cmp days had 21h LESS pick-time than good-Cmp days, with the time going to quality_check, training, receiving, returns_processing, loading. Root cause: filler tasks had constant demand=0.5 regardless of pick/pack pressure. Fix: filler_demand = max(0, 0.5 - max(pending_pressure, schedule_pressure) \u00c3\u2014 1.7), hits 0 at 30%+ pressure. Plus extended side_project_during_crunch reward to cover all filler tasks (loading, training, quality_check, returns_processing, receiving, side_project) when pending > 30%.",
+    "alternatives": [],
+    "constraints_created": [
+      "state.py filler demand must respond to BOTH pending-orders pressure AND schedule-behind pressure",
+      "facility_env.py crunch penalty must apply to all filler tasks uniformly via _FILLER_TASKS set"
+    ],
+    "tags": [
+      "state-representation",
+      "reward-shaping",
+      "filler-suppression"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T13:09:27.900258+00:00",
+    "verified_at": "2026-05-16T13:09:27.900258+00:00",
+    "updated_at": "2026-05-16T13:09:27.900258+00:00"
+  },
+  {
+    "id": "dec-010",
+    "summary": "Pick buffer cap (pick_buffer_capacity) prevents over-picking via env constraint, not learned behavior.",
+    "rationale": "Pick is 2.5\u00d7 faster than pack per worker (PICK_MULTIPLIER_MAIN=2.5 vs pack=1.0). Without a buffer cap, pickers could pile up unbounded picked-not-audited orders that packers couldn't clear. Real warehouses physically can't stage that many \u2014 cart space is finite. User reported their warehouse caps at ~50 picked-not-packed. Fix: pick_buffer_capacity (random 6-12 \u00d7 N_workers in synthetic_gen). When buffer is at cap, action mask removes 'pick' from valid tasks. Pick/pack balance becomes a hard env constraint, not learned. Stranded-worker safety: if buffer full AND no other action valid, re-enable pick (avoid zero-mask softmax NaN).",
+    "alternatives": [],
+    "constraints_created": [
+      "actions.py must enforce pick_buffer_capacity in BOTH normal-branch and OT-branch action masks",
+      "Stranded-worker safety check required: if buffer full and no other valid action, re-enable pick"
+    ],
+    "tags": [
+      "env-design",
+      "action-mask",
+      "pick-pack-balance"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T13:09:38.431680+00:00",
+    "verified_at": "2026-05-16T13:09:38.431680+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-011",
+    "summary": "Zero the per_productive_hour baseline for filler tasks and drop the crunch threshold from 0.30 to 0.10 (Restart A of filler-vs-orders fix).",
+    "rationale": "PROBLEM: Audit of recent grade-F days showed the agent was choosing filler over orders even when ignoring orders caused service failure. Worst day: 3716/2004 orders remaining, 0% completion, but total reward = -22 (barely negative). Workers spent more hours on side_project/training/qc/loading/returns than on picks. Root cause: per_productive_hour paid +0.3/hr for ANY non-idle work including all 6 filler task types, giving a +24/day baseline floor for \"look busy\" behavior; AND _in_crunch threshold of 30% pending never fired on the actual failure modes (24% completion days were BELOW the gate, so the existing -2.0 filler_during_crunch penalty never activated).\n\nWHY THIS FIX: Two tightly-coupled changes attacking opposite sides of the same hole. (1) Gate per_productive_hour to non-filler tasks: pickers/packers/restock/management still earn the +0.3/hr baseline, but filler is neutral by default. Removes the structural floor that let net day reward stay positive even on grade-F days. (2) Drop _in_crunch threshold 0.30\u21920.10: the existing -2.0 penalty now fires on the days it was designed for. Together: filler is positive-EV nowhere, and negative-EV across almost the entire range of \"we have orders to ship.\"\n\nWHAT WE TRIED FIRST: Extending filler_during_crunch from just side_project to all 6 filler task types (landed earlier, helped but insufficient \u2014 the binary 30% gate meant the penalty rarely fired). Suppressing filler_demand in state.py via pending_pressure scaling (landed, did not change behavior because the policy had learned the reward loophole).\n\nTRADEOFFS: per_productive_hour at +0.3/hr was load-bearing for the \"work vs idle\" gradient. Now pickers/packers still get it but a worker doing nothing-useful filler gets nothing positive baseline. If the agent compensates by going IDLE instead of filler, we'd see per_idle_hour=-0.5 kick in, which is even more aversive \u2014 should drive toward picks. Risk: short-term win-rate dip while policy re-explores.\n\nSEQUENCED: Restart B (queued, not yet shipped): scale side_project_during_crunch as -2.0 \u00d7 pending_pct \u00d7 5 instead of flat; cleanup per_filler_unit 0.1 \u2192 0.0. Following con-008 (1-2 changes per restart).",
+    "alternatives": [
+      {
+        "option": "Lower per_order_incomplete cap (currently -500 max)",
+        "reason_rejected": "Cap is load-bearing for value-head stability post-symlog; touching it risks regressing the head-saturation fix. Defer until symlog has more settling time."
+      },
+      {
+        "option": "Add action mask gate blocking filler when pending > X%",
+        "reason_rejected": "Hard-blocking the policy's action choices removes learning signal \u2014 agent never sees the negative consequence. Prefer to let the agent choose filler and pay the cost, so it learns the policy."
+      },
+      {
+        "option": "Ship scaled penalty + threshold drop + baseline zero all together",
+        "reason_rejected": "Violates con-008 (max 2 changes per restart). Lost attribution if results shift."
+      }
+    ],
+    "constraints_created": [
+      "Whenever extending a gated penalty (e.g. filler_during_crunch) to new tasks, also re-examine the gate threshold \u00e2\u20ac\u201d extending coverage without verifying the gate fires is a half-fix"
+    ],
+    "tags": [
+      "reward-shaping",
+      "filler-vs-orders",
+      "env-design",
+      "restart-a"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T13:59:13.171305+00:00",
+    "verified_at": "2026-05-16T13:59:13.171305+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-012",
+    "summary": "Restart B of filler-vs-orders fix: scale side_project_during_crunch penalty linearly with pending backlog (was flat -2.0), unify side_project's gate with the generalized _in_crunch threshold, and expand rb digest whitelist to surface the penalty on dashboards.",
+    "rationale": "PROBLEM: Restart A landed (zero filler floor + drop crunch threshold to 0.10) and the env-level penalty was firing hard (-1890 in one observed day in raw episode_log.json) but: (1) the penalty was still flat -2.0/tick regardless of severity, so 11% pending and 99% pending got identical pressure, and (2) the digest in mp_runner.py:124 had a hardcoded whitelist that dropped side_project_during_crunch from the rb dict, meaning the metrics/dashboard never showed it firing. We were flying blind on whether the penalty was even moving the needle.\n\nWHY THIS FIX: Two changes attacking the remaining gaps in the filler-vs-orders mechanism.\n\n(1) Scaled penalty: _crunch_scale = max(1.0, _crunch_pending_pct * 5.0), applied via _add_reward's multiplier. Floor at 1\u00d7 (preserves current behavior for backlogs 0-20%), linear ramp above that, reaching 5\u00d7 at 100% pending. At 50% pending the penalty becomes -5.0/tick instead of -2.0. At 100% pending (real failure mode) it's -10.0/tick. This is the \"increasingly scaled penalty so orders always come first when there's order load\" design we agreed on at the start of this debugging arc but had only half-implemented \u2014 only the extension to all filler tasks landed in earlier work, not the actual scaling math.\n\n(2) Unify side_project's gate: previously the side_project task branch had its own hardcoded 0.30 threshold (facility_env.py:539) which disagreed with the generalized 0.10 threshold the other 5 filler tasks now use. Move side_project to use _in_crunch and _crunch_scale so the policy can't escape the penalty by routing to side_project specifically.\n\n(3) Whitelist expansion in mp_runner.py:124 \u2014 add \"crunch\" (side_project_during_crunch) and \"filler\" (per_filler_unit) keys to the slim rb digest. Pre-fix these were dropped on the IPC boundary even though env tracked them correctly. Now visible on the dashboard so we can validate Restart B is doing what we think.\n\nWHAT WE TRIED FIRST: Restart A (zero per_productive_hour for filler + drop crunch threshold to 0.10) landed first. Verified math (prod dropped from ~100-150 to ~20-50 on bad days). Verified penalty fires in raw episode log (-1890 example). But only ran ~30 episodes before this restart so haven't yet seen policy-level adaptation.\n\nTRADEOFFS: Scale ramp from 1\u00d7 to 5\u00d7 is steep \u2014 at 100% pending a day of 900 filler-during-crunch ticks would cost -9000 vs current -1800. That's a strong learning signal but also a strong policy shift; if the agent overcorrects toward picks/restock and starves filler tasks (loading, training, qc, returns_processing, receiving) entirely, those may never get done. Acceptable risk because filler is supposed to be opportunistic, not mandatory. Worst case we tune the scale factor down later.\n\nRESTOCK ECHO: Audit found 24/123 fails (~20%) involved restock collapse. Same mechanism (filler beats restock when filler is positive-EV). Restart B's scaled penalty should help BOTH problems without further changes \u2014 restock urgency is implicit in pending_pct via picked_not_audited. If restock failures DON'T drop after Restart B's policy adaptation period, next audit target is restock demand scaling in state.py.\n\nSEQUENCED: Backed up checkpoint as preFillerFixB.bak. Killed PID 36396. Edits live. New trainer PID 17220. Following con-008 (2 changes max per restart).",
+    "alternatives": [
+      {
+        "option": "Multiplier formula base * (1 + pending_pct * 4) \u2014 no floor, scales from 1\u00d7 at 0% to 5\u00d7 at 100%",
+        "reason_rejected": "At very low pending (e.g. 5%) this gives 1.2\u00d7 \u2014 basically nothing. We want a meaningful floor of -2.0 at 10-20% pending so the penalty has teeth at the gate threshold."
+      },
+      {
+        "option": "Just raise the flat value from -2.0 to -10.0",
+        "reason_rejected": "Same penalty at 11% pending as at 99% pending \u2014 loses the severity gradient that makes the agent prioritize ACUTE backlog over chronic backlog. Doesn't match the original design intent."
+      },
+      {
+        "option": "Defer the whitelist expansion to a separate restart",
+        "reason_rejected": "Instrumentation gap is the reason we can't see Restart A's impact. Bundling it now means we can judge Restart B and any future changes from real data."
+      },
+      {
+        "option": "Touch per_filler_unit (currently 0.1 for side_project) in this restart too",
+        "reason_rejected": "Three changes violates con-008. per_filler_unit only fires for side_project (line 555) and contributes ~+0.017/tick to filler EV \u2014 small compared to the scaled crunch penalty. Can defer to Restart C if needed."
+      }
+    ],
+    "constraints_created": [
+      "When changing reward magnitudes by significant factors (e.g. flat penalty to scaled, or 2x+ multiplier change), also ensure the corresponding rb digest keys are in the whitelist so we can measure the impact. Instrumentation is part of the fix."
+    ],
+    "tags": [
+      "reward-shaping",
+      "filler-vs-orders",
+      "env-design",
+      "restart-b",
+      "instrumentation"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T14:12:51.470878+00:00",
+    "verified_at": "2026-05-16T14:12:51.470878+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-013",
+    "summary": "Option Z: cap cumulative side_project_during_crunch reward per day at -5000. Preserve the Restart B \u00c3\u20145 scale curve and gradient direction; just bound the tail.",
+    "problem": "Post-Restart-B trajectory audit (3 agents converged) found pass rate degrading 71.5% \u00e2\u2020\u2019 38% across a ~22-min wall-clock window after Restart B went live. Three diagnoses competed: policy destabilization, PPO-safe-but-reward-balance-wrong, and policy lag (only ~19 episodes since restart, insufficient for old policy to update). The one concrete artifact both auditors agreed on: reward tail to -123k in raw space and per-day v_loss peaks of 80-91 (vs typical 2-3), pointing to extreme negative-reward days injecting noise into the value function even after symlog compression.",
+    "why_chosen": "Option Z is the minimum-collateral middle ground between Option X (do nothing, trust the mechanics) and Option Y (dial scale \u00c3\u20145 \u00e2\u2020\u2019 \u00c3\u20143, lose the work). A per-day cap of -5000 bounds the extreme tail (which the worst observed Mode 3 day at -4714 grazes) without touching the gradient direction or the scale curve that Restart B's design implemented. Cheap defensive change: ~6 lines of code, zero math change for typical days, and the cap effectively only triggers on days the audit specifically flagged as anomalous. If pass rate doesn't recover after a few hundred more episodes, Option Y becomes the next move with full attribution.",
+    "what_we_tried": "Restart A (zero per_productive_hour for filler tasks + lower crunch threshold 0.30 \u00e2\u2020\u2019 0.10) landed and was verified working. Restart B (scaled penalty + side_project gate unification + rb whitelist expansion) landed and penalty fired hard (-4500+ on bad days). User flagged \"crushing it\" based on 77% A/B/C pass on last 100 days. Three-agent convergence audit found pass rate ACTUALLY degrading over time within the post-Restart-B window. Agent 1 wanted dial-down to \u00c3\u20143; Agent 2 said magnitudes are safe but reward balance may be off; my thread found stage was constant (curriculum ruled out as cause). Synthesis: most of the \"degradation\" is policy lag, but tail clamping is cheap insurance regardless. Then the session crashed AND the trainer crashed.",
+    "tradeoffs": "On days where the agent does pathologically high filler (would have hit -5000+ pre-cap), the policy now stops getting additional penalty signal past the cap. Could in theory mask the WORST behavior from learning. Mitigated by: (1) -5000 is already an enormous signal \u2014 once a day hits that, the policy has gotten plenty of bad-news gradient; (2) marginal returns of additional penalty past that point are small relative to noise; (3) preserves the gradient direction within the meaningful range; (4) easy to remove if it turns out to slow learning.",
+    "alternatives": [
+      {
+        "option": "Option X: do nothing, wait 200+ episodes",
+        "reason_rejected": "Trusts the mechanics analysis (correct) but ignores the concrete v_loss spike and -123k tail observations. Free option but loses time and tolerates an unnecessary tail risk."
+      },
+      {
+        "option": "Option Y: dial scale x5 to x3 across the board",
+        "reason_rejected": "Reduces tail magnitude but loses the work Restart B did and reduces the gradient signal across the whole range, not just the tail. Smaller signal-to-noise everywhere, not just where the tail was extreme."
+      },
+      {
+        "option": "Per-tick scale cap instead of per-day",
+        "reason_rejected": "Doesn't bound the cumulative tail because tick count varies. A day with 50% pending and 945 ticks would still hit -4725 even with per-tick cap of -10."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-011",
+      "dec-012",
+      "con-008",
+      "con-010"
+    ],
+    "tags": [
+      "reward-shaping",
+      "filler-vs-orders",
+      "env-design",
+      "convergence-audit",
+      "tail-clamping"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T16:33:45.101374+00:00",
+    "verified_at": "2026-05-16T16:33:45.101374+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-014",
+    "summary": "First scaffold of the facility setup wizard \u2014 local web UI that bridges non-technical warehouse operators to valid FacilityConfig YAML for fine-tuning. Vanilla JS, save/resume, preset-based pain-point mapping with no LLM calls.",
+    "problem": "User asked how a warehouse customer eventually tailors the foundation model to their facility. We have finetune.py + a 786-line schema + an interactive CLI (cmd_init) that scaffolds a YAML skeleton but expects the user to hand-edit hundreds of lines. That's a non-starter for non-technical operators. The fine-tune pipeline works but is unreachable without a guided UI. User wanted to start building one, asked for: local web, vanilla JS, save+resume, no LLM API calls (cost), and an explicit defensive validation layer.",
+    "why_chosen": "Mirrored the existing dashboard architecture (Python http.server + single-file HTML/JS) for zero new dependencies and a consistent codebase pattern. Built three artifacts: presets.json (archetype + question library, hand-curated mapping from user-friendly choices to specific reward weights \u2014 zero AI needed at runtime), index.html (vanilla JS multi-step wizard with localStorage for in-flight state and POST /sessions for named save/resume), and cmd_wizard in cli/main.py (HTTP server with /presets, /sessions GET+POST+GET-by-id, /validate POST). The validation endpoint walks a rules array in presets.json and reports errors/warnings on the combined config \u2014 catches things like \"no shipping reward\" (broken) or \"OT cost dominates incomplete cost\" (agent will prefer leaving orders unshipped). The whole \"intelligence\" lives in the JSON, not in code or API calls, so refining the question library is a content-edit not an engineering task.</why_chosen>\n<parameter name=\"what_we_tried\">Considered React/Vue for the frontend \u2014 rejected for the no-toolchain reason (matches the dashboard pattern). Considered LLM-driven free-text intake \u2014 rejected for cost (user explicitly flagged) and for \"free text is the worst UX because users describe edge cases\". Considered sliders for pain-point answers \u2014 rejected in favor of discrete presets because preset values are known-tested, slider values are not. Considered putting the wizard logic in clark/training/ rather than its own module \u2014 rejected for separation-of-concerns; wizard is presentation, training is execution.</what_we_tried>\n<parameter name=\"tradeoffs\">Single-page HTML in one file is fine for the current 3-4-step prototype but will need refactoring at 8-10 steps. localStorage for in-flight state means a hard browser crash can lose unsaved work \u2014 mitigated by a manual Save button, could later auto-save on each step transition. The validation rules are hand-coded checks in cmd_wizard (per_order_shipped_gt_zero, ot_cost_vs_incomplete, idle_not_negative, any_weight_extreme); adding a new rule requires both a presets.json entry AND a check branch in _validate_config. Acceptable for the first 5-10 rules; if the rule library grows large, refactor to a pure-data rule format.",
+    "what_we_tried": "Considered React/Vue for the frontend \u2014 rejected for the no-toolchain reason (matches the dashboard pattern). Considered LLM-driven free-text intake \u2014 rejected for cost (user explicitly flagged) and for 'free text is the worst UX because users describe edge cases'. Considered sliders for pain-point answers \u2014 rejected in favor of discrete presets because preset values are known-tested, slider values are not. Considered putting the wizard logic in clark/training/ rather than its own module \u2014 rejected for separation-of-concerns; wizard is presentation, training is execution.",
+    "tradeoffs": "Single-page HTML in one file is fine for the current 3-4-step prototype but will need refactoring at 8-10 steps. localStorage for in-flight state means a hard browser crash can lose unsaved work \u2014 mitigated by a manual Save button, could later auto-save on each step transition. The validation rules are hand-coded checks in cmd_wizard (per_order_shipped_gt_zero, ot_cost_vs_incomplete, idle_not_negative, any_weight_extreme); adding a new rule requires both a presets.json entry AND a check branch in _validate_config. Acceptable for the first 5-10 rules; if the rule library grows large, refactor to a pure-data rule format.",
+    "alternatives": [
+      {
+        "option": "Skip the wizard and build a YAML editor with live validation",
+        "reason_rejected": "Doesn't solve the actual problem (non-technical users can't navigate the 786-line schema even with syntax help). Wizard's job is translation, not editing."
+      },
+      {
+        "option": "FastAPI backend instead of stdlib http.server",
+        "reason_rejected": "Adds a dependency for ~150 lines of HTTP code that stdlib handles cleanly. Pattern already proven by dashboard. Can migrate later if endpoint count justifies it."
+      },
+      {
+        "option": "Build the full 8-step wizard now",
+        "reason_rejected": "Validates none of the architectural decisions if all steps follow the same broken pattern. Prototype with 1 archetype-pick + 1 pain-point question proves the wizard pattern AND the preset-mapping pattern with minimal code, then iterate."
+      }
+    ],
+    "constraints_created": [
+      "Wizard presets.json is the source of truth for archetypes, question presets, and validation rules. Adding archetypes or questions = edit JSON only, no code change. Adding a validation rule = edit JSON + add a check branch in cmd_wizard._validate_config. Keep this discipline so the question library can be iterated without engineering work.",
+      "All wizard UX text comes from presets.json (labels, descriptions, help, prompts). Never hard-code prompt strings in index.html \u00e2\u20ac\u201d wizard should be re-themable by editing one file."
+    ],
+    "related_to": [
+      "dec-011",
+      "dec-012",
+      "dec-013"
+    ],
+    "tags": [
+      "wizard",
+      "fine-tuning",
+      "ux",
+      "config-builder",
+      "presets"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T17:04:43.009744+00:00",
+    "verified_at": "2026-05-16T17:06:42.379166+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-015",
+    "summary": "Bound synthetic order volume to OT-rescuable workforce capacity (Fork C). Recalibrated _generate_volume capacity factor 0.4 to 0.22 and added a hard rescue ceiling so no curriculum config is physically unwinnable.",
+    "problem": "Win-rate plateaued noisy-flat (0.05-0.65) for thousands of episodes while completion stayed strong (0.85-0.98). A three-agent independent audit converged: optimizer healthy, ceiling environmental. Empirical anchor: across 300 days of grades, NO A-grade day ever exceeded ~1226 orders, yet _generate_volume emitted up to 2000 for the same workforce class. Configs with 1700-2100 orders graded 84% F regardless of policy. corr(orders_total, crunch_penalty)=-0.68. The agent was graded on physically unwinnable years. Confirmed the user's much-earlier intuition (\"is it a learning issue or is the task simply not possible?\").",
+    "why_chosen": "capacity_per_worker = avg_oph*9*0.4 was ~2x optimistic: it used the PACK rate but every order needs BOTH a pick and a pack labor unit (sequential pipeline), and 0.4 did not absorb restock/management/breaks/call-off/complexity plus the env pick->pack coordination cost (buffer caps, pack starvation, audit step). Theory suggests ~0.37; the real achievable factor measured against the 1226 empirical ceiling is ~0.22, so we trusted data over theory. Fork C (user chose over A and B): comfortable capacity = normal-shift no-OT throughput (factor 0.22); hard ceiling on every generated season HIGH = comfortable*1.25 (max-OT rescue headroom). Peak staffing is treated as pure safety margin, NOT banked on, because it is stage-probabilistic and month-specific and must not be load-bearing for feasibility. Preserves hard days (useful pressure) while guaranteeing every year is winnable. Verified 500+ samples: 0 small workforces exceed their rescue ceiling; high-volume configs now have proportionate 30-50 worker staffing.",
+    "what_we_tried": "The prior winter_hi_cap = n*cap*1.10/peak_mult was meant to keep summer feasible but rested on the same 2x-optimistic capacity_per_worker, so the cap was itself 2x too loose. The small-N trap-config filter in _generate_tasks (M<=N for N<=15) fixed a different unsolvable class (task variety, not volume). The inverted-range crash fix (commit 71b047c, _norm guard) was in this same function but orthogonal. Agent 2's alternative (raise tbptt_chunk_size 64->128) was deferred as cosmetic.",
+    "tradeoffs": "High-N facilities now legitimately get larger peak volumes (30-50 workers can see 1500-2000 order peaks) because volume scales WITH workforce; intended, not a regression. The 0.22 factor is calibrated to the current env + current policy competence; if the policy materially improves, 0.22 may become slightly conservative and worth revisiting upward. The 1.25 OT multiplier is a single flat estimate rather than derived per-config from each config's ot_wall_clock_max + per-worker max_ot_hours; chosen for simplicity, and under-estimating rescue headroom errs safe (slightly easier, never impossible). Restart cost: curriculum stage tracker resets 3->1 (weights persist via warm-resume; bounded, re-climbs).",
+    "alternatives": [
+      {
+        "option": "Fork A: hard-cap volume to workforce, no overwhelming days",
+        "reason_rejected": "Model never trains on genuinely demanding peak-season days that happen in real understaffed warehouses. Loses robustness."
+      },
+      {
+        "option": "Fork B: scale workers up to match volume",
+        "reason_rejected": "Distorts the staffing distribution the model sees; it should learn to cope with fixed staffing under load, not assume reinforcements always arrive."
+      },
+      {
+        "option": "Reward shaping: partial credit for high-completion F days",
+        "reason_rejected": "Agent 1 flagged this does not address the underlying issue; agent still optimizes toward impossible targets with softened gradients. Treats the symptom."
+      },
+      {
+        "option": "tbptt_chunk_size 64->128 (Agent 2 secondary)",
+        "reason_rejected": "Cosmetic per Agent 2's own verdict; deferred to preserve attribution (con-008)."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-011",
+      "dec-012",
+      "dec-013",
+      "con-008",
+      "con-010",
+      "pipe-001"
+    ],
+    "tags": [
+      "curriculum",
+      "synthetic-gen",
+      "feasibility",
+      "convergence-audit",
+      "win-rate-ceiling"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T20:15:30.831716+00:00",
+    "verified_at": "2026-05-16T20:15:30.831716+00:00",
+    "updated_at": "2026-05-16T20:15:30.831716+00:00"
+  },
+  {
+    "id": "dec-016",
+    "summary": "Vectorized the batched action sampler in transformer.py select_action_batched: one batched Categorical + one GPU-to-CPU transfer per head, replacing the per-env Python loop. Gated behind a distribution-equivalence test suite.",
+    "problem": "Training throughput was ~60.6s/episode and the question was where the bottleneck is. Two independent audits (a profiling agent + manual thread) converged: the loop is CPU/Python-bound, not GPU-bound \u2014 RTX 5070 Ti at 74% util / 16% mem-controller / 53% VRAM free is the classic GPU-starved signature. Profiling pinned select_action_batched (transformer.py:815-829): a for b in range(B) loop building 2 torch Categorical + .sample() + .tolist() per env, so 2*B (=64 at n_envs=32) blocking GPU-to-CPU syncs per tick, measured ~235ms/tick vs ~27ms actual GPU compute.",
+    "why_chosen": "torch.distributions.Categorical batches over leading dims independently, so a single Categorical(logits=full_padded_(B,max_N,K)) is mathematically distribution-identical to the per-env sliced loop for real worker rows. Padded worker rows and padded task columns are -1e9-masked by forward_batched upstream, so their probability underflows to exactly 0 (can never be sampled, contributes nothing to logsumexp) and they are sliced off per-env after sampling. This collapses 2*B syncs/tick to 2, the agent projecting ~5-6x faster rollout. It was chosen over gumbel-max (more code, same result, harder to prove equivalent) and over leaving it alone (the bottleneck IS the rollout sampler, ~7x the real compute). Critically, a correct speed-only change is behavior-neutral: it does not contaminate the in-flight dec-015 feasibility-fix measurement and actually makes that measurement window arrive sooner, so it is the one class of change safe to ship during a let-it-cook phase.",
+    "what_we_tried": "My initial hypothesis was that the per-env Pipe IPC round-trips (32 sequential pipes/tick) were the cost; the profiling agent disproved this by measuring pickled state at 1251 bytes / ~12us \u2014 IPC is not the bottleneck. The agent also identified a secondary instance of the same per-step host-list-construction antipattern in PPO _evaluate_sequence (ppo.py:844-851), deferred as the clear #2 not #1.",
+    "tradeoffs": "Padded rows are now sampled-then-discarded (a tiny amount of wasted compute on garbage rows) versus the old code that only sampled real rows \u2014 negligible vs the 200x saving on sync overhead. The equivalence is distribution-identical but NOT sample-identical: batched .sample() draws from the RNG in a different order than B sequential .sample() calls, so a resumed run sees a different random action stream than it would have pre-change. Acceptable (RNG stream is not reproducibility-critical here; the policy distribution is what matters and is provably preserved). Risk if vectorization were subtly wrong: silent policy corruption with no error \u2014 mitigated by the gating equivalence test suite (exact log_prob match + 20k-draw empirical distribution match + degenerate-row finiteness).",
+    "alternatives": [
+      {
+        "option": "Gumbel-max batched sampler",
+        "reason_rejected": "Same result as batched Categorical but more code and harder to prove distribution-equivalent; Categorical already supports batched leading dims natively."
+      },
+      {
+        "option": "Raise --n-envs 32 to 48-64 (VRAM 53% free)",
+        "reason_rejected": "Real but secondary \u2014 amortizes per-tick host cost; only worth doing AFTER the sampler is vectorized (agent ranked it lower-leverage). Deferred."
+      },
+      {
+        "option": "torch.compile the model",
+        "reason_rejected": "Unnecessary once the GPU is not the constraint, and Windows-risky. Agent explicitly down-ranked it."
+      },
+      {
+        "option": "Leave it, accept 60s/episode",
+        "reason_rejected": "The sampler loop is ~7x the actual GPU compute; a ~5-6x rollout speedup materially shortens every future training and the in-flight dec-015 measurement window."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-015",
+      "pipe-001",
+      "con-008"
+    ],
+    "tags": [
+      "performance",
+      "throughput",
+      "transformer",
+      "sampler",
+      "convergence-audit"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T20:49:25.200764+00:00",
+    "verified_at": "2026-05-16T20:49:25.200764+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-017",
+    "summary": "Shipped epochs_per_update 4 to 2 as a gated speed A/B (Lever 1), consciously trading the in-flight dec-015 clean read for ~1.8x projected throughput. Keep only if win/cmp learning is not materially worse over the next few hundred episodes; one-line revert otherwise.",
+    "problem": "The production-tick profiler (con-011) measured _update_single_buffer at 82-83% of training wall-clock, internally ~57% eval (4x forward_sequence) / 43% rest (4x backward+step) / 0.6% prep, at ~2.9 t/s. Every prior speed analysis (two sub-agents, web research on async actor-learner / more envs) was disproved by the profiler: env wait is 0.4%, the PPO update is the bottleneck. User wants faster training without changing how the agent learns.",
+    "why_chosen": "epochs_per_update linearly scales both eval and rest (the 82%), so 4 to 2 roughly halves the dominant cost for a one-line, instantly-reversible change. Honest finding delivered to user first: NO large speedup here is behavior-neutral (unlike the distribution-identical sampler vectorization) \u2014 batching per-env updates changes optimizer-step cadence + advantage-norm scope + EMA cadence and cannot equal N serial Adam steps; async changes on-policyness. Since every big lever changes learning, the criterion shifts from 'faster and identical' (impossible at scale here) to 'faster and demonstrably not worse'. Lever 1 is strictly the lower-risk path to that bar: one line vs a large silent-bug-prone refactor, learning impact measurable in a few hundred episodes on the win/cmp trend already tracked, trivial revert. Run it first; its measured result decides whether Lever 2's large refactor is even justified.",
+    "what_we_tried": "dec-016 (vectorized sampler) shipped on a microbench projection of 5-6x, delivered ~1.15x because the sampler was ~15% of the loop \u2014 the reason con-011 now mandates production-profiler validation. The async-actor-learner / Sample Factory direction and the n_envs 32->64 experiment were both abandoned: profiler showed Clark is not env-starved (recv 0.4%), so those solve a non-existent problem and n_envs=64 would worsen the 82%. The agent's fixation on the _evaluate_sequence list-construction (ppo.py:844-851) was disproved: a sub-ms slice inside the 288ms eval which is real transformer+LSTM forward compute.",
+    "tradeoffs": "Fewer PPO epochs = less sample reuse per batch; learning per episode may slow even though episodes are faster in wall-clock. Net learning-per-hour improves only if the 3rd/4th epoch contributed little marginal signal \u2014 unknown until measured, hence the gate. Also consciously sacrifices a clean dec-015 feasibility measurement (epochs change contaminates the win/cmp trend; the two cannot be attributed simultaneously). Accepted because the user prioritized speed. Revert is one line, no state migration.",
+    "alternatives": [
+      {
+        "option": "Lever 2: batch per-env day-boundary updates into one batched PPO update",
+        "reason_rejected": "Larger potential speedup but a large correctness-fraught model+optimizer refactor; also NOT behavior-neutral (N serial Adam steps != 1 batched step; advantage-norm scope; EMA cadence) so it needs the same learning A/B with far more risk. Deferred; attempt only if Lever 1 proves insufficient."
+      },
+      {
+        "option": "Both levers together",
+        "reason_rejected": "con-008 violation: three confounded variables (epochs, batched-update optimization change, possible silent refactor bug). Cannot attribute a win/cmp move."
+      },
+      {
+        "option": "Do nothing, protect dec-015 read",
+        "reason_rejected": "Legitimate but user explicitly prioritized speed; Lever 1 is cheap and reversible enough that the trade is favorable if learning holds."
+      },
+      {
+        "option": "Async actor-learner / more parallel envs",
+        "reason_rejected": "Profiler proved Clark is not env-bound (recv 0.4%); addresses a bottleneck Clark does not have."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-016",
+      "con-008",
+      "con-011",
+      "dec-015",
+      "pipe-001"
+    ],
+    "tags": [
+      "performance",
+      "ppo",
+      "hyperparameter",
+      "ab-test",
+      "epochs-per-update"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T21:35:50.195130+00:00",
+    "verified_at": "2026-05-16T21:35:50.195130+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-018",
+    "summary": "Keep epochs_per_update=2 unreverted (banked ~2x speed); defer the Defect-B management reward/grade fix until the epochs=2 learning gate clears a defined stability trigger, then ship it as the single isolated change.",
+    "problem": "The management audit confirmed Defect B: facility_env.py:868-869 gives ZERO reward penalty for missing management on high-volume days while the grade demerits not-mgmt_full every day \u2014 a reward/grade contradiction capping ~332/1000 perfect-completion days below A. Fixing it is a learning-affecting reward-shaping change. But the epochs=2 A/B (dec-017) is in flight with its learning half UNVERIFIED (zero post-change completed episodes; current_episode pinned at 6850). Shipping the management fix now stacks two learning-affecting changes plus dec-015 = three confounded variables (con-008 trap).",
+    "why_chosen": "User chose to keep the production-profiler-confirmed ~2x speed win rather than revert epochs=2 for a cleaner read, accepting the management fix waits. This is the disciplined sequence-don't-confound path (con-008/con-011): two learning changes get serial clean-ish reads instead of one uninterpretable everything-at-once. The management fix is locked and queued with fixed rationale so there is no re-litigation later. Recorded correction: the user's 'model appears to be doing well' is NOT observable \u2014 all buffered win/cmp/grade data is pre-epochs-change residue, the epochs=2 verdict is genuinely pending and must not be read off residue (con-005).",
+    "what_we_tried": "Rejected: (1) revert epochs=2 to 4 and ship management clean now \u2014 user declined to preserve the 2x speed; (2) ship management on top of unverified epochs=2 now \u2014 con-008 three-way confound; (3) both at once \u2014 definitively wrong. Prior speed dead-ends were dec-016 (sampler ~1.15x) and the n_envs/async research; con-011 mandated production-profiler validation, which is how epochs=2's speed half was confirmed (~2x, 5-7 t/s vs 2.9 baseline).",
+    "tradeoffs": "Defect B (a confirmed correctness bug) stays live in training through the epochs=2 stability window \u2014 the agent keeps training on the contradictory mgmt signal until the fix ships. Accepted because cross-change attribution cleanliness is judged more valuable than fixing the bug a few hours sooner. The eventual management-fix read will still be dec-015-confounded (accepted earlier); 'stable' = 'not degraded vs prior trajectory', not clean isolated attribution.",
+    "alternatives": [],
+    "constraints_created": [
+      "Defect-B management reward/grade fix (facility_env.py:868-869 vs the grade demerit) is QUEUED. Ship it as the single isolated change ONLY after the epochs=2 gate clears: current_episode ~7100-7300+, rolling buffer post-change-dominated, post-change win-rate/cmp not materially below the pre-change band (win ~0.25-0.40, cmp ~0.85-0.91) sustained. If epochs=2 degrades that band, revert epochs first and reassess before shipping management."
+    ],
+    "related_to": [
+      "dec-017",
+      "dec-015",
+      "con-008",
+      "con-011",
+      "con-005"
+    ],
+    "tags": [
+      "sequencing",
+      "reward-shaping",
+      "management",
+      "ab-test",
+      "attribution-discipline"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T22:05:31.748500+00:00",
+    "verified_at": "2026-05-16T22:05:31.748500+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-019",
+    "summary": "Shipped the Defect-B management reward fix (removed the high-volume escape hatch in facility_env.py so management_duty_missed applies whenever below minimum regardless of day volume). dec-018 gate cleared on substance. Now live alongside the previously-committed peak-season-OT grade change.",
+    "problem": "dec-018 queued the Defect-B fix gated on epochs=2 not degrading learning. Health check at ep 6889 (~50 post-epochs-change episodes) showed win/cmp at-or-above the pre-change band (cmp ~0.95-1.0, day-grade ABC ~68%) with PPO stable \u2014 the gate's substantive criterion (no degradation) was decisively met even though the conservative ~7100-episode proxy anchor was not reached. User greenlit.",
+    "why_chosen": "The dec-018 gate's real criterion was 'epochs=2 not materially degrading learning', answered decisively by ~50 stage-3 episodes (win/cmp not below band, v_loss mean 2.7 vs pre-epochs 6.75, no instability). The 7100-episode figure was a confidence proxy, not the criterion; acting on answered substance beats bureaucratic round-number waiting. The fix is minimal and surgical: delete the elif-high_volume-pass branch so the reward penalizes missing management whenever below minimum, matching the grade which hard-F's that case regardless of volume. Exactly one isolated learning change (con-008).",
+    "what_we_tried": "Audit ruled out Defect A (the +30/+10/-50 magnitude ladder) as the thing to ship now \u2014 calibration not contradiction; bundling it = two reward changes (con-008). The bimodal win pattern in raw post-change episodes (ep6887 win=0.004 cmp=1.0 ot=0.98) corroborated the audit live: agent ships ~100% then loses the year purely on OT/management demerits, exactly Mechanisms 2 and 3.",
+    "tradeoffs": "CRITICAL attribution caveat: this restart activated TWO changes. (1) Management reward fix = a learning change (gradual over episodes), confounded with epochs=2 + dec-015 as already accepted. (2) Peak-season-OT grade change (commit 213164d, rode until this restart) = a metric-scoring change that MECHANICALLY lifts win-rate on peak-OT days instantly, zero learning effect. Post-restart win-rate moves for two distinct reasons; a jump must NOT be read as 'the management fix worked' \u2014 part is just OT rescoring. Also lost ~14 episodes (checkpoint at ep 6875, save-interval 25); weights intact, only wall-clock.",
+    "alternatives": [
+      {
+        "option": "Wait for the literal ~7100-episode dec-018 anchor",
+        "reason_rejected": "The anchor was a confidence proxy for 'no degradation'; that question was answered decisively at ~50 episodes. More waiting adds no information, only delays a confirmed correctness-bug fix."
+      },
+      {
+        "option": "Also fix Defect A (rebalance +30/+10/-50) now",
+        "reason_rejected": "Two reward changes at once = con-008 confound. Defect A is calibration, separable, only worth touching if Defect B alone proves insufficient."
+      },
+      {
+        "option": "Revert/hold peak-season-OT so only management goes live",
+        "reason_rejected": "OT change is metric-only (behaviour-neutral for the policy) so it does not confound the LEARNING read of the management fix, only the win-rate METRIC, which is flagged. Reverting = churn for no learning-attribution benefit."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-018",
+      "dec-017",
+      "dec-015",
+      "con-008",
+      "con-005",
+      "con-011"
+    ],
+    "tags": [
+      "reward-shaping",
+      "management",
+      "defect-b",
+      "shipped",
+      "attribution-discipline"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T22:34:25.223475+00:00",
+    "verified_at": "2026-05-16T22:34:25.223475+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-020",
+    "summary": "Scrapped the FastAPI layer (api/main.py), dropped fastapi+uvicorn deps, deleted CLOUD_ARCHITECTURE.md, rewrote README/ARCHITECTURE/NOTE removing all API/cloud/Docker/Celery fiction. Clark is now explicitly local-only (CLI + wizard). Commit bf21561.",
+    "problem": "External reviews (Claude 9/10, Codex 7.5/10) plus a direct audit showed the API was a skeleton overstating readiness: train endpoints returned not_implemented, auth accepted any non-empty key, registry was local JSON, and its only non-duplicated function (a programmatic /plan endpoint) had zero consumers. Biggest drag on the honest production-readiness score and pure speculative scope.",
+    "why_chosen": "YAGNI plus the session-wide anti-fiction discipline. Wizard + CLI cover the human workflow end to end so the API duplicated everything except a no-consumer /plan endpoint. Verified nothing imported api/ or fastapi/uvicorn before deleting (wizard/dashboard use stdlib http.server by design), so removal also cut two real install deps. Docs made honest not merely trimmed: ARCHITECTURE.md's five fiction sections replaced via keyed splice with one truthful Deployment section, real sections kept. A hosted layer is built only when a real consumer exists to design around.",
+    "what_we_tried": "Considered the middle path (keep only the working /plan endpoint, delete stubs/fake auth, label experimental); rejected because no consumer exists so even the minimal version is speculative scope that still costs review credibility. The Docker/Celery/Postgres design (CLOUD_ARCHITECTURE.md, NOTE.md Phase 7) was always aspirational, never built.",
+    "tradeoffs": "If a hosted/integration deployment becomes real the API is rebuilt from scratch \u2014 but shaped by that consumer's real needs not the skeleton's guesses (a day's work then vs ongoing credibility cost now). NOTE.md carries an explicit do-not-resurrect note so a future session does not rebuild by reflex or mistake scrapped scope for roadmap.",
+    "alternatives": [],
+    "constraints_created": [
+      "Clark is local-only (CLI + clark wizard). No API/service layer exists and none is built speculatively; a hosted/multi-tenant/WMS layer is built ONLY when a real external consumer exists, designed around them. NOTE.md records this; do not resurrect the FastAPI skeleton."
+    ],
+    "related_to": [
+      "dec-014",
+      "dec-019",
+      "con-011"
+    ],
+    "tags": [
+      "api",
+      "scope",
+      "scrap",
+      "deployment",
+      "documentation-honesty"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T23:43:53.354285+00:00",
+    "verified_at": "2026-05-16T23:43:53.354285+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-021",
+    "summary": "Live-experiment state as of commit bf21561 / ~ep 6900: three changes are simultaneously active in the running pretrain \u2014 epochs=2 (dec-017), the Defect-B management reward fix (dec-019), and the peak-season-OT grade change. Records what the next health read must separate.",
+    "problem": "Compaction is imminent and multiple learning/metric changes went live close together. Without an explicit record, a future session reading a win-rate move post-compaction would misattribute it, repeating the noise-as-signal failure this project keeps having (con-005).",
+    "why_chosen": "A single consolidated state note is the cheapest way to preserve attribution across compaction. The next health check (anchor ~ep 7200-7400+, after buffer turnover) MUST separate: (1) epochs=2 \u2014 speed half confirmed ~2x via profiler, learning gate substantively cleared at ~ep6889 (win/cmp at-or-above pre-change band, no degradation); (2) Defect-B management fix \u2014 a LEARNING change, gradual over episodes, its win-rate effect is fewer perfect-completion-but-not-A days (~332/1000 baseline); (3) peak-season-OT grade change \u2014 a METRIC-ONLY change that mechanically lifts win-rate on peak-OT days the instant it activated, zero learning effect; (4) dec-015 feasibility-bounded volume, already accepted as confounded. A win-rate jump is NOT proof the management fix worked \u2014 part is the mechanical OT rescoring.",
+    "what_we_tried": "dec-018 originally gated the management fix on a conservative ~7100-episode anchor; we shipped at ~6889 because the gate's real criterion (epochs=2 no-degradation) was decisively answered earlier and waiting added no information. The 392-test suite, profilers (tick + ppo-prof, permanent), and CI are all in place and green; speed is ~5-12 t/s vs the 2.9 baseline depending on config.",
+    "tradeoffs": "Defect A (the +30/+10/-50 management reward magnitude ladder) is still unaddressed \u2014 only the Defect-B contradiction was fixed; revisit only if B alone proves insufficient. The management-fix learning read is permanently confounded with epochs=2 + dec-015 (accepted): 'success' = win-rate/perfect-but-not-A trend improving vs the pre-fix baseline, not clean isolated attribution.",
+    "alternatives": [
+      {
+        "option": "Record nothing, rely on the compaction summary",
+        "reason_rejected": "The three-way live-change confound is exactly the detail a summary flattens; misreading the next health check is the concrete risk."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-015",
+      "dec-017",
+      "dec-018",
+      "dec-019",
+      "dec-020",
+      "con-005",
+      "con-008",
+      "con-011"
+    ],
+    "tags": [
+      "training-state",
+      "attribution",
+      "in-flight",
+      "continuity",
+      "pre-compaction"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-16T23:44:33.888884+00:00",
+    "verified_at": "2026-05-16T23:44:33.888884+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-022",
+    "summary": "Fixed structurally-unusable end-of-day OT: anchor ot_hard_stop = eod + ot_wall (Bug B) and enter OT at orders_remaining >= ot_trigger, not strict > (Bug A). Commit 13aea3c.",
+    "problem": "An external review surfaced that synthetic_gen sampled eod_hour and ot_hard_stop_hour on independent clocks, so ~45% of generated facilities had ot_hard_stop <= eod (degenerate/zero OT window) plus ~5% sub-tick; and _check_eod used strict `orders_remaining > ot_trigger`, so a day exactly ot_trigger short never entered OT. ~50% of the training distribution physically could not use end-of-day OT, making any near-miss an instant unrecoverable F regardless of policy quality.",
+    "why_chosen": "Anchoring ot_hard_stop strictly off eod (eod + ot_wall, ot_wall in [0.5,2.0]) guarantees every facility a usable >=0.5h OT runway \u2014 verified 0% degenerate across 5000 post-fix samples (was 45.3%). Changing `>` to `>= and >0` closes the off-by-one so a 1-order miss also triggers OT. Both are env-feasibility fixes (change what a good policy can achieve, independent of reward). Pinned by new tests/test_ot_window.py.",
+    "what_we_tried": "User proposed forcing a pick/pack-only action mask during OT; rejected after data showed completed days run the same pick:pack mix as failed days and idle is only ~5.5% of F-day labor (mostly call-offs) \u2014 it would not have addressed the structural window.",
+    "tradeoffs": "Extreme-tail configs can now have ot_hard_stop up to ~24.0 (eod 22 + 2h window); accepted as rare and within the pre-existing eod envelope.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-015",
+      "con-008"
+    ],
+    "tags": [
+      "env-design",
+      "ot-mechanics",
+      "synthetic-gen",
+      "structural-bug",
+      "feasibility"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-17T23:28:59.843641+00:00",
+    "verified_at": "2026-05-17T23:28:59.843641+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-023",
+    "summary": "Reward made completion-dominant then re-tuned after a second triple-audit: per_order_shipped=3.0 (dense), all_orders_complete_bonus=3.0xtotal_orders paid only on full completion, per_order_incomplete capped -10xmin(N,200) (floor -2000). Commits bd28760 then fceda51. Supersedes dec-005's -10xmin(N,50) cap.",
+    "problem": "A triple-audit found a FAILED day netted net-POSITIVE reward (winnable-idle F days mean +1493, 75% positive) because per_order_shipped was paid linearly and banked during the day while the binary finish/fail outcome was tiny (flat +50 bonus, -500-capped penalty) and idle/filler were ~free. PPO optimized correctly but had no advantage gradient to stop leaving orders unshipped \u2014 F-rate flat 0.198->0.214, entropy rising (policy diffusing).",
+    "why_chosen": "The sign fix (failed days must be net-negative) was verified correct on logged data and kept. The first implementation (per_order_shipped=1 + a pure terminal +4xT lump + UNCAPPED per_order_incomplete) was over-tuned: a second independent triple-audit unanimously found it (a) over-sparsified \u2014 zero learnable gradient on the ~21% of days that end incomplete, behaviour went static-to-adverse, win regressed Welch t=-3.39; and (b) the uncap recreated the fat-tailed value-target instability INCOMPLETE_CAP existed to prevent (v_loss spiked 65-270, symlog insufficient at -42k). Re-tune restores a dense completion-graded shipped signal (3.0) + a finishing premium (+3xT lump) + a looser cap (200), keeping the verified sign while bounding the value tail. Modeled on logged days pre-cutover: F-incomplete mean -2585 (74.6% net-neg), clean-A +5308 (stable), incomplete bounded -2000.",
+    "what_we_tried": "Original flat +50 bonus + linear +5/order (caused net-positive failures). First rebalance per_order_shipped=1 + terminal +4xT + uncapped incomplete (over-sparsified, regressed, value-tail spikes). Full revert (rejected \u2014 discards the verified root-cause sign fix).",
+    "tradeoffs": "Near-miss F days are ~break-even in absolute reward (not deeply negative); finishing dominates by ~2.1x via the forgone completion lump, so this relies on PPO learning from advantage, not absolute sign. Restarted from the clean pre-rebalance checkpoint, discarding ~760 regressed episodes.",
+    "alternatives": [
+      {
+        "option": "Cap-only minimal fix (reinstate INCOMPLETE_CAP, keep per_order_shipped=1)",
+        "reason_rejected": "does not fix the near-miss winnable majority, which are below the cap; behavioural data showed F-day task-mix drifting wrong"
+      },
+      {
+        "option": "Full revert to pre-rebalance reward",
+        "reason_rejected": "discards the triple-verified root-cause sign fix (failed days were genuinely net-positive)"
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-005",
+      "dec-004",
+      "dec-013",
+      "dec-022",
+      "pipe-001"
+    ],
+    "tags": [
+      "reward-shaping",
+      "completion-dominant",
+      "value-head",
+      "convergence-audit",
+      "re-tune",
+      "supersedes-dec-005"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-17T23:29:20.493337+00:00",
+    "verified_at": "2026-05-17T23:29:20.493337+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-024",
+    "summary": "Whole-project audit reframe: the win_year ceiling is ~50% reward-addressable (incomplete days) and ~50% a grading artifact (completed days demerited by secondary mgmt/OT). Operational order completion is ~0.93 uniform across N=5-50 (generalization demonstrated). Decision: stop tuning reward/architecture; the headline gap is now an evaluation question, not a training one.",
+    "problem": "After many reward iterations the top-line win_year stayed ~flat (~0.4-0.56, declining with N) and it was unclear whether this was a policy ceiling, a distribution ceiling, or a measurement artifact \u2014 risking an endless unproductive reward-tuning loop, and leaving the foundation-model thesis unanswered.",
+    "why_chosen": "Three independent audits + direct verification converged: of all non-win (C/D/F) days, 52.7% shipped 100% but were demerited (restock ~always satisfied, OT only 37% \u2014 predominantly management duty), 47.3% incomplete. cmp_year is ~0.92-0.96 flat across every N bucket \u2014 completion does NOT collapse on hard configs. So Clark is operationally a working generalist and ~half the apparent gap is a self-conflated objective (primary KPI fused with secondary-duty demerits), not a policy deficiency. Both ML audits independently concluded further reward/architecture tuning has ~zero marginal return; the N-gradient is env super-linearity near the OT boundary, not an architecture limit.",
+    "what_we_tried": "Earlier framing treated the bimodal win as variance or a reward problem; the idle-composition probe (tools/probe_idle_composition.py) ruled out idle/sloth (idle is ~5.5% of F labor, ~46% unavoidable call-offs, 0% the hypothesized 'sent home before OT' case); feasibility stratification ruled out a distribution ceiling (dec-015 holds, only ~10% structurally infeasible).",
+    "tradeoffs": "Accepts the only remaining reward-addressable lever is the genuine ~21% incomplete-day gap, left to the dec-023 re-tune's convergence; no further reward/architecture changes pursued \u2014 the project's open question is now convergence + evaluation honesty, not more shaping.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-023",
+      "dec-015",
+      "con-005",
+      "pipe-001"
+    ],
+    "tags": [
+      "audit",
+      "win-rate-ceiling",
+      "evaluation",
+      "generalization",
+      "strategic",
+      "convergence-audit"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-17T23:29:38.036314+00:00",
+    "verified_at": "2026-05-17T23:29:38.036314+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-025",
+    "summary": "Eval-metric split: log ship_win (fraction of days that shipped 100% \u2014 the operational primary KPI) separately from the grade-conflated win, in record_episode/record_window (additive JSON keys) and the dashboard. Commits 5b58ea0 + d6ae441.",
+    "problem": "The dashboard and headline metric reported only the grade-based win, which fuses the primary job (ship orders) with secondary mgmt/OT demerits \u2014 under-reporting the model by ~50% and steering humans (and the job-hunt narrative) by a misleading number. Per dec-024 the honest operational signal needed to be visible where people actually look.",
+    "why_chosen": "Verified grade/win_year is NOT in the PPO loss and NOT in curriculum gating (_get_stage is config-count driven), so adding/splitting the metric is purely evaluation-side: non-learning-affecting, no restart, live run untouched. Additive JSON keys keep the dashboard backward compatible. Dashboard headline ship-win tile is derived from already-logged per-day completion so it is live immediately; the per-N column and trend overlay populate after the next natural restart and degrade to '\u2014' until then rather than faking zeros.",
+    "what_we_tried": "",
+    "tradeoffs": "The per-N/trend ship-win surfaces are blank until the running process restarts onto the new code; accepted rather than forcing a restart for a logging change. The cmp_year>1.0 carryover clamp was deliberately NOT bundled (it is learning-affecting \u2014 see the constraint).",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-024",
+      "con-012"
+    ],
+    "tags": [
+      "evaluation",
+      "metrics",
+      "dashboard",
+      "instrumentation",
+      "non-learning-affecting"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-17T23:29:50.933328+00:00",
+    "verified_at": "2026-05-17T23:29:50.933328+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-026",
+    "summary": "Triple-agent audit: the post-re-tune v_loss \"degradation\" is a false alarm \u2014 the value head is healthy (median v_loss ~0.02, fits ~98% of targets; bounded by-construction spikes that recover in 1-2 updates). No fix. Corrected the rollback trigger; banked a real non-urgent finding that the true negative tail is crunch (not incomplete) and its -5000/day cap slightly leaks.",
+    "problem": "A bedtime health check flagged v_loss apparently worsening (last-40 mean ~8.4, max ~153, cumulative spikes>50 went 5/270 -> 10/407) against a pre-set rollback trigger (\"spikes larger/more frequent -> the -2000 cap is insufficient, intervene\"). Needed to decide before a potential restart whether the re-tuned reward's value handling was failing.",
+    "why_chosen": "Three independent analyses converged: V median is ~0.02-0.024 (mean >> median = thin spike tail, not a distribution shift); absolute v_loss is bounded ~482 by construction (symlog(+good year) vs symlog at the +/-500k GAE clip), true max 252, spikes recover to ~0.01 within 1-2 updates and the instantaneous >50 rate mean-reverts (hit zero mid-run). The flagged trigger was a measurement artifact: a CUMULATIVE count (monotone by construction) plus a display-undersampled proflog max. v_loss uncorrelated with clip/entropy (not exploration-driven); per-day reward flat across the run (no worsening tail). Operational cmp ~0.95+ confirms learning intact.",
+    "what_we_tried": "Treated the cumulative spike count + proflog max as the degradation signal (the pre-set trigger); pressure-testing showed both are artifacts and the true ppo_updates[] series is bounded and mean-reverting.",
+    "tradeoffs": "Banked, NOT acted on: the dominant negative-return tail is side_project_during_crunch (worst component on ~859/889 negative days), NOT per_order_incomplete (floors only ~3% of days) \u2014 i.e. the re-tune capped the wrong lever; and the -5000/day crunch cap leaks (min ~-5228, ~67 days breach). Left for a future learning-affecting restart to avoid perturbing a healthy live run.",
+    "alternatives": [
+      {
+        "option": "Restart now with a tighter incomplete cap",
+        "reason_rejected": "value head is healthy (median v_loss 0.02); the trigger was a flawed metric; incomplete is not even the dominant tail"
+      },
+      {
+        "option": "Clamp the per-year return",
+        "reason_rejected": "symlog already handles it; the +/-500k GAE step-return clip rarely binds at the effective gamma horizon"
+      }
+    ],
+    "constraints_created": [
+      "Do NOT use a cumulative spike count or the undersampled proflog max as a v_loss health/rollback signal. Use the sliding-100-update v_loss MEDIAN (intervene only if it rises above ~0.5, currently ~0.02), or last-200 mean >25 with a monotonically climbing per-bin max, or cmp_year rolling <0.90.",
+      "If a value-tail fix is ever triggered, the correct lever is side_project_during_crunch (tighten to ~-2500/day AND make the cap actually bind \u00e2\u20ac\u201d it currently leaks to ~-5228), NOT per_order_incomplete; ride the next learning-affecting restart, never hot-apply."
+    ],
+    "related_to": [
+      "dec-023",
+      "dec-004",
+      "con-014",
+      "con-005",
+      "pipe-001"
+    ],
+    "tags": [
+      "value-head",
+      "v-loss",
+      "convergence-audit",
+      "false-alarm",
+      "rollback-trigger",
+      "crunch-cap",
+      "symlog"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-18T02:08:09.966216+00:00",
+    "verified_at": "2026-05-18T02:08:09.966216+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-027",
+    "summary": "Shipped a dense, gated management reward (management_progress_gated=6.0, paid per-management-hour only once orders are essentially shipped and capped at required hours). Targets the ~half of lost wins that are completed-but-demerited days. Commit a33cbbb. Resumed from the ep-11436 re-tuned checkpoint. Eligibility-widening explicitly deferred as the isolated next lever.",
+    "problem": "On ~1051 days the agent shipped 100% of orders but was graded C/D almost entirely for the management-duty shortfall: it did ~2.3h management (need ~2-6h) while sitting on ~118 worker-h/day of reallocatable filler+idle slack (45% of labor, 93.6% of days >=8h slack). This is ~half of all non-win days and materially revises the earlier 'structural ceiling, stop tuning' conclusion for that half \u2014 it is policy-addressable free headroom, not a ceiling.",
+    "why_chosen": "A triple-audit DIVERGED: auditor 1 said incentive (the decisive management signal is a sparse EOD grade-tier lump +10->+30 on a day already worth ~3600, normalized to noise by PPO's per-batch advantage normalization; management is already the best dense per-hour action yet not chosen); auditor 2 said eligibility (only manager/asst-mgr can do management, exactly 1 + 0-2 per facility regardless of N, so slack is on ineligible workers; reward fix is wasted). Reconciled from first principles: on the targeted completed days orders are shipped with 118h slack and the requirement is <=6h, so a single manager (8h shift) has both eligibility AND spare capacity \u2014 capacity exists, the policy just isn't assigning it. Therefore it is fundamentally an incentive problem; eligibility is a real but secondary amplifier (fragile/needle-in-haystack at large N, explains auditor 2's size-stratified split). Fix makes the management signal DENSE (per-tick, shipped-stream scale) so it survives advantage normalization, GATED to post-completion and CAPPED at required hours so it can never trade against shipping or become a grind.",
+    "what_we_tried": "A prior management reward change (commit bdb8665, the Defect-B fix) removed a high-volume escape hatch but only strengthened the penalty for missing management, not a positive dense incentive to do it \u2014 the agent still did ~1% management. That ruled out 'just remove the escape hatch' and motivated a dense positive per-hour signal.",
+    "tradeoffs": "Re-opens the tuning loop the earlier audit closed \u2014 accepted because that closure was based on the wrong premise for this half (it is addressable). Shipped the reward lever ALONE (not bundled with eligibility-widening) to preserve attribution per the no-bundling rule; the eligibility fix is therefore unproven and the reward fix may prove insufficient at very large N where the single eligible worker is a needle in a haystack.",
+    "alternatives": [
+      {
+        "option": "Eligibility/synthetic-gen fix (scale manager count with N, or add 'lead' to mgmt-eligible) instead of the reward fix",
+        "reason_rejected": "capacity already exists on the targeted completed days (1 manager covers <=6h with 118h slack) so it is not the binding cause; held as the explicit ISOLATED next lever if the reward fix underperforms at large N"
+      },
+      {
+        "option": "Bundle reward + eligibility together",
+        "reason_rejected": "violates the no-bundling/attribution rule; could not tell which lever worked or regressed"
+      },
+      {
+        "option": "Grade realignment (stop the mgmt demerit sinking a 100%-shipped day) instead of teaching the behavior",
+        "reason_rejected": "user chose to improve the behavior over redefining the metric; legitimate since management is genuine free headroom here, not an unmeetable artifact"
+      }
+    ],
+    "constraints_created": [
+      "The eligibility-widening lever (scale manager/asst-mgr count with N, or add 'lead' to management_eligible_ids) is the ISOLATED next lever for the management gap. Ship it ONLY if the dense gated reward proves insufficient at large N, and ship it ALONE (never bundled with another learning change)."
+    ],
+    "related_to": [
+      "dec-024",
+      "dec-023",
+      "dec-019",
+      "con-008",
+      "con-013",
+      "pipe-001"
+    ],
+    "tags": [
+      "reward-shaping",
+      "management",
+      "convergence-audit",
+      "gated-reward",
+      "divergent-audit",
+      "win-rate-ceiling",
+      "supersedes-premise-dec-024"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-18T10:33:07.832135+00:00",
+    "verified_at": "2026-05-18T10:33:07.832135+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-028",
+    "summary": "Fixed the dead management-bonus gate: changed it from pending<=order_incomplete_threshold(=0) to pending<=10% of the day's total orders (\"shipping under control\"), and surfaced the term as rb.mgmt_gated. The prior gate (dec-027) was inert by construction and never fired. No rollback \u2014 the apparent decline was not a real regression. Commit 05278be, resumed from ep-13192 checkpoint.",
+    "problem": "After ~1700 episodes the dec-027 dense gated management bonus produced ZERO behavioral change (mgmt hours on completed days flat ~2.31h) and top-line metrics appeared to decline monotonically. Needed to find why the term did nothing and whether to roll back.",
+    "why_chosen": "Two independent minimal-context audits converged: (1) the gate `_orders_pending <= order_incomplete_threshold` with threshold=0 is only true in the last ~0.5h of a day and never on the ~27% OT days \u2014 orders arrive on a curve and pack is 2.5x slower than pick, so pending>0 the whole time management is performed. The term fired literally zero times across 438 windows (dominance min=max=mean=0). (2) The 'decline' was NOT caused by the (inert) term: it was a favorable resume-from-checkpoint transient mean-reverting to the long-run ~0.55 win baseline, plus a facility-size-mix artifact (ship_win vs N corr -0.39 vs -0.11 vs time); cmp_year (core capability) flat ~0.95, value head healthy (median v_loss 0.01-0.03). Both audits independently said do NOT roll back (inert term is harmless, decline isn't real). Fix gates on pending<=10% of total (inverse of the env's crunch threshold) so the bonus has a real multi-hour window on on-track days while staying inert during genuine crunch (still cannot trade against shipping, still capped at required hours).",
+    "what_we_tried": "dec-027's gate (pending<=0) \u2014 shipped, ran ~1700 eps, provably inert. Considered rollback to preMgmtGated.bak \u2014 rejected by both audits (term harmless, no real regression, rollback only churns).",
+    "tradeoffs": "The 10% band is a heuristic; if too generous (management cannibalizing the last 10% of shipping) tighten toward the crunch threshold. VERIFIED post-hoc (tools/probe_mgmt_gate.py, real preMgmtGateFix.bak policy, 400 days): gate open mean 7.42h/day, 7.38h actionable (eligible worker present), open 70.9% of day ticks, >=2h window on 88% of days, only 3.2% of days inert (correctly the all-crunch days). Gate is sound \u2014 wide, actionable, safety property intact. Whether the POLICY learns to use it is still the open question (needs episodes); watch rb.mgmt_gated nonzero + mgmt-hours-on-completed-days climbing off ~2.3h.",
+    "alternatives": [],
+    "constraints_created": [
+      "Any new reward component MUST be added to the rb digest whitelist (mp_runner.py) in the same change, so 'did it ever fire' is observable from logs. The dec-027 term flew blind for ~1700 episodes purely because it was not surfaced."
+    ],
+    "related_to": [
+      "dec-027",
+      "dec-024",
+      "con-005",
+      "pipe-001"
+    ],
+    "tags": [
+      "reward-shaping",
+      "management",
+      "gated-reward",
+      "bugfix",
+      "convergence-audit",
+      "observability"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-18T22:26:12.879030+00:00",
+    "verified_at": "2026-05-18T22:39:45.199491+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-029",
+    "summary": "Sanctioned and will build a MINIMAL local-only Clark inference endpoint (localhost FastAPI, 5 stateless routes, weights loaded once, thin adapter over the existing in-process inference path) as Phase 0 of the local AI warehouse system. Evolves \u2014 does not contradict \u2014 dec-020 (API scrap): dec-020's own condition ('build only when a real consumer exists') is now met by the clark-mcp/LLM layer.",
+    "problem": "A new project (local AI warehouse system: domain-fine-tuned LLM in Ollama -> clark-mcp MCP server -> Clark) needs the LLM to call Clark for inference. The pitch assumed an 'existing FastAPI port 8000' that does not exist (it was the scrapped speculative skeleton, dec-020). The MCP->Clark transport had to be defined for real before any of the new project's phases could start.",
+    "why_chosen": "dec-020 scrapped a speculative cloud skeleton (FastAPI+Celery+Redis+S3+fake auth+registry, ZERO consumers) and NOTE.md set the rule: build a serving layer only when a real consumer exists to shape it. The clark-mcp/LLM layer is now exactly that real, single, local consumer \u2014 so the rule's condition is satisfied, not violated. Chosen a strictly minimal localhost inference endpoint (5 routes: /plan, /what_if, /facilities, /facility/{id}, /health) that is a thin HTTP adapter over Clark's already-tested in-process path (StateBuilder + get_action_mask + select_action_from_dict, the 5-tuple path test_plan_path.py pins) \u2014 NOT a reimplementation and NOT the scrapped skeleton. This unblocks the plan while preserving the anti-speculative-surface discipline and the honesty narrative (an interviewer reading the evolved NOTE.md sees judgment, not resurrected fiction).",
+    "what_we_tried": "Considered in-process calls only (no HTTP) \u2014 viable and cleanest for locality, but the user wants a process boundary so the LLM/MCP and Clark are independently startable components of a 'system'; a minimal localhost API is the honest way to provide that without resurrecting any cloud surface.",
+    "tradeoffs": "Re-introduces fastapi+uvicorn (as an optional [serve] extra, zero new core-training deps). Adds a small surface that must carry an end-to-end test (per con-012). Strict scope discipline now depends on not letting this minimal endpoint accrete auth/queue/registry/cloud over time \u2014 explicitly fenced in NOTE.md.",
+    "alternatives": [],
+    "constraints_created": [
+      "The local inference endpoint is localhost-only, stateless, no auth/Celery/Redis/S3/registry-DB/training-route. Any need to go beyond localhost inference is a NEW decision with its own real consumer \u00e2\u20ac\u201d never licence to rebuild the scrapped skeleton.",
+      "Phase 0 (the endpoint, with an end-to-end test hitting the real inference path) must be built and green BEFORE clark-mcp (Phase 1) starts; clark-mcp's transport depends on it."
+    ],
+    "related_to": [
+      "dec-020",
+      "con-012",
+      "con-008"
+    ],
+    "tags": [
+      "api",
+      "scope",
+      "deployment",
+      "mcp",
+      "llm-integration",
+      "evolves-dec-020",
+      "honesty-narrative"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-18T22:50:05.792295+00:00",
+    "verified_at": "2026-05-18T22:50:05.792295+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-030",
+    "summary": "Phase 0 pre-fine-tune audit (dual independent) found clark_what_if's absent_workers was a SILENT NO-OP and /plan was RNG-noisy. Fixed: _run_one_plan_day now takes forced_absent (deterministic, uncapped) + seed (random/numpy/torch), reports absent workers as task 'absent', and the planning path NEUTRALIZES natural call-offs (only explicitly-requested absences apply). /what_if shares one stable seed across base+modified. Commits d05c9d1 (clark) + 951e39d (clark-mcp).",
+    "problem": "Before committing weeks to an LLM fine-tune driving clark-mcp, an audit was demanded. It caught a critical bug: _run_one_plan_day zipped the agent action vector against the STATIC config.workers list and never consulted is_absent/call_off_probability, so absent_workers could not change output at all and natural call-offs were misreported as real assignments. A fine-tune trained on this what_if would learn 'absences don't change the plan'. Separately, plans were RNG-noisy so /what_if base-vs-modified was not apples-to-apples.",
+    "why_chosen": "Both audits independently said FIX-FIRST, same root cause. Fix made absence authoritative by setting WorkerState.is_absent directly (bypassing the probabilistic, max-2/day-capped _roll_call_offs) and reporting absent workers as 'absent' instead of a masked-idle fake assignment. Chose to NEUTRALIZE natural call-offs in the plan/what-if path entirely: a planning tool should answer the SPECIFIED scenario (explicit absent_workers), not inject unrequested stochastic call-offs \u2014 this also removes the dominant nondeterminism so /plan is reproducible and /what_if a faithful contrast. Determinism required seeding torch (the agent samples via torch.Categorical) \u2014 seeding only random/numpy was insufficient and a determinism test caught it (verify-before-trusting on my own fix).",
+    "what_we_tried": "Audit agents disagreed on mechanism (A: capped/randomized; B: total no-op); read _run_one_plan_day directly to settle it (B correct). First fix seeded random+numpy only -> still nondeterministic (agent samples via torch) -> added torch seeding. Then env-internal call-off RNG still noisy -> chose the design-level neutralization rather than risky env-RNG refactor.",
+    "tradeoffs": "`clark plan` output changes: absent workers now show 'absent' (was a fake assignment) and natural call-offs no longer appear in the opening plan \u2014 correct for a planning tool but a behavior change for any consumer expecting stochastic call-offs in `clark plan`. Inference/serve/CLI only \u2014 training run untouched, not learning-affecting.",
+    "alternatives": [],
+    "constraints_created": [
+      "The plan/what-if inference path (_run_one_plan_day) must keep neutralizing natural call-offs and applying ONLY explicit forced_absent \u00e2\u20ac\u201d it answers the specified scenario deterministically. Do not 'restore realism' by re-enabling stochastic call-offs there; that reintroduces the irreproducibility + muddy-what_if the audit fixed.",
+      "Any reproducibility/determinism seeding for Clark inference MUST seed torch (the policy samples actions via torch.Categorical), not just random/numpy."
+    ],
+    "related_to": [
+      "dec-029",
+      "con-012"
+    ],
+    "tags": [
+      "phase-0",
+      "audit",
+      "bugfix",
+      "what-if",
+      "determinism",
+      "pre-finetune-gate",
+      "fix-first"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-19T00:08:39.122533+00:00",
+    "verified_at": "2026-05-19T00:08:39.122533+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-031",
+    "summary": "Phase 0 inference API now distinguishes plannable facilities from loadable-but-non-facility configs: /facilities filters to plannable only, and /facility, /plan, /what_if return 422 (not an unhandled 500) for non-facility configs. Also fixed the seeded-/plan reproducibility hole where the volume draw used un-seeded global RNG.",
+    "problem": "While generating the Phase 2 fine-tune dataset off the live API, standard_vocab.yaml (a task-vocabulary reference doc, not a facility \u2014 no workers, tasks is a list) was advertised by /facilities and caused an unhandled 500 on /plan, polluting the dataset's honest-failure category with \"a listed facility crashes\" instead of \"unknown facility -> honest refusal\". Diagnosing the resulting test-ordering failure also surfaced that a seeded /plan was not actually reproducible when volume was omitted.",
+    "why_chosen": "A non-facility config is a client/usage error, not a server fault, so the correct HTTP shape is 4xx not 5xx; _try_plannable (load + require workers + clean validate()) is the single authoritative plannability gate reused by /facilities, /facility, /plan, /what_if so the contract cannot drift between routes. The seed fix belongs in app.py's _plan_for (the seed-contract owner) because _sample_volume_for_date draws from the global random module and ran before _run_one_plan_day's reseed \u2014 seeding the volume draw too makes \"same seed -> same plan\" actually hold, including what-if base vs modified.",
+    "what_we_tried": "First read the determinism-test failure as pre-existing test-ordering noise (it failed on clean HEAD full-file run under pytest-randomly), but a clean-HEAD full-suite run with stable ordering was green while the changed branch failed \u2014 that disproved \"purely pre-existing\" and led to finding the real un-seeded volume-draw bug, which the prior suite simply never exercised in a polluting order.",
+    "tradeoffs": "/facilities and /facility now load+validate every candidate config per request (cheap at ~4 configs, but O(configs) work on a hot-ish path). The volume draw is now seeded twice when a seed is given (once before sampling, again inside _run_one_plan_day) \u2014 semantically fine since both are deterministic functions of the seed, but slightly redundant.",
+    "alternatives": [],
+    "constraints_created": [
+      "Phase 0 routes must return 4xx (not 5xx) for loadable-but-non-plannable configs; plannability is gated by a single shared _try_plannable helper, never per-route ad hoc checks"
+    ],
+    "related_to": [
+      "con-001",
+      "con-002"
+    ],
+    "tags": [
+      "phase0",
+      "serve",
+      "inference-api",
+      "bugfix",
+      "robustness",
+      "determinism",
+      "dataset"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-19T00:58:16.652797+00:00",
+    "verified_at": "2026-05-19T00:58:16.652797+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-032",
+    "summary": "Added curriculum stress tier to _generate_volume: stress_prob 0%/15%/25% per stage, allowing peak-summer volume up to 1.7x OT rescue ceiling. Re-pretrain from ep 15000 to ep 17500 (clark_foundation_stress.pt; pre_stress.bak preserves original) to expose policy to real overload scenarios.",
+    "problem": "Reported jack_baseline at vol=450 produces F=100% on the current foundation; policy spends ~24% of worker-ticks on side_project even though the reward signal (per_order_shipped +1053 vs per_order_incomplete -989 vs picked_backlog -557 vs side_project_during_crunch -437) correctly nets negative. Diagnosis needed: what's actually broken, since reward gradient already points the right way?",
+    "why_chosen": "Probes (tools/probe_foundation_behavior.py + tools/probe_curriculum_shape.py) invalidated three more-obvious proposed fixes one by one. Probe data showed: F-day filler reward is only +1.5 (noise, not pull), crunch cap never binds on this config (0/30 days), buffer never fills during non-OT hours (0 incidents). All three reward/env levers were non-issues. THEN the curriculum probe found the smoking gun: across 1500 sampled configs, peak vol/capacity mean=0.29 / p90=0.34. The 'Fork C' generator hard-caps every config at OT rescue ceiling so every day is winnable. Jack_baseline at vol=450 is 1.56x rescue ceiling, literally outside the entire training distribution. The model defaults to its learned moderate-pressure behavior because for every config it ever saw, that was the right answer. The stress tier teaches graceful partial-completion on real overload (ship what you can, no filler, no defeatism) WITHOUT touching reward weights or env mechanics. Stage-gated so stage 1 stays all-winnable (basics-first) while stages 2/3 see real overload. STRESS_MULT=1.7 means stress configs can reach up to 2.125x comfortable capacity. The env reward signal (dec-023 completion-dominant + dec-011 no look-busy floor + dec-012 scaled crunch penalty) already shapes the right partial-completion behavior; just needs scenarios to learn from.",
+    "what_we_tried": "Three reward/env proposals were considered and rejected via probe data before landing on curriculum: (1) Restart 1: zero per_filler_unit per dec-012's queued cleanup. Probe P1 showed filler reward on F-days is only +1.5 mean, removing it would be cosmetic. (2) Restart 2: tighten + fix the -5000 daily crunch cap per dec-026's banked finding. Probe P2 showed cap binds 0/30 days at vol=450 (worst was -525), cap fix solves nothing in practice. (3) Restart 3: extend pick_buffer_full mask to non-OT hours (force pack when carts full). Probe P3 showed 0 buffer-full ticks during non-OT in 30 days, mask change addresses non-existent failure mode. Hard action masking on soft signals (pending_pct) was also reconsidered but stayed rejected per dec-011's 'let the policy learn' philosophy.",
+    "tradeoffs": "Stress days will produce F outcomes in training - by design, model must learn graceful partial-completion. Existing test_volume_never_exceeds_ot_rescue_ceiling was generalized to allow up to STRESS_MULT \u00c3\u2014 rescue. The Fork C invariant (every day winnable) is partially relaxed: 15% of stage-2 and 25% of stage-3 configs can produce non-winnable days. Mitigation: reward design already gives meaningful gradient on incomplete days, so model has something to optimize for on stress days. Existing fine-tunes built from pre-stress foundation will need re-fine-tuning to get the new generalization (not done in this restart per con-008 one-variable-per-restart). The cap-lifting also required lifting the comfortable-fraction limb (facility_comfortable \u00c3\u2014 fraction_hi \u00c3\u2014 STRESS_MULT when stress fires); without this, low-peak-mult stress configs silently fell back to the comfortable limit and didn't actually produce overload.",
+    "alternatives": [
+      {
+        "option": "Zero per_filler_unit (dec-012's queued cleanup)",
+        "reason_rejected": "Probe P1 showed F-day filler reward is +1.5 mean, removing it changes nothing"
+      },
+      {
+        "option": "Tighten/fix -5000 crunch cap leak per dec-026 banked finding",
+        "reason_rejected": "Probe P2: cap never binds on this config (worst -525, cap -5000), so cap fix solves nothing in practice"
+      },
+      {
+        "option": "Extend pick_buffer_full mask to non-OT hours",
+        "reason_rejected": "Probe P3: 0 non-OT buffer-full ticks in 30 days. Mask change addresses non-existent failure mode"
+      },
+      {
+        "option": "Hard action mask for side_project during crunch",
+        "reason_rejected": "Explicitly rejected by dec-011 design philosophy: 'let the policy learn, don't take agency away'"
+      },
+      {
+        "option": "Train from scratch with new curriculum",
+        "reason_rejected": "Wastes 15000 episodes of foundation work; resume preserves learned competence + adds stress-day exposure as additive lesson"
+      }
+    ],
+    "constraints_created": [
+      "Synthetic configs may exceed OT rescue ceiling by up to STRESS_MULT (currently 1.7) when stress_prob fires; lifting must be applied to BOTH winter_hi_cap AND the post-clamp rc (otherwise comfortable-fraction limb binds and stress doesn't actually produce overload)"
+    ],
+    "related_to": [
+      "dec-011",
+      "dec-012",
+      "dec-013",
+      "dec-022",
+      "dec-026",
+      "con-015"
+    ],
+    "tags": [
+      "curriculum",
+      "foundation-retrain",
+      "stress-tier",
+      "synthetic-gen",
+      "reward-shaping",
+      "audit-discipline",
+      "supersedes-fork-c-invariant"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-24T21:26:20.189224+00:00",
+    "verified_at": "2026-05-24T21:26:20.189224+00:00",
+    "updated_at": "2026-05-24T21:26:20.189224+00:00"
+  },
+  {
+    "id": "dec-033",
+    "summary": "Pivot from observation-feature interventions (v2.1 dvc projection, v2.2 queue_pressure) to structural action-mask interventions (v2.4 \u00e2\u2020\u2019 v2.5 \u00e2\u2020\u2019 v2.6) after both obs attempts FAILED head-to-head A/B vs v2 baseline.",
+    "problem": "v2 baseline policy converged to a stable \"do ~50% filler on F-days\" attractor (audit: side_project_during_crunch firing at \u00e2\u02c6\u20196347/window at final pretrain state). Two consecutive warm-start fine-tune attempts with new obs features (v2.1: dvc projection + reward coupling; v2.2: simpler queue_pressure obs alone) BOTH drifted MORE filler not less, and head-to-head A/B showed v2.1 regressed on every scenario class (stress, mid, easy) with shipping completion dropping below v2 baseline. The failure pattern repeated across two completely different feature designs, demonstrating the bug was NOT in feature design but in warm-start PPO dynamics: gradient pressure from new obs/reward can't escape the entrenched attractor within reasonable episode budgets.",
+    "why_chosen": "Structural masking removes invalid actions from the policy's action space entirely (set to \u00e2\u02c6\u20191e9 logits before softmax), so the policy cannot subvert the constraint regardless of how its weights are pointed. Compared to gradient-pressure interventions: (a) takes effect from tick 1 of episode 1, no PPO updates needed; (b) cannot be over-ridden by clip-capped policy update; (c) doesn't depend on the value head learning a new reward landscape; (d) is testable in isolation with the existing test framework. The pretrain weights stay loadable since obs_feat_dim and arch are unchanged.",
+    "what_we_tried": "v2.1: demand_vs_capacity projection feature (env_feats[17]) + crunch_scale reward coupling. Result: 250-ep fine-tune showed monotone drift to MORE filler; head-to-head A/B at completion showed regression on stress AND mid AND easy days, with shipping completion dropping ~5pp vs baseline. v2.2: simpler queue_pressure feature (queue/capacity instantaneous, no projection complexity) with reward coupling REVERTED to baseline per con-008. Result: at 172 fine-tune episodes, aggregate filler had drifted from 23% to 46.5% \u2014 same drift shape as v2.1, just slower. Both runs killed mid-flight after the failure pattern became clear. v2.4 first attempt used reactive pending_pct > 0.25 gate but only fired AFTER queue accumulated \u2014 too late; revised to PROJECTION-based gate (proj_dvc > 0.85) for proactive firing.",
+    "tradeoffs": "Mask intervention requires the env to compute extra state (projected_demand_ratio, time_pressure) at every action-mask build (every 10-min tick \u00c3\u2014 ~32 workers \u00c3\u2014 n_envs in parallel runs). Measured throughput drop: 14 t/s on v2.5 vs 21 t/s on no-mask runs. Worth it for the policy-quality wins. Also: the structural mask can over-fire and produce stranded workers; the existing pick-buffer-cap stranded-worker safety net in actions.py:205 catches this (re-enable pick if mask leaves no valid action).",
+    "alternatives": [
+      {
+        "option": "Run v2.1/v2.2 obs attempts longer (3000+ episodes)",
+        "reason_rejected": "Drift pattern was monotonic over 172-250 eps \u2014 extending the run extends the regression, not corrects it. Both attempts paid the GPU cost to confirm."
+      },
+      {
+        "option": "Fresh pretrain with new obs features (no warm-start)",
+        "reason_rejected": "~11h pretrain commitment per attempt vs ~5h fine-tune; structural mask doesn't need this and works from existing v2 baseline checkpoint."
+      },
+      {
+        "option": "Increase reward coupling weight to push gradient harder",
+        "reason_rejected": "Already at (dvc-1)*3 in v2.1. Increasing further would risk policy oscillation and doesn't address the underlying issue (PPO clip \u00ce\u00b5=0.2 ceiling on per-step updates)."
+      }
+    ],
+    "constraints_created": [
+      "Action mask must use env.episode.total_orders directly for stress detection \u00e2\u20ac\u201d mask is env-side code, not an observation the policy network sees, so the 'no oracle leak' rule (con-014) does not apply",
+      "v2.x mask iterations must keep env_feat_dim=17 and ARCH_VERSION='clark-v2' so v2 baseline checkpoint loads natively without transplant surgery"
+    ],
+    "related_to": [
+      "dec-032",
+      "con-008",
+      "con-016"
+    ],
+    "tags": [
+      "action-mask",
+      "filler-vs-orders",
+      "structural-intervention",
+      "warm-start-fine-tune",
+      "post-mortem-v2.1-v2.2"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-05-25T17:33:03.220233+00:00",
+    "verified_at": "2026-05-25T17:33:03.220233+00:00",
+    "updated_at": "2026-08-01T11:54:51.271351+00:00"
+  },
+  {
+    "id": "dec-034-cf89",
+    "summary": "Test-suite optional deps (fastapi, uvicorn, httpx, ortools) are hard requirements of the `dev` extra, and pytest.importorskip guards are banned for them. `dev` self-references `clark[serve,optimizer]`; a new `optimizer` extra declares ortools.",
+    "problem": "The CI workflow installed only `dev = [\"pytest\", \"httpx\"]`, while four test modules (test_serve_api, test_per_facility_agent, test_compare_and_calendar, test_optimizer) opened with pytest.importorskip on fastapi/httpx/ortools. In a clean CI environment every guard resolved to \"skip\", so the entire serve/API layer and the CP-SAT optimizer were never executed. The run reported 503 passed / 6 skipped and read as green while ~27 tests silently did not run. Locally it looked fine only because the ambient interpreter happened to have the packages installed.",
+    "why_chosen": "Installing the deps alone would fix today's gap but leave the skip mechanism armed for the next dependency someone adds, so both halves were needed. importorskip is the correct tool for a dependency that is genuinely optional to the thing under test; it is the wrong tool for a dependency the test requires, because in a CI summary a skip is indistinguishable from a pass. Making `dev` self-reference `clark[serve,optimizer]` (verified: setuptools emits `Requires-Dist: clark[optimizer,serve]; extra == \"dev\"` and pip resolves it transitively on an editable install) keeps one source of truth, so any dep added to serve/optimizer is automatically armed in CI rather than needing a second manual edit to `dev`.",
+    "what_we_tried": "Confirmed the gap empirically: the ambient dev environment (which has fastapi + ortools) runs 530 passed / 4 skipped, while the previous clean CI-mirror venv installing only the old `dev` extra ran 503 passed / 6 skipped \u2014 a 27-test delta that CI reported as success.",
+    "tradeoffs": "CI now installs ortools (~100MB) and fastapi/uvicorn on every run, so the job is slower and the image larger. Accepted: the alternative is a green CI that does not execute the serve layer or the optimizer. Also, a developer who installs only the core deps can no longer run a partial suite \u2014 but they could not run pytest at all without the `dev` extra anyway.",
+    "alternatives": [
+      {
+        "option": "Keep importorskip but set a CLARK_REQUIRE_ALL_DEPS=1 env var in CI to convert skips into failures",
+        "reason_rejected": "Adds a second configuration surface that can itself silently drift (unset var = silent skips again), and preserves the guard pattern the incident was caused by."
+      },
+      {
+        "option": "Flatten the deps: list fastapi/uvicorn/ortools explicitly inside `dev` instead of self-referencing the extras",
+        "reason_rejected": "Zero-risk but duplicates the dependency list; a future dep added to `serve` would not reach CI without a second edit. The self-reference was verified to resolve, so DRY won."
+      },
+      {
+        "option": "Leave ortools out of `dev` because it is a heavy (~100MB) install and only run it locally",
+        "reason_rejected": "That is precisely the silent-skip pattern being removed; the CP-SAT bound is a documented, advertised result and must be exercised."
+      }
+    ],
+    "constraints_created": [
+      "Do not use pytest.importorskip for fastapi, uvicorn, httpx, or ortools in the Clark test suite \u2014 they are hard test dependencies supplied by the `dev` extra and a missing one must fail loudly.",
+      "Any new optional dependency the test suite exercises must be added to an extra that `dev` pulls in, so CI installs it."
+    ],
+    "related_to": [],
+    "tags": [
+      "ci",
+      "testing",
+      "packaging",
+      "dependencies",
+      "silent-skip"
+    ],
+    "retrieval_hints": [
+      "why did CI skip the serve API tests",
+      "importorskip fastapi ortools clark",
+      "dev extra self-reference clark[serve,optimizer]",
+      "ortools optimizer extra pyproject"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-24T21:00:31.485584+00:00",
+    "updated_at": "2026-07-24T21:00:31.485584+00:00",
+    "verified_at": "2026-07-24T21:00:31.485584+00:00"
+  }
+]

@@ -1,0 +1,90 @@
+[
+  {
+    "id": "con-001-ff21",
+    "rule": "Derive a backup file's age from its timestamped filename, never from st_mtime. Any backup written with shutil.copy2 (or any metadata-preserving copy) inherits the SOURCE file's mtime, so st_mtime answers \"when was the original last edited\", not \"when was this backup taken\". A test that sets the mtime itself (os.utime) cannot detect the difference and will pass under either implementation.",
+    "reason": "prune_backups() in install/xylem_install.py aged backups by st_mtime while write_with_backup() created them with shutil.copy2, which preserves the source mtime onto the copy. This broke in both directions: a config untouched for a year yielded a brand-new backup that looked a year old and was deleted on the next --apply (destroying the only rollback), while a config edited daily yielded backups that never aged out. The second direction is the security-relevant one, because these backups carry live connector tokens and pruning them is the whole reason the function exists.",
+    "triggering_incident": "Flagged as a latent, deliberately-unfixed bug in PR #41 (audit sweep). installer.py already did this correctly by reading the epoch from the filename; install/xylem_install.py had diverged. Fixed in 38537e3. The pre-existing test called os.utime(b, (0,0)) to force an old mtime, so it passed against the buggy code -- the two new tests pin both directions and fail against it. That fixture also used day 00, which strptime rejects.",
+    "scope": "install/xylem_install.py",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "backups",
+      "security",
+      "tokens",
+      "testing",
+      "filesystem"
+    ],
+    "retrieval_hints": [
+      "prune_backups deletes the wrong backups",
+      "copy2 preserves mtime so backup age is wrong",
+      "why did my backup get pruned immediately",
+      "test passes because it sets mtime itself"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-25T13:18:10.913576+00:00",
+    "updated_at": "2026-07-25T13:18:10.913576+00:00",
+    "verified_at": "2026-07-25T13:18:10.913576+00:00"
+  },
+  {
+    "id": "con-002-360e",
+    "rule": "A hook script must never fall back to os.getcwd() to decide which project it is acting on. Take the project from the hook payload's cwd, and if the payload has no cwd, do nothing. A hook process inherits whatever directory it was launched from, which is very often A git repo - just not the session's - so a \"is this a git root?\" guard cannot catch the mistake; it resolves happily, into the wrong project.",
+    "reason": "plugin/scripts/distill.py resolved the session project as _payload().get(\"cwd\") or os.getcwd(), which silently captured session knowledge into whichever repo the hook process happened to start in. The file's own header documents this exact failure as the reason the previous implementation was replaced (\"swallowed a failed cd, so a bad resolve silently distilled the WRONG project rather than distilling nothing\"), so the fallback reintroduced the bug the rewrite existed to fix. Verified rather than theorised: against the old code a test distils into \"some-other-repo\" purely because that was the process cwd.",
+    "triggering_incident": "Found while reviewing the hooks.json `A || B` interpreter fallback chain (dec-013). The chain is justified by \"both hook scripts exit 0 on every path\", but that is a property of the scripts' code, whereas the fallback fires on the PROCESS's exit status - which a script does not control when something else kills it. SessionEnd has a hard timeout; if the first leg is killed, the second runs against a stdin the first already drained, arriving with an empty payload. With the os.getcwd() fallback that second run distilled the wrong project. Fixed in 43c7974 on fix/audit-sweep. artifacts/session_end_hook.py was already correct and pinned by tests/test_hooks.py; only the plugin path had drifted.",
+    "scope": "plugin/scripts/distill.py",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "hooks",
+      "distill",
+      "cambium",
+      "session-end",
+      "plugin",
+      "drift"
+    ],
+    "retrieval_hints": [
+      "distill captured into the wrong project",
+      "hook used os.getcwd instead of payload cwd",
+      "A || B chain second run empty stdin",
+      "SessionEnd timeout kills the first interpreter"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-25T13:48:16.486971+00:00",
+    "updated_at": "2026-07-25T13:48:16.486971+00:00",
+    "verified_at": "2026-07-25T13:48:16.486971+00:00"
+  },
+  {
+    "id": "con-003-b795",
+    "rule": "Every repo with a test suite gets a CI workflow that runs it on BOTH ubuntu-latest and windows-latest, from a CLEAN install of the declared dependencies. A suite that has only ever run on one developer machine has not been verified, it has been observed once. Three specific traps, all hit on the first day this was rolled out: (1) the push branch filter must name the repo's ACTUAL default branch - a workflow filtered on [main] in a repo whose default is master queues no run at all, and a CI config that matches no branch is indistinguishable from a CI config that passes; (2) do not add `cache: pip` to a stdlib-only repo - setup-python builds the cache key by hashing requirements.txt or pyproject.toml and treats having neither as a hard job failure; (3) a workflow only guards the default branch once it is merged ONTO that branch - a green run from a pull_request trigger on a feature branch is not coverage of main.",
+    "reason": "A cross-repo audit found that of 24 local suites, every genuinely broken one was broken in a way only a second platform or a clean checkout would reveal, and adding CI to the four uncovered repos immediately surfaced four more defects that had existed for months. shibboleth and waveform MCP could not be collected at all from a fresh clone (src layout, no pythonpath). shibboleth's import fix then exposed a Windows-only correctness bug: panphon reads its UTF-8 IPA tables through a Traversable.open() with no encoding, so under cp1252 it failed to load and phone_distance silently degraded to plain edit distance. waveform MCP had numpy imported at module level by five package files and declared nowhere, so `pip install waveform-mcp` produced an installation that raises ImportError in normal use - a published registry server. waveform MCP's drum kit loader returned None on both success and failure, so an unloadable kit produced ok=True, no warnings, and a silently mute drum track; its presets path is Windows-only by construction, so that was the guaranteed outcome on macOS and Linux. git-onboard's fixtures passed rmtree(onexc=), added in 3.12, so every teardown died on 3.10. In every case the tests existed and passed for their author; what was missing was a second machine and a clean environment.",
+    "triggering_incident": "2026-07-25 cross-repo test audit and CI rollout. 24 repos with suites: 18 green, 6 broken, all fixed. Four authored repos had substantial suites and zero CI (shibboleth 38 tests, waveform MCP 257, repo-scope 111, git-onboard 20); workflows added in shibboleth 36a560c, waveform 19b1e10, repo-scope ae81579, git-onboard 6d4d408. Every one of those four workflows was wrong on its first attempt: cache:pip with no dependency file (fixed 2e47e0c / b4afd4a), a [main] filter on a master-default repo that queued nothing (fixed bb665bb), and two real product bugs the runs then caught (numpy declared in 675111e, drum kit warning in 38b7e0e). repo-scope's workflow still lives on fix/audit-sweep behind open PR #1, so it guards that PR and not main.",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "ci",
+      "testing",
+      "cross-platform",
+      "windows",
+      "encoding",
+      "github-actions"
+    ],
+    "retrieval_hints": [
+      "repo has tests but no CI",
+      "tests only ever ran on my machine",
+      "setup-python cache pip fails no requirements.txt",
+      "windows-only test failure encoding cp1252",
+      "workflow added but no run was queued",
+      "undeclared dependency only worked because dev machine had it"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-25T16:12:15.791966+00:00",
+    "updated_at": "2026-07-25T16:22:04.192758+00:00",
+    "verified_at": "2026-07-25T16:22:04.192758+00:00"
+  }
+]

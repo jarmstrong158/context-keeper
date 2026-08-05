@@ -49,76 +49,111 @@ and still slip through — a lexical signal cannot separate them; the opt-in
 semantic blend is what helps there, and even dense retrieval struggles on
 this (a known-hard problem across the field).
 
-## Retrieval quality
+## Retrieval quality (v2: `run_retrieval_eval.py`, 2026-08-05)
 
-Measures the one thing the test suite doesn't: **given a natural-language query a
-future session would actually ask, does `get_context` surface the entry that
-answers it?** Built on [llm-evals](../../llm-evals) as the engine.
+Self-contained successor to the retired harness below. No sibling repo, no
+network in the lexical arm, and it runs against **copies** of every store —
+`get_context` is not read-only twice over (it records usage telemetry on every
+call, and the semantic arm caches embeddings next to the entries it embeds), so
+a naive loop would mutate every store it measured.
 
-## Run
+By default it reads the **frozen corpus** in `evals/fixtures/corpus` (173
+entries, 7 public stores). Pointed at live stores the number measures the ranker
+*and* whatever anyone recorded since: the first pin broke within a day when
+three new entries moved lexical recall@5 by 0.076 with no code change. Freezing
+also means the regression test runs in CI instead of skipping for want of
+sibling repos.
 
 ```bash
-cd context-keeper/evals
-python run_eval.py                         # combined dataset, all splits, lexical
-python run_eval.py --semantic              # blend nomic-embed cosine into ranking
-python run_eval.py --split dev --semantic --sem-weight 150   # tune on dev
-python run_eval.py --split test --set-baseline               # held-out baseline
-python run_eval.py --include-related       # ablation: let related_to traversal help
+python evals/run_retrieval_eval.py                 # lexical + embedding, frozen corpus
+python evals/run_retrieval_eval.py --arm lexical   # no network at all
+python evals/run_retrieval_eval.py --all-arms      # adds embedding-heavy (w=400)
+python evals/run_retrieval_eval.py --live          # real stores: current, not comparable
+python evals/build_corpus_fixture.py               # deliberately refresh the corpus
 ```
 
-The combined dataset spans three stores (Clark, Conductor, context-keeper); each
-case carries its own `store` and a `dev`/`test` `split`. Tune weights on `dev`,
-report on the held-out `test` split.
+**Golden set:** `retrieval_golden.json` — 59 cases across 9 stores (44 positive,
+9 negative, 6 history). Every question is written from the **problem the entry
+solves** — the symptom you'd be staring at before you knew the entry existed —
+never by paraphrasing its summary. That rule is the whole point: a query derived
+from the summary shares surface tokens with its target, so lexical scoring hits
+it for free and recall comes out inflated.
 
-Requires the `llm-evals` repo checked out as a sibling of `context-keeper`.
-No Ollama / network needed — pure lexical-vs-gold measurement.
+Cases may only be drawn from stores whose project repo is **public** — a case
+quotes the entry it targets, and this repo is public (`con-015-12da`).
 
-## Metrics
+**Results (2026-08-05, 59 cases, `include_related=False`):**
 
-- **hit@k** = `RunResult.pass_rate` — was a gold entry in the top-k returned?
-- **MRR** = `RunResult.avg_score` — mean reciprocal rank of the first gold hit.
+| arm | recall@1 | recall@3 | recall@5 | hit@5 | MRR | FPR |
+|---|---|---|---|---|---|---|
+| lexical | 0.220 | 0.370 | 0.483 | 0.560 | 0.383 | 0.667 |
+| embedding (w=150) | **0.390** | **0.554** | **0.691** | **0.760** | **0.565** | 0.667 |
 
-Mapping retrieval metrics onto `passed`/`score` means the llm-evals
-baseline/regression tooling (`runs/baseline_clark_retrieval.json`) works
-unchanged: every retriever change is now measured against the baseline.
+`recall@k` is strict — `|gold ∩ top-k| / |gold|`, so a case with 5 gold entries
+cannot exceed 0.2 at k=1. `hit@5` (any gold in top 5) is carried for
+comparability with the 2026-06-17 numbers below.
 
-## Files
+**The embedding path earns its complexity.** +21 points recall@5 and +18 points
+MRR over lexical, on a set specifically built to deny lexical its free tokens.
+The margin is wider here than in the 2026-06-17 measurement precisely because
+that older set was partly paraphrase-derived.
 
-- `datasets/clark_retrieval.json` — labeled `(query -> gold entry ids)` cases
-  drawn from Clark's real decision log. Several are deliberate
-  *vocabulary-mismatch* traps (the query and the entry share no keywords).
-- `retrieval_eval.py` — `ContextKeeperRetriever` (executor) + `RetrievalScorer`.
-- `run_eval.py` — runner, report, baseline compare.
+Per-project, the gap is entirely in the two big, prose-heavy stores: Clark
+0.333 → 0.744 and context-keeper 0.398 → 0.741 recall@5. Small stores
+(agentsync, meristem) are already at 1.000 lexically and embeddings add nothing
+— which is the honest shape of the result. The blend earns its keep as a store
+grows, not from the first entry.
 
-## Results (2026-06-17)
+Three findings the number surfaced:
 
-**Lexical baseline:** `hit@5 = 70%, MRR = 0.477`. All six misses are
-vocabulary-mismatch cases (query phrased differently than the entry). Arc
-traversal (`--include-related`) recovers none of them.
+1. **History is unreachable: recall@5 = 0.000 in *both* arms.** All six history
+   cases ask explicitly for a prior state ("what was the original sync design
+   before the newest-wins merge") and no superseded entry is returned in the top
+   5 — usually not in the returned set at all. `score_entry` demotes superseded
+   by 15 points *and* those entries are old, so recency compounds the demotion.
+   Supersession is now first-class at write time and read time (`dec-022-730e`),
+   and retrieval still cannot find the predecessor when you ask for it directly.
+2. **Abstention misses in-domain negatives: 6 of 9** plausible-but-unanswerable
+   questions come back with no `no_confident_match` flag, identically in both arms. Consistent
+   with `abstention.py`'s TNR of 38% at the 0.20 floor — the honest limit noted
+   there (hard negatives sharing real topic vocabulary) is what these are.
+3. **The embedding arm can fail silently.** `query_cosines` returns `None` on any
+   error and the caller drops to lexical, so a cold Ollama made the arm report
+   the *lexical* number under a different name. The harness now probes with
+   retries and refuses to run an arm it cannot prove is live.
 
-**Semantic blend** (`--semantic`, nomic-embed cosine added to `score_entry`):
+`tests/test_retrieval_eval.py` pins the lexical arm's positive-case recall@5 so a
+ranking change cannot quietly regress it, and pins the history gap at zero so a
+fix to it cannot land unnoticed either. **That test owns those thresholds and
+this README deliberately does not repeat them** (`con-009-6bdc`) — the table
+above is a dated measurement, not the enforced value. Lexical is bit-for-bit
+deterministic run to run; the test asserts that too.
+
+## Retrieval quality (v1, retired)
+
+The first retrieval harness (`retrieval_eval.py` + `run_eval.py`, built on the
+sibling `llm-evals` repo) was **removed** on 2026-08-05. It could not run in CI
+or in a fresh clone -- it needed `../llm-evals` checked out beside this repo --
+and its dataset was partly paraphrase-derived, which is the contamination the v2
+set was built to control for. Two harnesses answering the same question, only
+one of them runnable, is worse than one.
+
+Its results are kept here because they are what justified shipping the opt-in
+semantic blend:
+
+**Lexical baseline (2026-06-17):** `hit@5 = 70%, MRR = 0.477` on 20 Clark cases.
+All six misses were vocabulary-mismatch; arc traversal recovered none of them.
 
 | sem_weight | hit@5 | MRR |
 |---|---|---|
 | 0 (lexical) | 70% | 0.477 |
-| 50 | 80% | 0.650 |
 | 100 | 85% | 0.696 |
 | 150 | 85% | **0.752** |
 | 400 | **90%** | 0.704 |
 
-MRR peaks near weight ~150; very high weight buys raw coverage at the cost of
-demoting exact-match hits (the MRR dip). Recommended integration default:
-~100–150, opt-in, lexical fallback when the embedder is unavailable.
+**Held-out (31 cases / 3 stores, weight tuned on `dev`, reported on `test`):**
+lexical `hit@5 = 80.0%, MRR = 0.633`; semantic w=150 `hit@5 = 93.3%, MRR = 0.880`.
+MRR peaked near weight ~150, which is the shipped default.
 
-**Held-out result** (`combined_retrieval.json`, 31 cases / 3 stores, weight tuned
-on `dev` only, reported on the `test` split it never saw):
-
-| test split | hit@5 | MRR |
-|---|---|---|
-| lexical baseline | 80.0% | 0.633 |
-| semantic w=150 (tuned on dev) | **93.3%** | **0.880** |
-
-The gain generalizes across stores (Clark RL, Conductor process-locking,
-context-keeper meta), not just Clark's vocabulary, and is robust to weight
-(w=150 vs w=300 differ by <0.01 MRR on test). This justified shipping the
-opt-in semantic blend in `server.py` (`semantic.enabled` in config).
+The v2 numbers above are lower for both arms because the questions are harder by
+construction, not because retrieval got worse.

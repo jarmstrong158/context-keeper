@@ -49,6 +49,10 @@ __version__ = "0.18.0"
 # without paying for this module's imports (~73ms, mostly mirror -> urllib).
 # Re-exported here because every existing caller and test refers to them
 # through server. One implementation, two import costs.
+# The scope rule, shared with hooks/scope_guard.py, work_focus and the
+# .claude/rules projection. One implementation, so con-011-76f8's "every surface
+# must agree" is enforced by construction rather than by prose.
+import scope_rules  # noqa: E402
 import store_paths  # noqa: E402
 from store_paths import (  # noqa: E402
     CONTEXT_DIR_NAME,
@@ -214,6 +218,24 @@ DEFAULT_CONFIG = {
     # escalates on scope, not on an actual violation (nothing reads the diff).
     "scope_guard": {"confirm_absolute": False},
 }
+
+# Tunables NOT listed above are module constants, deliberately: a store cannot
+# override them. Naming them here is the point -- an audit found seven scattered
+# across three thousand lines with no way to tell which were configurable, so
+# "can I change this per project?" had no answer short of reading the call site.
+#
+#   ranking.py        _SEM_REL_LO / _SEM_REL_HI   cosine calibration band;
+#                                                 per-store override exists as
+#                                                 semantic.relevance_floor /
+#                                                 relevance_ceiling
+#   server.py         DEFAULT_SIMILAR_THRESHOLD   overridable: similar_threshold
+#                     DEFAULT_SUPERSESSION_THRESHOLD
+#                                                 overridable: supersession_threshold
+#                     _ADVISORY_SUMMARY_CHARS     fixed: presentation width
+#                     _PREDECESSOR_TEXT_CHARS     fixed: presentation width
+#                     MAX_DROPPED_IDS_LISTED      fixed: id-trail cap
+#                     CACHE_TTL_MS                fixed: protocol cache hint
+#   handle_get_project_summary.CLUSTER_THRESHOLD  fixed: when to cluster by topic
 
 USAGE_GUIDANCE = (
     "Context Keeper maintains project memory across conversations. "
@@ -799,271 +821,28 @@ def _entry_timestamp(entry):
 # ============================================================
 
 
-def estimate_tokens(text):
-    return max(1, len(text) // 4)
+# ============================================================
+# Relevance ranking lives in ranking.py -- pure functions over entry dicts,
+# no I/O, so it is testable without a store. Re-exported here because every
+# existing caller and test reaches for these through `server` (the same
+# arrangement store_paths has). One implementation, two import paths.
+# ============================================================
+
+from ranking import (  # noqa: E402
+    _SEM_REL_HI,
+    _SEM_REL_LO,
+    _STOPWORDS,
+    _jaccard,
+    _mmr_reorder,
+    _relevance_signal,
+    _semantic_relevance,
+    _text_words,
+    _truncate_entry,
+    estimate_tokens,
+    score_entry,
+)
 
 
-def _text_words(entry):
-    """Extract searchable words from an entry's text fields.
-
-    Pulls from both v0.4 structured fields (problem, why_chosen,
-    what_we_tried, tradeoffs, purpose, when_to_invoke,
-    triggering_incident) and the legacy `rationale` field so old
-    entries remain searchable.
-    """
-    parts = []
-    text_keys = (
-        "summary", "rationale", "rule", "reason", "name",
-        "problem", "why_chosen", "what_we_tried", "tradeoffs",
-        "purpose", "when_to_invoke", "triggering_incident",
-    )
-    for key in text_keys:
-        val = entry.get(key, "")
-        if val:
-            parts.append(val.lower())
-    for tag in entry.get("tags", []):
-        parts.append(tag.lower())
-    # Anticipated-query hints: alternate phrasings supplied at record time,
-    # indexed so vocabulary-mismatch queries hit without embeddings.
-    for hint in entry.get("retrieval_hints", []) or []:
-        parts.append(str(hint).lower())
-    # Include step actions for pipelines
-    for step in entry.get("steps", []):
-        action = step.get("action", "")
-        if action:
-            parts.append(action.lower())
-    return set(" ".join(parts).split())
-
-
-def score_entry(entry, query_tags=None, query_text=None, scope=None, now_dt=None):
-    score = 0.0
-    entry_tags = set(t.lower() for t in entry.get("tags", []))
-    entry_words = _text_words(entry)
-
-    # Tag matching (0-40)
-    if query_tags:
-        q_tags = set(t.lower() for t in query_tags)
-        overlap = len(entry_tags & q_tags)
-        score += 40 * (overlap / max(len(q_tags), 1))
-
-    # Free-text word matching against tags + text fields (0-40)
-    if query_text:
-        q_words = set(query_text.lower().split())
-        overlap = len(q_words & entry_words)
-        score += 40 * (overlap / max(len(q_words), 1))
-
-    # If neither tags nor text query, give base score so all entries are considered
-    if not query_tags and not query_text:
-        score += 20
-
-    # Scope matching (0-20)
-    entry_scope = entry.get("scope", "global")
-    if scope:
-        if entry_scope != "global" and scope.lower() in entry_scope.lower():
-            score += 20
-        elif entry_scope == "global":
-            score += 10
-        else:
-            score += 5
-    elif entry_scope == "global":
-        score += 10
-    else:
-        score += 5
-
-    # Recency (0-20)
-    verified = entry.get("verified_at") or entry.get("updated_at") or entry.get("created_at")
-    if verified and now_dt:
-        try:
-            v_dt = datetime.fromisoformat(verified.replace("Z", "+00:00"))
-            days_ago = (now_dt - v_dt).days
-            # Clamp to [0, 1]: a future timestamp (clock skew, manual edit)
-            # must not push recency past its 20-point cap.
-            recency = max(0.0, min(1.0, 1 - (days_ago / 90)))
-            score += 20 * recency
-        except Exception:
-            score += 10  # can't parse, give middle score
-
-    # Status (0-20)
-    status = entry.get("status", "active")
-    if status == "active":
-        score += 20
-    elif status == "superseded":
-        score += 5
-
-    # Origin trust (0-10): user-stated entries outrank agent-inferred,
-    # which outrank imported/backfilled. Entries without an origin
-    # (pre-v0.7) score as agent — a uniform shift that preserves their
-    # relative order.
-    origin = entry.get("origin", "agent")
-    score += {"user": 10, "agent": 5, "import": 2}.get(origin, 5)
-
-    return score
-
-
-# Common English + query-filler words that carry no retrieval signal. Small
-# and dependency-free. Used ONLY for the abstention relevance signal below,
-# never for the main ranking (which stays backward-compatible).
-_STOPWORDS = frozenset("""
-a an the this that these those of in on at to for from by with about into over
-and or but if is are was were be been being do does did doing done have has had
-how what why when where which who whom whose it its we our us you your they them
-their i my me can could should would will shall may might must not no nor as so
-than then there here out up down off again once only just also very more most
-""".split())
-
-
-# Cosine calibration for the abstention signal. These map a RAW embedding
-# cosine onto the same 0-1 scale the lexical signal already lives on, and
-# they are model-specific — do not treat them as universal.
-#
-# Why any mapping at all: a cosine from nomic-embed-text is not a
-# probability and shares no scale with lexical overlap. Measured on this
-# repo's eval set (evals/, 31 answerable + 16 no-answer queries across three
-# real stores), nomic's cosines are compressed into a high, narrow band:
-#
-#     answerable queries   top cosine  min 0.636  median 0.719  max 0.815
-#     NO-ANSWER queries    top cosine  min 0.515  median 0.603  max 0.718
-#
-# The bands overlap heavily, and the no-answer FLOOR is 0.515 — far above
-# the 0.20 abstention floor. So the obvious implementation,
-# max(lexical, cosine), puts every query on earth above the floor and
-# silently disables abstention completely: measured TNR falls 19% -> 0%.
-# ("what is the capital of France" scores ~0.49 against this store.)
-#
-# _SEM_REL_LO is therefore set just above the highest cosine any no-answer
-# query reached (0.718), so the semantic term contributes exactly nothing
-# until a match is stronger than anything a no-answer query produced, and
-# lexical alone decides. Above that it ramps linearly to _SEM_REL_HI (near
-# the observed answerable maximum), where it saturates at 1.0.
-#
-# Overridable per project via config semantic.relevance_floor /
-# .relevance_ceiling, because a different embedding model has a different
-# cosine distribution and these numbers would be wrong for it.
-_SEM_REL_LO = 0.72
-_SEM_REL_HI = 0.85
-
-
-def _semantic_relevance(cosine, lo=_SEM_REL_LO, hi=_SEM_REL_HI):
-    """Map a raw embedding cosine onto the lexical signal's 0-1 scale.
-
-    Deliberately returns 0.0 for anything at or below `lo` rather than a
-    small positive number: below the calibration floor the cosine carries
-    no evidence that this entry answers the query, and letting it leak a
-    fraction of a point is what would erode the abstention floor.
-    """
-    if cosine is None or hi <= lo:
-        return 0.0
-    if cosine <= lo:
-        return 0.0
-    return min(1.0, (cosine - lo) / (hi - lo))
-
-
-def _relevance_signal(entry, query_tags, query_text, cosine=None,
-                      sem_lo=_SEM_REL_LO, sem_hi=_SEM_REL_HI):
-    """0-1 estimate of how well this entry matches the QUERY specifically —
-    tag/text overlap, plus the calibrated semantic cosine when one is given.
-
-    This is the signal the abstention floor keys on. The composite
-    score_entry value is inflated by non-relevance terms (an active,
-    recent, global entry banks ~55 points with zero query overlap), so a
-    totally irrelevant entry can masquerade as a confident hit. This
-    isolates the part that actually reflects "does this answer the query."
-
-    `cosine` is the entry's embedding cosine when the opt-in semantic blend
-    is active, and None otherwise. It matters because get_context already
-    blends cosine into the RANKING: without it here, an entry retrieved
-    purely on semantic similarity — the vocabulary-mismatch rescue the
-    blend exists for — was ranked first and then flagged
-    `no_confident_match` for having no lexical overlap, which is precisely
-    backwards. The cosine is run through _semantic_relevance first; see the
-    calibration note there for why the raw value must never be used
-    directly.
-
-    Returns None when no query is given — a bare summary/tag-less request
-    is never an abstention case. Stopwords are dropped so filler like
-    "what/the/we/about" doesn't manufacture overlap on no-answer queries.
-    """
-    sigs = []
-    if query_tags:
-        q = set(t.lower() for t in query_tags)
-        if q:
-            et = set(t.lower() for t in entry.get("tags", []))
-            sigs.append(len(q & et) / len(q))
-    if query_text:
-        qw = {w for w in query_text.lower().split() if w and w not in _STOPWORDS}
-        if qw:
-            ew = _text_words(entry)
-            sigs.append(len(qw & ew) / len(qw))
-    if not sigs:
-        # No lexical basis at all (no query text and no tags) -- a bare
-        # request, not an abstention case, even if a cosine exists.
-        return None
-    if cosine is not None:
-        sigs.append(_semantic_relevance(cosine, sem_lo, sem_hi))
-    return max(sigs)
-
-
-def _jaccard(a, b):
-    """Word-set Jaccard similarity of two entries' text (zero-dependency)."""
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
-
-
-def _mmr_reorder(scored, lam=0.7):
-    """Greedily reorder (score, type, entry) tuples for Maximal Marginal Relevance.
-
-    Penalizes a candidate by its peak lexical similarity to already-selected
-    entries, so near-duplicate restatements of one topic don't crowd the budget
-    and a second relevant topic gets a seat. Entries linked by `related_to` are
-    exempt from the penalty — those are intentional arcs meant to surface
-    together, not redundancy. lam=1.0 reduces to pure relevance order.
-    """
-    if len(scored) < 2:
-        return scored
-    max_score = max((s for s, _t, _e in scored), default=0.0) or 1.0
-    items = []
-    for s, t, e in scored:
-        items.append({
-            "orig": s, "norm": s / max_score, "type": t, "entry": e,
-            "words": _text_words(e), "id": e.get("id"),
-            "related": set(e.get("related_to") or []),
-        })
-    selected, ordered = [], []
-    while items:
-        best_i, best_val = 0, None
-        for i, d in enumerate(items):
-            sim = 0.0
-            for s in selected:
-                if d["id"] in s["related"] or s["id"] in d["related"]:
-                    continue  # arc-linked: no diversity penalty
-                sim = max(sim, _jaccard(d["words"], s["words"]))
-            val = lam * d["norm"] - (1 - lam) * sim
-            if best_val is None or val > best_val:
-                best_val, best_i = val, i
-        chosen = items.pop(best_i)
-        selected.append(chosen)
-        ordered.append((chosen["orig"], chosen["type"], chosen["entry"]))
-    return ordered
-
-
-def _truncate_entry(entry, max_tokens):
-    """Truncate an entry to fit within max_tokens. Returns a copy."""
-    text = json.dumps(entry, indent=2)
-    if estimate_tokens(text) <= max_tokens:
-        return entry
-    # Build truncated version with key fields only
-    truncated = {"id": entry.get("id", "?")}
-    for key in ("summary", "name", "rule"):
-        if key in entry:
-            truncated[key] = entry[key]
-            break
-    truncated["tags"] = entry.get("tags", [])
-    truncated["status"] = entry.get("status", "active")
-    truncated["_truncated"] = "Use get_context with this id for full entry"
-    return truncated
 
 
 # ============================================================
@@ -1173,6 +952,20 @@ _FIELD_GUIDANCE = {
     "purpose": "Explain why this pipeline exists. What does it accomplish that ad-hoc steps couldn't?",
     "rule": "State the rule in clear imperative language ('Always X', 'Never Y').",
     "name": "A short pipeline name.",
+    # Not a min-length field: this is the lazy-loaded home for the write-time
+    # supersession advisory's wording, per con-004 (schema descriptions are a
+    # per-session token tax on every connected client; a rejection message or
+    # an advisory only costs tokens when it actually fires).
+    "supersedes": (
+        "Only you can tell whether this entry REPLACES the one(s) named above or "
+        "stands beside them. If it replaces one: record it again with "
+        "supersedes=[<id>] (decisions), or deprecate_entry the old one with "
+        "superseded_by pointing here. If it does not, link them with related_to "
+        "and move on. Nothing was linked or changed for you -- an auto-link fired "
+        "from a tag/scope heuristic would rewrite history on a guess. Leaving a "
+        "real replacement unlinked is how a store ends up able to say what is "
+        "true now but not what changed, or why."
+    ),
 }
 
 
@@ -1368,6 +1161,246 @@ def _attach_similar(result, entry, base_dir):
 
 
 # ============================================================
+# Supersession advisory (write time)
+#
+# Reversals were landing as in-place EDITS, so the store could answer what is
+# true now but not what changed or why: its own dogfood store held 36 active
+# entries, 0 deprecated and 0 supersedes links while two of those entries
+# carried their history inline instead ("replacing the old additive-only
+# sync"; "(was additive-only)"). deprecate_entry has supported superseded_by
+# the whole time. Nobody used it, because nothing ASKED at the one moment the
+# answer was known -- while the replacement was being written.
+#
+# So this asks, and only asks. It never links, never blocks the write, and
+# never touches the older entry. An auto-link fired from a tag/scope heuristic
+# would rewrite history on a guess, which is a worse failure than the missing
+# link it set out to fix: a wrong supersedes edge silently demotes a rule that
+# is still in force.
+#
+# The signal is deliberately NOT the text overlap _find_similar_entries
+# already computes. Restatement and supersession look different in the text:
+# a replacement often shares little wording with what it replaces ("the merge
+# is additive-only" vs "the merge is timestamp-based newest-wins") while
+# addressing exactly the same subject. What survives a rewrite is the SUBJECT
+# -- the tags and the scope -- so that is what gets scored.
+# ============================================================
+
+# Mean of the available subject signals at or above this flags a candidate.
+# Overridable per store via config "supersession_threshold".
+DEFAULT_SUPERSESSION_THRESHOLD = 0.50
+
+# How many candidates an advisory names, and how much of a summary it quotes.
+_MAX_SUPERSESSION_CANDIDATES = 3
+_ADVISORY_SUMMARY_CHARS = 140
+
+
+def _compact(text, limit):
+    """Collapse text to a single line of at most `limit` chars, ASCII-safe."""
+    s = " ".join(str(text or "").split())
+    if len(s) <= limit:
+        return s
+    return s[:limit - 3].rstrip() + "..."
+
+
+# Scope reasoning lives in scope_rules, shared with the hook, work_focus and
+# the rules projection so no two surfaces can disagree (con-011-76f8). These
+# aliases exist because callers and tests already reach for them through server.
+_scope_components = scope_rules.components
+_scope_overlap = scope_rules.overlap
+
+
+def _tag_overlap(a, b):
+    """Jaccard over lowercased tag sets, or None if either side is untagged."""
+    ta = {str(t).strip().lower() for t in (a or []) if str(t).strip()}
+    tb = {str(t).strip().lower() for t in (b or []) if str(t).strip()}
+    if not ta or not tb:
+        return None
+    return len(ta & tb) / len(ta | tb)
+
+
+def _supersession_score(new_entry, other):
+    """0.0-1.0 subject overlap between two entries of the same kind.
+
+    The mean of whichever signals exist. An entry with neither tags nor a real
+    scope carries no subject signal, and scores 0 rather than guessing from
+    nothing -- an advisory nobody can act on is worse than silence, because it
+    trains the reader to skip the next one.
+    """
+    signals = [s for s in (
+        _tag_overlap(new_entry.get("tags"), other.get("tags")),
+        _scope_overlap(new_entry.get("scope"), other.get("scope")),
+    ) if s is not None]
+    if not signals:
+        return 0.0
+    return sum(signals) / len(signals)
+
+
+def _supersession_candidates(new_entry, type_name, base_dir,
+                             exclude_ids=(), threshold=None):
+    """Active same-kind entries whose subject this new entry may be replacing.
+
+    Same kind only: a decision never supersedes a constraint, and offering one
+    as a candidate would invite a link the schema cannot hold.
+    """
+    if threshold is None:
+        threshold = read_config(base_dir).get(
+            "supersession_threshold", DEFAULT_SUPERSESSION_THRESHOLD)
+    paths = _resolve_paths(base_dir)
+    if paths is None or type_name not in paths:
+        return []
+    # Already-linked ids are not news: `supersedes` IS the explicit form of
+    # this advisory, and related_to is an acknowledged relation.
+    exclude = set(exclude_ids or [])
+    exclude.update(new_entry.get("related_to") or [])
+
+    matches = []
+    for e in read_json_file(paths[type_name]):
+        eid = e.get("id")
+        if not eid or eid in exclude or eid == new_entry.get("id"):
+            continue
+        if e.get("status", "active") != "active":
+            continue
+        score = _supersession_score(new_entry, e)
+        if score >= threshold:
+            matches.append({
+                "id": eid,
+                "summary": e.get("summary") or e.get("rule") or e.get("name") or "?",
+                "score": round(score, 2),
+            })
+    matches.sort(key=lambda m: (-m["score"], m["id"]))
+    return matches[:_MAX_SUPERSESSION_CANDIDATES]
+
+
+def _attach_supersession_advisory(result, entry, type_name, base_dir,
+                                  exclude_ids=()):
+    """Name possible supersession targets on a successful record_* result.
+
+    Advisory only, and fail-soft for the same reason _attach_similar is: the
+    write has already landed, so nothing this function discovers is worth
+    turning a successful record into an error.
+    """
+    try:
+        candidates = _supersession_candidates(
+            entry, type_name, base_dir, exclude_ids=exclude_ids)
+    except Exception:
+        return result
+    if candidates:
+        result["supersession_advisory"] = [
+            "possible supersession of {}: {}".format(
+                c["id"], _compact(c["summary"], _ADVISORY_SUMMARY_CHARS))
+            for c in candidates
+        ]
+        result["supersession_note"] = _FIELD_GUIDANCE["supersedes"]
+    return result
+
+
+def _attach_capture_advisories(result, entry, type_name, base_dir,
+                               exclude_ids=()):
+    """Every write-time advisory, in one call.
+
+    The two look at the same write from different angles -- similar_entries on
+    WORDING (is this the same thing said twice), supersession on SUBJECT (does
+    this replace something) -- but they are one concern from the caller's side:
+    "tell me what this write collides with". Each record impl was invoking both
+    in sequence, which is three copies of an ordering that has to stay
+    consistent. One entry point, so adding a third advisory later is one edit.
+    """
+    result = _attach_similar(result, entry, base_dir)
+    return _attach_supersession_advisory(
+        result, entry, type_name, base_dir, exclude_ids=exclude_ids)
+
+
+# ============================================================
+# Predecessor line (read time)
+#
+# The other half of the same problem. A supersedes link is only worth making
+# if retrieval spends it: the predecessor is superseded, so every retrieval
+# filter has already dropped it by the time an agent reads the replacement,
+# and "what changed, and why" costs a second deliberate lookup that nobody
+# makes. One line, carried with the entry that replaced it, is what turns the
+# link from bookkeeping into an answer.
+#
+# ONE level deep, deliberately. A chain rendered in full grows without bound
+# in a token budget that is already the scarce resource, and the immediate
+# predecessor is what explains the current entry -- the one before that
+# explains the predecessor, and can be read from ITS own entry.
+# ============================================================
+
+_PREDECESSOR_TEXT_CHARS = 140
+
+
+def _predecessor_sort_key(entry):
+    return (entry.get("updated_at") or "", entry.get("id") or "")
+
+
+def _predecessor_map(base_dir):
+    """{replacement_id: predecessor_entry} for every recorded supersession.
+
+    Read from ALL entries including superseded and deprecated ones: a
+    predecessor is by definition no longer active, so the retrieval filters
+    have already excluded it by the time this is needed.
+    """
+    paths = _resolve_paths(base_dir)
+    if paths is None:
+        return {}
+    out = {}
+    for tpath in paths.values():
+        for e in read_json_file(tpath):
+            newer = e.get("superseded_by")
+            if not newer or not e.get("id"):
+                continue
+            # Several entries can point at one replacement. Keep the most
+            # recently changed: that is the IMMEDIATE predecessor.
+            prior = out.get(newer)
+            if prior is None or _predecessor_sort_key(e) > _predecessor_sort_key(prior):
+                out[newer] = e
+    return out
+
+
+def _predecessor_line(prior, successor):
+    """One compact ASCII line: what the prior entry said, and why it changed."""
+    was = _compact(
+        prior.get("summary") or prior.get("rule") or prior.get("name") or "?",
+        _PREDECESSOR_TEXT_CHARS)
+    # deprecate_entry(superseded_by=...) records an explicit reason. The
+    # record_entry(supersedes=[...]) path has no such field, so fall back to
+    # what forced the replacement -- the closest thing the store actually
+    # holds. Never invent one: no reason at all is honest, a guessed one is not.
+    why = _compact(
+        prior.get("deprecated_reason") or successor.get("problem") or "",
+        _PREDECESSOR_TEXT_CHARS)
+    line = 'supersedes {}: was "{}"'.format(prior.get("id"), was)
+    if why:
+        line += " -- changed because: {}".format(why)
+    return line
+
+
+def _attach_predecessor(item, entry, pred_map, remaining):
+    """Prepend the predecessor line to a result item if it fits `remaining`.
+
+    Returns the tokens spent (0 when there is no predecessor, or when neither
+    form fits). Budget discipline follows dec-021-b607: when the full line
+    does not fit, what gets dropped is the LINE -- never the entry -- and an
+    id trail is left behind so the history stays discoverable with one
+    targeted get_context call.
+    """
+    prior = pred_map.get(entry.get("id"))
+    if prior is None:
+        return 0
+    line = _predecessor_line(prior, entry)
+    cost = estimate_tokens(line)
+    if cost <= remaining:
+        item["predecessor"] = line
+        return cost
+    trail = prior.get("id") or ""
+    trail_cost = estimate_tokens(trail) if trail else 0
+    if trail and trail_cost <= remaining:
+        item["predecessor_id"] = trail
+        return trail_cost
+    return 0
+
+
+# ============================================================
 # Markdown projection — DECISIONS.md as a derived, regenerated file
 # ============================================================
 
@@ -1522,48 +1555,12 @@ def _maybe_export_markdown(base_dir):
 # it enters the model's context, so this marker is free: it identifies the
 # file to the tool and to a human reader without costing context tokens.
 _RULES_MARKER = "<!-- context-keeper:generated -->"
-
-# Characters that make a scope unprojectable, for two different reasons with
-# one shared consequence: the rule silently never fires.
-#
-#   Glob metacharacters — Claude Code reads `[` as the start of a bracket
-#   expression, and a pattern whose bracket never closes matches nothing.
-#
-#   A double quote (or a control character) — each pattern is emitted as a
-#   double-quoted YAML scalar, so an embedded quote closes it early and the
-#   whole frontmatter block stops parsing. The harness then loads NO rule
-#   from that file, not even the patterns that were fine.
-#
-# Both are skipped and REPORTED rather than emitted, because a rule file that
-# never fires is indistinguishable from coverage.
-_GLOB_META = set("[]{}*?")
-_YAML_UNSAFE = set('"')
+# The glob projection of a scope moved to scope_rules alongside the rest of the
+# scope reasoning. Re-exported: render_scope_rule, export_rules and the
+# scope-suggestion check all still reach for it by this name.
+_scope_to_paths = scope_rules.to_glob_patterns
 
 
-def _scope_to_paths(scope):
-    """Glob patterns for a constraint scope, or [] if it can't be expressed.
-
-    Directory scopes match everything beneath them; file scopes match the
-    file. Each gets a repo-root-anchored form and a `**/`-prefixed form, so
-    a scope recorded as `hooks/` still fires in a nested checkout.
-    """
-    s = str(scope or "").replace("\\", "/").strip()
-    if not s or s.lower() == "global":
-        return []
-    if any(ch in _GLOB_META or ch in _YAML_UNSAFE or ord(ch) < 32 for ch in s):
-        return []
-    # A `..` component cannot become a meaningful glob -- the harness matches
-    # patterns against repo-relative paths, which never contain one -- and it
-    # would let a scope reach outside the project. Caught here because this is
-    # the single chokepoint every scope passes through on its way to a pattern.
-    if ".." in s.split("/"):
-        return []
-    s = s.strip("/")
-    if not s:
-        return []
-    if "." in os.path.basename(s):  # looks like a file, not a directory
-        return [s, f"**/{s}"]
-    return [f"{s}/**/*", f"**/{s}/**/*"]
 
 
 def _rule_slug(scope):
@@ -1871,7 +1868,10 @@ def _record_decision_impl(params):
     result = {"success": True, "id": entry["id"], "entry": entry}
     if superseded:
         result["superseded"] = superseded
-    return _attach_similar(result, entry, base_dir)
+    # Ids just linked via `supersedes` are excluded -- the caller already
+    # answered this question for them.
+    return _attach_capture_advisories(
+        result, entry, "decisions", base_dir, exclude_ids=superseded)
 
 
 def _record_pipeline_impl(params):
@@ -1916,7 +1916,9 @@ def _record_pipeline_impl(params):
     entries.append(entry)
     write_json_file(pipe_path, entries)
     _mirror_out(entry, "pipelines", base_dir)
-    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+    return _attach_capture_advisories(
+        {"success": True, "id": entry["id"], "entry": entry},
+        entry, "pipelines", base_dir)
 
 
 def _record_constraint_impl(params):
@@ -1959,7 +1961,9 @@ def _record_constraint_impl(params):
     write_json_file(con_path, entries)
     _maybe_export_projections(base_dir, "constraints")
     _mirror_out(entry, "constraints", base_dir)
-    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+    return _attach_capture_advisories(
+        {"success": True, "id": entry["id"], "entry": entry},
+        entry, "constraints", base_dir)
 
 
 # Kind -> the per-kind implementation. record_entry is the canonical write tool;
@@ -2019,7 +2023,16 @@ def handle_get_context(params):
         entry, type_name, _, _ = _find_entry_by_id(entry_id, base_dir)
         if entry is None:
             return {"error": f"No entry found with id '{entry_id}'"}
-        return {"type": type_name, "entry": entry}
+        out = {"type": type_name}
+        # No budget on this path, so the line always fits; it is attached the
+        # same way and in the same position as in the ranked results below, so
+        # an entry does not gain or lose its history depending on how it was
+        # asked for.
+        prior = _predecessor_map(base_dir).get(entry_id)
+        if prior is not None:
+            out["predecessor"] = _predecessor_line(prior, entry)
+        out["entry"] = entry
+        return out
 
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -2107,6 +2120,8 @@ def handle_get_context(params):
     results = []
     used_tokens = 0
     seen_ids = set()
+    # Supersession history, one level deep, for whatever survives the budget.
+    pred_map = _predecessor_map(base_dir)
     for sc, entry_type, entry in scored:
         clean = entry
 
@@ -2124,7 +2139,13 @@ def handle_get_context(params):
             # mid-ranked entry must not block smaller entries behind it.
             continue
 
-        results.append({"score": round(sc, 1), "type": entry_type, "entry": clean})
+        item = {"score": round(sc, 1), "type": entry_type}
+        # The entry is paid for first, so the predecessor line is only ever
+        # spent out of what is left over after it.
+        used_tokens += _attach_predecessor(
+            item, entry, pred_map, budget - used_tokens - cost)
+        item["entry"] = clean
+        results.append(item)
         seen_ids.add(entry.get("id"))
         used_tokens += cost
 
@@ -2157,12 +2178,11 @@ def handle_get_context(params):
             if used_tokens + cost > budget:
                 continue
             r_label = type_labels.get(r_type, r_type)
-            results.append({
-                "score": 0.0,
-                "type": r_label,
-                "entry": clean,
-                "via": "related_to",
-            })
+            item = {"score": 0.0, "type": r_label, "via": "related_to"}
+            used_tokens += _attach_predecessor(
+                item, r_entry, pred_map, budget - used_tokens - cost)
+            item["entry"] = clean
+            results.append(item)
             seen_ids.add(rid)
             used_tokens += cost
             related_added += 1
@@ -3024,111 +3044,19 @@ def _verified_sha(base_dir):
         return code_drift.head_sha(base_dir)
     except Exception:
         return ""
-
-
-# ============================================================
-# Mojibake detection and repair
-#
-# con-008-dc30 stopped the CAUSE: stdin defaulted to cp1252 on Windows, so a
-# client's raw UTF-8 bytes were mis-decoded before json.loads ever ran, and an
-# em-dash landed in the store as three characters. Forcing UTF-8 on the stdio
-# transport means no new entry is corrupted.
-#
-# It did nothing for entries already written. A fix that stops the bleeding
-# and leaves the wound is half a fix, and the damage is invisible in exactly
-# the place it matters: the text is still readable enough that nobody
-# re-reads it, so a corrupted rationale just quietly degrades every future
-# retrieval that surfaces it.
-# ============================================================
-
-# Sequences that only occur when UTF-8 bytes were decoded as cp1252. Requiring
-# one of these before attempting a repair keeps the round-trip check below
-# from "fixing" text that merely happens to survive the transform.
-_MOJIBAKE_MARKERS = (
-    "â€",      # â€  - the em/en-dash and smart-quote family
-    "Ã©",      # Ã©  - accented latin
-    "Ã¨",      # Ã¨
-    "Ã¼",      # Ã¼
-    "Ã±",      # Ã±
-    "â",      # â„  - trademark/numero
-    "â",      # â ˆ - maths
-    "Â ",      # Â   - non-breaking space
-    "Â·",      # Â·
+# Mojibake detection/repair moved to mojibake.py (imports nothing, so the
+# quality checks can use it without pulling in the protocol layer). Re-exported:
+# handle_repair_mojibake and the tests reach for these through `server`.
+from mojibake import (  # noqa: E402
+    _MOJIBAKE_FIELDS,
+    _MOJIBAKE_MARKERS,
+    _entry_mojibake_fields,
+    _repair_entry_mojibake,
+    demojibake,
+    looks_like_mojibake,
 )
 
 
-def looks_like_mojibake(text):
-    """Cheap pre-filter: does this string carry a known misdecode signature?"""
-    return isinstance(text, str) and any(m in text for m in _MOJIBAKE_MARKERS)
-
-
-def demojibake(text):
-    """Repair cp1252-misdecoded UTF-8, or return None if that isn't what this is.
-
-    The repair is the exact inverse of the corruption, so it is verified as
-    one: re-applying the corruption to the candidate must reproduce the
-    input byte for byte. Anything that fails that check is left alone —
-    a partial or approximate repair of someone's recorded reasoning is
-    worse than leaving it legibly broken, because it looks fixed.
-    """
-    if not looks_like_mojibake(text):
-        return None
-    try:
-        repaired = text.encode("cp1252").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return None
-    if repaired == text:
-        return None
-    try:
-        if repaired.encode("utf-8").decode("cp1252") != text:
-            return None
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return None
-    return repaired
-
-
-# Entry fields that hold prose and are therefore worth repairing. Ids, tags
-# and timestamps are excluded: they are machine-facing, and rewriting an id
-# would break every related_to pointing at it.
-_MOJIBAKE_FIELDS = (
-    "summary", "problem", "why_chosen", "what_we_tried", "tradeoffs",
-    "rationale", "rule", "reason", "triggering_incident", "purpose",
-    "when_to_invoke", "name", "deprecated_reason",
-)
-
-
-def _entry_mojibake_fields(entry):
-    """Names of this entry's fields that carry repairable mojibake."""
-    hits = []
-    for field in _MOJIBAKE_FIELDS:
-        if demojibake(entry.get(field)) is not None:
-            hits.append(field)
-    for i, alt in enumerate(entry.get("alternatives") or []):
-        if not isinstance(alt, dict):
-            continue
-        for key in ("option", "reason_rejected"):
-            if demojibake(alt.get(key)) is not None:
-                hits.append(f"alternatives[{i}].{key}")
-    return hits
-
-
-def _repair_entry_mojibake(entry):
-    """Repair in place. Returns the list of field names changed."""
-    changed = []
-    for field in _MOJIBAKE_FIELDS:
-        fixed = demojibake(entry.get(field))
-        if fixed is not None:
-            entry[field] = fixed
-            changed.append(field)
-    for i, alt in enumerate(entry.get("alternatives") or []):
-        if not isinstance(alt, dict):
-            continue
-        for key in ("option", "reason_rejected"):
-            fixed = demojibake(alt.get(key))
-            if fixed is not None:
-                alt[key] = fixed
-                changed.append(f"alternatives[{i}].{key}")
-    return changed
 
 
 def handle_repair_mojibake(params):
@@ -3196,49 +3124,17 @@ def handle_repair_mojibake(params):
             "bumped so the corrected copy wins the mirror merge."
         ),
     }
+# The quality checks moved to quality_checks.py -- one function per check
+# instead of one 117-line loop. Re-exported so existing callers and tests keep
+# addressing them through `server`.
+from quality_checks import (  # noqa: E402
+    QUALITY_CHECKS,
+    _project_root_for,
+    _QualityContext,
+    _suggest_scope,
+)
 
 
-def _project_root_for(base_dir):
-    """The project directory containing a .context/ dir, or None."""
-    return os.path.dirname(os.path.abspath(base_dir)) if base_dir else None
-
-
-def _suggest_scope(entry, project_root):
-    """A concrete scope path this constraint could use, or None.
-
-    `global` scope is not a formatting nit -- it is the difference between
-    a rule that participates and one that does not. A global constraint
-    gets no drift check (no path to compare commits against), no
-    .claude/rules/ projection (no pattern to build), and never fires
-    scope_guard. Its only route to the model is the session-start summary,
-    which is also the thing that truncates first on a large store.
-
-    Only suggests when there is real evidence, because a bare "consider
-    adding a scope" on every global constraint is noise the reader learns
-    to skip -- and some rules genuinely are global.
-    """
-    if not project_root:
-        return None
-
-    def _exists(rel):
-        return rel and os.path.exists(os.path.join(project_root, rel))
-
-    # Strongest evidence: the entry names its own enforcing test/command.
-    # "tests/test_server.py::TestX" -> "tests/test_server.py".
-    enforced = (entry.get("enforced_by") or "").strip()
-    if enforced:
-        candidate = enforced.split("::", 1)[0].strip().replace("\\", "/")
-        candidate = candidate.split()[0] if candidate else ""
-        if _exists(candidate) and _scope_to_paths(candidate):
-            return candidate
-
-    # Next best: a tag that names a real directory or module in the repo.
-    for tag in entry.get("tags", []):
-        for candidate in (f"{tag}/", f"{tag}.py", tag):
-            rel = candidate.rstrip("/")
-            if _exists(rel) and _scope_to_paths(candidate):
-                return candidate
-    return None
 
 
 def handle_verify_quality(params):
@@ -3295,118 +3191,17 @@ def handle_verify_quality(params):
 
     flagged = []
     for tname, e in all_active:
+        ctx = _QualityContext(
+            type_name=tname, entry=e, entry_id=e.get("id", "?"),
+            base_dir=base_dir, min_reason=min_reason, tag_index=tag_index,
+            drift=drift, usage_data=usage_data)
         issues = []
-        eid = e.get("id", "?")
-
-        # Legacy detection — schema_version is set to 4 by v0.4 writes.
-        # Older entries lack it AND lack the new structured fields.
-        is_v4 = e.get("schema_version") == 4
-        if not is_v4:
-            if tname == "decisions" and not e.get("why_chosen"):
-                issues.append({
-                    "type": "legacy",
-                    "detail": "Pre-v0.4 decision: missing structured fields (problem, why_chosen). The freeform 'rationale' is preserved but won't show the full why. Consider re-recording with the v0.4 schema.",
-                })
-            elif tname == "pipelines" and not e.get("purpose"):
-                issues.append({
-                    "type": "legacy",
-                    "detail": "Pre-v0.4 pipeline: missing 'purpose' field. Re-record so future sessions know why this pipeline exists, not just what it does.",
-                })
-            elif tname == "constraints" and not e.get("triggering_incident"):
-                # triggering_incident is optional, so only flag if reason is also thin
-                pass
-
-        # Thin reason text
-        if tname == "decisions":
-            reason_text = (e.get("why_chosen") or "") + " " + (e.get("rationale") or "")
-        elif tname == "constraints":
-            reason_text = e.get("reason") or ""
-        elif tname == "pipelines":
-            reason_text = e.get("purpose") or ""
-        else:
-            reason_text = ""
-        if len(reason_text.strip()) < min_reason:
-            issues.append({
-                "type": "thin_reason",
-                "detail": f"Reasoning text is only {len(reason_text.strip())} chars (threshold: {min_reason}). Use update_entry to expand the rationale with concrete context.",
-            })
-
-        # No tags
-        if not e.get("tags"):
-            issues.append({
-                "type": "no_tags",
-                "detail": "Entry has no tags. Tags are the primary retrieval signal — add 2-4 lowercase, hyphen-separated tags.",
-            })
-
-        # Isolated: tag overlap with siblings but no related_to link
-        own_tags = set(t.lower() for t in e.get("tags", []))
-        own_links = set(e.get("related_to", []) or [])
-        sibling_ids = set()
-        for tag in own_tags:
-            sibling_ids |= tag_index.get(tag, set())
-        sibling_ids.discard(eid)
-        unlinked_siblings = sibling_ids - own_links
-        if own_tags and unlinked_siblings and not own_links:
-            issues.append({
-                "type": "isolated",
-                "detail": f"Shares tags with {len(unlinked_siblings)} other entries but has no related_to links. Suggested links: {sorted(unlinked_siblings)[:5]}",
-            })
-
-        # The code this entry describes moved, or moved away entirely.
-        if drift and code_drift is not None:
-            issues.extend(code_drift.issues_for(drift.get(eid)))
-
-        # A constraint naming its own check is only useful while the name
-        # resolves. Never executed -- see code_drift.enforcement_issues.
-        if code_drift is not None and e.get("enforced_by"):
-            try:
-                issues.extend(code_drift.enforcement_issues(
-                    e, code_drift.repo_root(base_dir)))
-            except Exception:
-                pass
-
-        # Carried into every session and never actually sought.
-        if usage is not None:
-            issues.extend(usage.issues_for(usage.stats_for(base_dir, eid, usage_data)))
-
-        # Text corrupted before con-008-dc30 forced UTF-8 on the transport.
-        # The store has to be able to report this itself: the damage is
-        # legible enough that nobody re-reads the entry, so it degrades
-        # every retrieval that surfaces it without ever announcing itself.
-        # A global-scoped constraint is invisible to every path-based
-        # delivery mechanism. Only flagged when a concrete path can be
-        # suggested -- see _suggest_scope.
-        if tname == "constraints" and (e.get("scope") or "global").lower() == "global":
-            suggestion = _suggest_scope(e, _project_root_for(base_dir))
-            if suggestion:
-                issues.append({
-                    "type": "global_scope",
-                    "detail": (
-                        f"Scope is 'global', so this rule gets no drift check, "
-                        f"no .claude/rules/ file, and never fires scope_guard -- "
-                        f"it reaches the model only via the session-start summary. "
-                        f"Evidence suggests scope='{suggestion}'. Set it with "
-                        f"update_entry, or leave it global if the rule really "
-                        f"does apply everywhere."
-                    ),
-                })
-
-        garbled = _entry_mojibake_fields(e)
-        if garbled:
-            issues.append({
-                "type": "mojibake",
-                "detail": (
-                    f"{len(garbled)} field(s) carry cp1252-misdecoded UTF-8 "
-                    f"({', '.join(garbled[:4])}). Written before the transport "
-                    "was forced to UTF-8 (con-008). Repair with the "
-                    "repair_mojibake handler: "
-                    "context-keeper repair_mojibake '{\"apply\": true}'"
-                ),
-            })
+        for _name, check in QUALITY_CHECKS:
+            issues.extend(check(ctx) or [])
 
         if issues:
             flagged.append({
-                "id": eid,
+                "id": ctx.entry_id,
                 "type": tname,
                 "summary": e.get("summary") or e.get("name") or e.get("rule") or "?",
                 "issues": issues,
@@ -3649,36 +3444,52 @@ def _maybe_bootstrap_from_snapshot(base_dir):
         return None
 
 
-def handle_pull_remote(params):
-    """MCP tool: merge remote-recorded entries into the local store."""
+# op -> (mirror function name, the count key its result and its failures use).
+# Both directions have identical preconditions and identical failure shapes;
+# only the verb and the noun differ, so they are one function with a table
+# rather than two functions that must be kept in step.
+_MIRROR_OPS = {
+    "pull": ("pull_remote", "pulled"),
+    "backfill": ("backfill_remote", "backfilled"),
+}
+
+
+def _run_mirror_op(params, op):
+    """Shared body for mirror(op='pull'|'backfill').
+
+    Fail-soft at every step, per con-006: an unavailable module, an unresolved
+    project, a disabled mirror and a raising remote must each come back as a
+    reported zero rather than an exception, because none of them is the local
+    store's problem.
+    """
+    fn_name, count_key = _MIRROR_OPS[op]
     if _mirror is None:
-        return {"pulled": 0, "reason": "mirror module unavailable"}
+        return {count_key: 0, "reason": "mirror module unavailable"}
     base_dir = _base_dir_from_params(params)
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
     if not _mirror.mirror_enabled():
-        return {"pulled": 0, "reason": "disabled",
+        return {count_key: 0, "reason": "disabled",
                 "note": "Set CONTEXT_KEEPER_REMOTE_URL to enable mirroring."}
     try:
-        return _mirror.pull_remote(base_dir)
+        return getattr(_mirror, fn_name)(base_dir)
     except Exception as e:
-        return {"pulled": 0, "error": str(e)}
+        return {count_key: 0, "error": str(e)}
+
+
+def handle_pull_remote(params):
+    """Merge remote-recorded entries into the local store.
+
+    Reachable only through mirror(op='pull') since dec-014 retired the
+    standalone tool; kept as a named handler because HANDLERS and the CLI still
+    address it, and existing callers should not break.
+    """
+    return _run_mirror_op(params, "pull")
 
 
 def handle_backfill_remote(params):
-    """MCP tool: push all local entries for the project to the remote."""
-    if _mirror is None:
-        return {"backfilled": 0, "reason": "mirror module unavailable"}
-    base_dir = _base_dir_from_params(params)
-    if base_dir is None:
-        return UNRESOLVED_PROJECT_ERROR
-    if not _mirror.mirror_enabled():
-        return {"backfilled": 0, "reason": "disabled",
-                "note": "Set CONTEXT_KEEPER_REMOTE_URL to enable mirroring."}
-    try:
-        return _mirror.backfill_remote(base_dir)
-    except Exception as e:
-        return {"backfilled": 0, "error": str(e)}
+    """Push all local entries for the project to the remote. See handle_pull_remote."""
+    return _run_mirror_op(params, "backfill")
 
 
 def handle_mirror(params):
@@ -3727,6 +3538,22 @@ HANDLERS = {
     # Hidden by design: a one-time migration for stores written before
     # con-008-dc30. verify_quality flags the damage; this repairs it.
     "repair_mojibake": handle_repair_mojibake,
+}
+
+# Handlers deliberately absent from tools/list, and why. Every schema kept out
+# of the payload is a per-session token saving for every connected client
+# (con-004), so being hidden is a decision worth recording -- and worth
+# distinguishing from an oversight. TestHandlerVisibility asserts HANDLERS is
+# exactly TOOLS plus this table, so a new handler that never got a schema fails
+# loudly instead of becoming a tool nobody can call.
+_HIDDEN_HANDLERS = {
+    "record_decision": "deprecated alias of record_entry(kind='decision')",
+    "record_pipeline": "deprecated alias of record_entry(kind='pipeline')",
+    "record_constraint": "deprecated alias of record_entry(kind='constraint')",
+    "pull_remote": "folded into mirror(op='pull') by dec-014",
+    "backfill_remote": "folded into mirror(op='backfill') by dec-014",
+    "export_rules": "one-time projection backfill, run from the CLI",
+    "repair_mojibake": "one-time con-008-dc30 migration, run from the CLI",
 }
 
 # ============================================================

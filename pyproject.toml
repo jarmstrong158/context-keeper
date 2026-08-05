@@ -53,6 +53,10 @@ context-keeper = "server:main"
 include = [
     "server.py",
     "store_paths.py",
+    "scope_rules.py",
+    "ranking.py",
+    "mojibake.py",
+    "quality_checks.py",
     "mirror.py",
     "semantic_index.py",
     "code_drift.py",
@@ -73,6 +77,10 @@ include = [
 [tool.hatch.build.targets.wheel.force-include]
 "server.py" = "server.py"
 "store_paths.py" = "store_paths.py"
+"scope_rules.py" = "scope_rules.py"
+"ranking.py" = "ranking.py"
+"mojibake.py" = "mojibake.py"
+"quality_checks.py" = "quality_checks.py"
 "mirror.py" = "mirror.py"
 "semantic_index.py" = "semantic_index.py"
 "code_drift.py" = "code_drift.py"

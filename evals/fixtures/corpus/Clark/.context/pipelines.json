@@ -1,0 +1,246 @@
+[
+  {
+    "id": "pipe-001",
+    "name": "audit-driven-debugging",
+    "steps": [
+      {
+        "order": 1,
+        "action": "Spawn 3 independent agents with different audit lenses (e.g., code/architecture, data/distribution, weights/probe). Each gets full session context and a focused investigation prompt."
+      },
+      {
+        "order": 2,
+        "action": "Receive their independent reports. Look for convergence (high confidence finding) and disagreement (real diagnostic uncertainty)."
+      },
+      {
+        "order": 3,
+        "action": "Round 2: send each agent the OTHER agents' findings, ask for cross-rebuttal and refinement. Agents update their priors."
+      },
+      {
+        "order": 4,
+        "action": "Synthesize unanimous priority list. Ship fixes ONE AT A TIME with clean attribution windows where possible."
+      },
+      {
+        "order": 5,
+        "action": "After each fix, audit again to verify the diagnosis was right. If wrong, learn what was missed."
+      }
+    ],
+    "constraints": [
+      "Brief each agent like a smart colleague who just walked into the room \u00e2\u20ac\u201d they don't see the conversation history",
+      "Tell them what was already tried and why, so they don't re-recommend it",
+      "Ask for SPECIFIC numbers not 'appears to' \u00e2\u20ac\u201d agents will hand-wave if you let them",
+      "When agents disagree, that's signal \u00e2\u20ac\u201d chase the disagreement to find the real story",
+      "After audit consensus, ship 1-2 fixes per cycle to preserve attribution"
+    ],
+    "tags": [
+      "debugging",
+      "process"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:09:51.150161+00:00",
+    "verified_at": "2026-05-16T13:09:51.150161+00:00"
+  },
+  {
+    "id": "pipe-002",
+    "name": "value-head-symlog-flow",
+    "steps": [
+      {
+        "order": 1,
+        "action": "Rollout: value head produces scalar output (in symlog space). Stored in RolloutBuffer.values as-is."
+      },
+      {
+        "order": 2,
+        "action": "compute_returns: stored symlog values are SYMEXP'd to real values BEFORE GAE math. Returns come out in real-value space."
+      },
+      {
+        "order": 3,
+        "action": "_update_single_buffer: target = symlog(returns_real). Re-evaluated value head outputs are already in symlog space."
+      },
+      {
+        "order": 4,
+        "action": "Value loss = MSE(value_head_output, symlog(returns)) in symlog space. With vf_clip=0.2 in symlog space: max of clipped and unclipped losses (PPO standard)."
+      },
+      {
+        "order": 5,
+        "action": "When the value head output is needed externally (e.g., dashboard, debugging), apply symexp to convert back to real-value space."
+      }
+    ],
+    "constraints": [
+      "NEVER feed real-magnitude returns directly to value loss \u00e2\u20ac\u201d always symlog them first",
+      "vf_clip operates in symlog space (clip \u00c2\u00b10.2 of symlog output)",
+      "If you change the value head architecture, the symlog interpretation must be preserved"
+    ],
+    "tags": [
+      "ppo",
+      "value-head",
+      "symlog"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:09:59.903715+00:00",
+    "verified_at": "2026-05-16T13:09:59.903715+00:00"
+  },
+  {
+    "id": "pipe-003",
+    "name": "warm-resume-hparam-override",
+    "steps": [
+      {
+        "order": 1,
+        "action": "Resume detects existing checkpoint, loads it via ClarkAgent.load(). The saved 'hparams' dict contains the LR and other PPO config from the original training run."
+      },
+      {
+        "order": 2,
+        "action": "After load, iterate PPO_DEFAULTS.items(). For each scalar hparam, compare to agent.hparams[key]. If different, override agent.hparams AND patch optimizer.param_groups for LR specifically."
+      },
+      {
+        "order": 3,
+        "action": "Print '[Resume] hparam override: KEY OLD -> NEW' for each overridden value. Without this, changing PPO_DEFAULTS has NO effect on resumed runs because the saved hparams silently win."
+      },
+      {
+        "order": 4,
+        "action": "Curriculum counter (configs_seen_state) must also be fast-forwarded based on start_episode, otherwise warm-resume silently re-enters stage 1."
+      }
+    ],
+    "constraints": [
+      "The resume override mechanism must apply to ANY scalar PPO_DEFAULTS hparam, not just LR (lesson learned: entropy_coeff change had no effect on first attempt because only LR was being overridden)",
+      "Curriculum fast-forward: configs_seen_state['count'] = (start_episode - 1) // years_per_config"
+    ],
+    "tags": [
+      "training",
+      "checkpointing",
+      "resume"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:11.406975+00:00",
+    "verified_at": "2026-05-16T13:10:11.406975+00:00"
+  },
+  {
+    "id": "pipe-004",
+    "name": "Foundation behavior diagnostic (probe-first investigation)",
+    "purpose": "When a trained policy misbehaves on a specific facility / scenario, this pipeline routes the investigation through measurement probes BEFORE proposing any reward, env, or curriculum change. Saves a foundation retrain per wrong hypothesis (~12h each). Forces the investigation to be data-driven rather than reasoning-driven, which today proved decisive: three plausible reward/env hypotheses were invalidated by probes, leading to the actual root cause (curriculum gap, not reward design).</purpose>\n<parameter name=\"when_to_invoke\">Any time the policy produces behavior on a target facility that contradicts what the reward signal would predict (e.g. jack_baseline F=100% despite negative net reward for the bad actions). Also invoke before approving any reward-weight or env-mechanic change proposed to fix a behavior failure - per con-016.",
+    "when_to_invoke": "",
+    "steps": [
+      {
+        "order": 1,
+        "action": "Run tools/probe_foundation_behavior.py --facility <fid> --volume <vol> --days 30. Reports P1 (per-grade filler reward), P2 (crunch cap binding frequency), P3 (buffer-full non-OT incidents), P4 (per-day task share by grade), P5 (time-of-day for side_project), P6 (reward-component dominance on F-days).",
+        "output": "tools/_probe_results.json + human-readable stdout report. The numbers say whether each proposed lever is firing at all on the failure mode."
+      },
+      {
+        "order": 2,
+        "action": "For each proposed reward/env change, check the probe data: does the data show the targeted mechanism actually firing on F-days? If P1 says filler reward is +1.5/day, zeroing it is cosmetic. If P2 says cap binds 0/30 days, fixing the cap is irrelevant. Each lever needs probe evidence BEFORE proposing a retrain.",
+        "output": "List of proposed changes with verdict (justified by data / non-fix per probe)."
+      },
+      {
+        "order": 3,
+        "action": "If steps 1-2 invalidate the obvious reward/env hypotheses, run tools/probe_curriculum_shape.py --samples-per-stage 500 to check whether the failure scenario shape is even represented in the curriculum. Compute the target's vol/capacity ratio and compare to the curriculum's p90.",
+        "output": "Per-stage stats: N distribution, filler-enabled %, peak vol/cap percentiles, jack-shape coverage. If target scenario is outside p90, the foundation has never trained on anything like it - curriculum is the cause."
+      },
+      {
+        "order": 4,
+        "action": "Only after steps 1-3 narrow the cause to either (a) a specific lever the probes confirm is firing or (b) a curriculum coverage gap, propose the smallest change that addresses the identified cause. Per con-008, change one variable per restart so attribution stays clean. Back up the current foundation checkpoint as <name>.pre_<change>.bak before retraining.",
+        "output": "Single localized change + checkpoint backup + retrain command."
+      },
+      {
+        "order": 5,
+        "action": "After retrain finishes, re-run tools/probe_foundation_behavior.py against the new checkpoint at the same scenario. Compare to the pre-change probe results. If the targeted behavior shifted (e.g. F-day side_project share drops), the fix worked. If it didn't, the diagnosis was wrong - go back to step 1 with the new data.",
+        "output": "Before/after probe comparison. Confirmation or refutation of the change's effect."
+      }
+    ],
+    "constraints": [
+      "con-008: one variable per restart for clean attribution",
+      "con-015: measure gate frequency before shipping any gated reward term",
+      "con-016: probe-first discipline extends to all reward/env change proposals"
+    ],
+    "related_to": [
+      "dec-032",
+      "con-016",
+      "con-015",
+      "con-008"
+    ],
+    "tags": [
+      "diagnostic",
+      "audit-discipline",
+      "probe-first",
+      "foundation-retrain",
+      "investigation-workflow"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-24T21:27:13.449355+00:00",
+    "verified_at": "2026-05-24T21:27:13.449355+00:00"
+  },
+  {
+    "id": "pipe-005",
+    "name": "Multi-gate action-mask design (project + react + structural backstops)",
+    "purpose": "Forces correct policy behavior on stress days via STRUCTURAL constraint rather than gradient pressure. Pattern emerged after v2.1 dvc-projection + reward-coupling and v2.2 queue_pressure-obs-alone both failed: gradient-based interventions can't escape the v2 baseline's \"do filler under crunch\" attractor within reasonable fine-tune budgets. The mask removes invalid actions from the policy's action space (-1e9 logits before softmax), so the constraint takes effect from tick 1 with no PPO updates needed.",
+    "when_to_invoke": "When a behavior failure is stable across multiple feature-design attempts AND is policy-level wrong (the policy chooses a clearly bad action when better options exist AND are eligible). Specifically NOT when the failure is environment-mechanic (use env fix) or capacity (use curriculum fix). The mask pattern is for \"policy choice is wrong despite the right options being available.\"",
+    "steps": [
+      {
+        "order": 1,
+        "action": "Identify the failure mode behaviorally - what action the policy is choosing that it shouldn't, on what subset of states. Audit at least 30 episodes; stratify by grade/scenario/facility-mix to confirm it's policy-choice not eligibility/mask-already-restrictive.",
+        "output": "Concrete failure characterization"
+      },
+      {
+        "order": 2,
+        "action": "Design a set of GATES - boolean conditions on env state - that when ANY fires should mask out the bad action. Include at least one PROACTIVE gate (projection-based, fires early) and one or more REACTIVE backstops (queue/schedule/clock-check, fires when projection underestimated). The reactive backstops are critical: projection alone is fragile to morning estimation error.",
+        "output": "Gate formulas with thresholds"
+      },
+      {
+        "order": 3,
+        "action": "Add per-tick gate computation to the env (NOT as obs features - these are mask-only). Mask-side env state can read total_orders etc. directly because the mask is env code, not policy input (no oracle leak risk).",
+        "output": "env methods like _compute_projected_demand_ratio, _compute_time_pressure"
+      },
+      {
+        "order": 4,
+        "action": "Wire the gates into clark/agent/actions.py inside the normal-case mask branch. After per-task eligibility, add: if any gate fires AND task is in target-set (e.g., FILLER_TASKS), set mask[w_id, j] = False. CRITICAL: preserve the existing stranded-worker safety net (re-enable a productive action if mask leaves no valid option) - the new gates could otherwise produce zero-mask softmax NaN.",
+        "output": "Updated actions.py with gate logic"
+      },
+      {
+        "order": 5,
+        "action": "Add tests pinning each gate individually (fires when condition true, dormant when false) + safety invariants (no zero masks, no stranded workers) + threshold-pin tests so regressions surface (a future loosening of threshold will fail the test).",
+        "output": "tests/test_filler_crunch_mask.py with N+3 tests where N = number of gates"
+      },
+      {
+        "order": 6,
+        "action": "Run full pytest suite to confirm no regressions in other env tests. Mask changes can have second-order effects (e.g., over-firing eliminates an action the policy was using legitimately).",
+        "output": "474+ tests passing"
+      },
+      {
+        "order": 7,
+        "action": "Fine-tune from v2 baseline checkpoint (or previous mask-iteration checkpoint for incremental). No transplant needed - env arch unchanged. ~500 episodes is typically enough since structural mask delivers most of the gain mechanically, not via PPO learning.",
+        "output": "clark_foundation_vXX_ft.pt at intermediate checkpoints"
+      },
+      {
+        "order": 8,
+        "action": "Probe at checkpoints (every 100-150 eps) for: target-bad-action % (should drop), the failure-mode outcome (should improve), and any over-fire signals (e.g., easy-day metrics regressing because mask fires when it shouldn't).",
+        "output": "Probe report showing whether gates are biting on the right days"
+      },
+      {
+        "order": 9,
+        "action": "Run head-to-head A/B vs the prior baseline using tools/quick_v2_baseline_metrics.py (or equivalent). Use temperature-0.5 sampling, NOT argmax - argmax at early-training shows misleadingly bad deterministic mode. Compare on heavy/mid/easy scenarios separately to verify the mask isn't trading off easy-day quality for stress-day wins.",
+        "output": "A/B verdict with statistical CIs"
+      }
+    ],
+    "constraints": [
+      "Mask gates can read env oracle state (total_orders, etc.) - the no-oracle-leak rule (con-014) is about OBSERVATIONS the policy network sees, not env-side mask code",
+      "Every mask gate iteration must keep ARCH_VERSION='clark-v2' and env_feat_dim=17 - bumping ARCH or env_feat_dim breaks the v2 baseline checkpoint loadability",
+      "Always add stranded-worker safety: if all of a worker's actions get masked out, the existing pick-fallback in actions.py:205 must catch it; new gates must not bypass this",
+      "One gate variable per restart (per con-008): v2.4 added projection, v2.5 added 3 reactive backstops, v2.6 added restock-pressure. Stacking multiple new gates in one iteration prevents clean attribution if A/B regresses"
+    ],
+    "related_to": [
+      "dec-033",
+      "con-016",
+      "con-008",
+      "con-017",
+      "con-018"
+    ],
+    "tags": [
+      "action-mask",
+      "structural-intervention",
+      "design-pattern",
+      "v2.4-v2.5-v2.6"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-25T17:34:44.701475+00:00",
+    "verified_at": "2026-05-25T17:34:44.701475+00:00"
+  }
+]

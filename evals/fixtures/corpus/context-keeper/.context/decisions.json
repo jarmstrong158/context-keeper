@@ -1,0 +1,976 @@
+[
+  {
+    "id": "dec-001",
+    "summary": "Context-keeper is the primary cross-session project memory system. Auto-memory does not organically capture project decisions or constraints.",
+    "rationale": "Audited both systems April 2026. Auto-memory (MEMORY.md) had zero Clark/Conductor/skillmatch entries despite many sessions. Context-keeper captured 5+ entries that would have been lost. Auto-memory is passively loaded but does not trigger active orientation; context-keeper SessionStart hook forces Claude to read and think about project state. Debated three times before being recorded.",
+    "alternatives": [
+      {
+        "option": "Consolidate onto auto-memory, retire context-keeper",
+        "reason_rejected": "Auto-memory never organically captured project decisions. Its edit-with-confirmation rule adds friction. Passive loading does not trigger active orientation."
+      },
+      {
+        "option": "Keep both systems with assigned lanes",
+        "reason_rejected": "Two systems = ambiguity on every record action. Ongoing friction deciding which system gets the entry."
+      }
+    ],
+    "constraints_created": [],
+    "tags": [
+      "context-keeper",
+      "architecture",
+      "memory",
+      "meta"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-12T02:18:02.999412+00:00",
+    "verified_at": "2026-04-12T02:18:02.999412+00:00",
+    "updated_at": "2026-04-12T02:18:02.999412+00:00"
+  },
+  {
+    "id": "dec-002",
+    "summary": "PreCompact hook prints capture prompt reminding Claude to record decisions/constraints before compaction.",
+    "rationale": "Capture gap was the single biggest hole: retrieval worked (SessionStart hook) but nothing prompted Claude to record new findings. PreCompact is the right trigger for the snapshot because compaction is exactly when context is about to be lost. CORRECTION (v0.6, 2026-07-02): the original claim that the printed capture prompt 'becomes part of context that gets compacted' was wrong - PreCompact stdout is user-visible only and never reaches the model (see con-002). The compaction guard today is: PreCompact snapshots all active entries, the comparison runs at SessionStart(source=compact) and writes a discrepancy report, and session_start.py injects that report plus the capture nudge at turn one.",
+    "alternatives": [
+      {
+        "option": "Session-end hook",
+        "reason_rejected": "Claude Code has no session-end hook. Stop fires every response, not just at end."
+      },
+      {
+        "option": "Periodic CronCreate reminder",
+        "reason_rejected": "Cron jobs are session-scoped and die when Claude exits."
+      }
+    ],
+    "constraints_created": [
+      "PreCompact capture prompt must use ASCII only -- Windows cp1252 crashes on Unicode arrows/dashes"
+    ],
+    "tags": [
+      "context-keeper",
+      "hooks",
+      "capture",
+      "compaction"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-12T02:18:03.005412+00:00",
+    "verified_at": "2026-07-03T01:41:59.224149+00:00",
+    "related_to": [
+      "con-001",
+      "con-002",
+      "dec-005"
+    ],
+    "retrieval_hints": [
+      "losing recorded decisions when conversation history is compressed",
+      "compaction data loss guard",
+      "snapshot and diff of context entries around compaction",
+      "capture prompt before context is compacted"
+    ],
+    "updated_at": "2026-07-03T01:41:59.224149+00:00"
+  },
+  {
+    "id": "dec-003",
+    "summary": "Capture is now anchored to git commits: hooks/commit_capture_reminder.py (PostToolUse, matcher Bash) injects a record-it-now reminder whenever a Bash command contains \"git commit\". Fourth hook in the loop alongside SessionStart (retrieval), PreCompact (pre-compression safety net), Stop (integrity).",
+    "problem": "The README honestly stated the gap: \"capture still relies on Claude calling record_* during the session.\" Field use proved it fails under load \u2014 during an incident-heavy balatron session (2026-06-10), the agent batched capture \"for later\" through a dozen commits and the user had to say \"update context keeper\" three times in one night.",
+    "why_chosen": "A git commit is the single best capture trigger: it is the exact moment a decision/constraint/gotcha became real enough to persist in version control, so prompting at commit time anchors capture to the natural unit of finished work instead of leaving it to agent discretion mid-task. PostToolUse additionalContext injects the reminder directly into the agent's context \u2014 the same unskippable-injection principle that fixed retrieval in the SessionStart hook redesign.",
+    "what_we_tried": "Relying on the CLAUDE.md \"capture as you go\" instruction and the SessionStart reminder \u2014 both reliably lost to task-focused incident response. The PreCompact prompt exists but only fires at compaction, far too late for multi-commit arcs.",
+    "tradeoffs": "The substring match (\"git commit\" in command) is deliberately loose: it also fires on pipe-tests, echo commands, and commits in unrelated repos \u2014 mild noise accepted over missed captures. The reminder is advisory, not blocking; a truly negligent agent can still skip it. ASCII-only output per con-001 (Windows cp1252 hook stdout).",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "hooks",
+      "capture-loop",
+      "post-tool-use",
+      "git-commit"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-06-11T01:31:24.693204+00:00",
+    "verified_at": "2026-06-11T01:31:24.693204+00:00",
+    "updated_at": "2026-08-01T11:55:21.459392+00:00"
+  },
+  {
+    "id": "dec-004",
+    "summary": "v0.5 data integrity: entry files are written atomically (temp + os.replace), and write paths refuse to proceed when an existing entry file fails to parse, instead of treating it as empty.",
+    "problem": "read_json_file returned [] on any parse error and write_json_file wrote in place. A crash mid-write left truncated JSON; the next record_* then read the corrupt file as an empty store, appended one entry, and wrote - silently replacing the entire history with a single entry and restarting IDs at 001. For a memory tool, this was the worst possible failure mode.",
+    "why_chosen": "Two mechanisms with distinct jobs: os.replace after writing a temp file makes corruption-by-crash nearly impossible (old file stays intact until the new one is complete), and _load_entries_for_write distinguishes missing (fresh store, fine) from corrupt (refuse with an error naming the file) so history is never overwritten even if corruption arrives some other way. Read-only paths keep the soft [] fallback so retrieval degrades gracefully.",
+    "what_we_tried": "Considered file locking for concurrent sessions as well, but deferred it: cross-platform lock code (msvcrt vs fcntl) adds real complexity, and atomic replace already shrinks the lost-update window to the read-modify-write interval of a single tool call.",
+    "tradeoffs": "A genuinely corrupt file now blocks recording until the user fixes or removes it, rather than 'working' by starting over. That friction is deliberate - starting over silently is data loss wearing a success message. Concurrent same-project sessions can still race between read and write.",
+    "alternatives": [
+      {
+        "option": "Auto-backup the corrupt file to .bak and start a fresh store",
+        "reason_rejected": "Recovers availability but hides the failure; the user may not notice the .bak for weeks while new entries diverge from the old history."
+      },
+      {
+        "option": "Cross-platform file locking",
+        "reason_rejected": "Deferred, not rejected: complexity outweighs the residual risk once writes are atomic, and the tool is effectively single-user today."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "data-integrity",
+      "storage",
+      "atomic-write"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-02T22:33:57.609165+00:00",
+    "verified_at": "2026-07-02T22:33:57.609165+00:00",
+    "updated_at": "2026-07-02T22:33:57.609165+00:00"
+  },
+  {
+    "id": "dec-005",
+    "summary": "v0.6: constraints with a file/dir scope are re-injected at edit time by the scope_guard hook (PostToolUse on Edit|Write), once per constraint per session.",
+    "problem": "Session-start injection briefs the model on all rules once, at turn one, when they are abstract and compete with the task for attention. By the time the agent actually edits a file a constraint covers, the rule may be long forgotten or compacted away - the constraint existed but did not act.",
+    "why_chosen": "The scope field already existed on constraints and PostToolUse additionalContext is one of the few hook surfaces the model actually sees (con-002). Matching the edited file path against constraint scopes turns a passive memo into an active guardrail delivered at the exact moment it matters. Once-per-session dedupe (state file in .context/) keeps repeated edits from spamming context.",
+    "what_we_tried": "",
+    "tradeoffs": "Only fires for constraints whose scope is a real path substring - global constraints stay session-start-only, and overly broad scopes (e.g. 'src/') could still fire on nearly every edit once per session. Matching is substring, not glob, so precision depends on how carefully scopes are written.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "con-002",
+      "con-001"
+    ],
+    "tags": [
+      "hooks",
+      "constraints",
+      "scope",
+      "guardrails"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-03T01:14:23.381622+00:00",
+    "verified_at": "2026-07-03T01:14:23.381622+00:00",
+    "updated_at": "2026-07-03T01:14:23.381622+00:00"
+  },
+  {
+    "id": "dec-006",
+    "summary": "v0.6: record_* responses surface similar_entries (word-set Jaccard vs the store, default threshold 0.30) so duplicates and contradictions get caught at capture time, not retrieval time.",
+    "problem": "Stores accumulate restatements of the same fact as sessions re-record things they half-remember. MMR was added to mitigate the resulting redundancy at retrieval, but that treats the symptom - the store itself keeps bloating and contradictory entries can coexist unnoticed.",
+    "why_chosen": "Prevention beats mitigation: comparing the new entry against all active entries at write time reuses the existing _text_words and _jaccard code with zero new dependencies. The check is advisory (write always proceeds, warnings ride the success response) so capture is never blocked, and related_to-linked entries are exempt because the caller already acknowledged the relation. CLAUDE.md tells the agent how to resolve each case: deprecate the restatement, supersede the contradicted entry, or link genuinely distinct ones.",
+    "what_we_tried": "",
+    "tradeoffs": "Lexical Jaccard misses duplicates phrased with disjoint vocabulary (the same weakness semantic retrieval addresses for search) and cannot semantically distinguish a duplicate from a contradiction - it flags overlap and delegates judgment to the agent. Threshold 0.30 is a guess; tune via similar_threshold in config as field data accumulates.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-005"
+    ],
+    "tags": [
+      "capture",
+      "dedup",
+      "quality",
+      "retrieval"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-03T01:14:35.049052+00:00",
+    "verified_at": "2026-07-03T01:14:35.049052+00:00",
+    "updated_at": "2026-07-03T01:14:35.049052+00:00"
+  },
+  {
+    "id": "dec-007",
+    "summary": "v0.7: retrieval_hints (anticipated queries), origin field with trust-weighted scoring (user 10 / agent 5 / import 2), and since/before temporal filters on get_context.",
+    "problem": "Three retrieval gaps remained after mapping the project against the ai-memory-comparison taxonomy: vocabulary-mismatch queries only had the opt-in Ollama fix, all entries carried equal authority regardless of whether the user stated them or the agent guessed, and there was no way to ask what was decided in a time window. Same day, the eval caught store growth crowding two gold entries out of the top-5 (hit@5 80 to 66.7).",
+    "why_chosen": "All three are zero-dependency and free at runtime. retrieval_hints puts predicted search phrasings in the lexical index at capture time - the recording agent knows what the entry is about and can predict how a future session will ask; adding hints to the two crowded-out entries recovered both to rank 1 (hit@5 back to 80, MRR 0.567 to 0.700 held-out). Origin trust is a 0-10 score term so user-stated rules outrank inferred ones without reordering legacy entries (uniform agent default). since/before reuses the recency timestamp parse.",
+    "what_we_tried": "First eval run after the changes showed a 13.3 point regression that looked like the new code; stashing to old code reproduced identical numbers, proving it was store growth (five new hook/compaction entries recorded that day crowding same-vocabulary queries), not the scoring change. That diagnosis is itself the retrieval_hints use case.",
+    "tradeoffs": "Hints add a few dozen tokens per entry to storage and retrieval payloads (opt-in per entry). Origin trust is honor-system - the agent must not claim user origin for inferences (CLAUDE.md instructs this). Hints written after seeing failing queries risk teaching-to-the-test; mitigated by requiring hints to describe the entry, not quote queries.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-005",
+      "dec-006",
+      "dec-003"
+    ],
+    "tags": [
+      "retrieval",
+      "scoring",
+      "evals",
+      "capture"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-03T01:45:58.679756+00:00",
+    "verified_at": "2026-07-03T01:46:08.036730+00:00",
+    "retrieval_hints": [
+      "queries phrased differently than the entry text",
+      "search misses because of synonyms",
+      "why is my agent-guessed rule ranked above what I told it",
+      "filter decisions by date range"
+    ],
+    "origin": "agent",
+    "updated_at": "2026-07-03T01:46:08.036730+00:00"
+  },
+  {
+    "id": "dec-008",
+    "summary": "v0.8: DECISIONS.md is an opt-in derived projection, regenerated whole from decisions.json on the write path of every decision mutation - never appended to, merged, or parsed back.",
+    "problem": "Balatron proved the value of a human-readable DECISIONS.md kept in sync with the store, but the sync was manual - one hand-written mirror edit per commit, enforced only by agent discipline and a hook reminder. Manual mirroring drifts, and a post-commit or PostToolUse render trigger would regenerate AFTER the git snapshot is taken, so the committed markdown would always lag the committed JSON by one commit.",
+    "why_chosen": "Render on the write path: regenerate the entire file after the JSON write completes and before the tool returns, so markdown and JSON land on disk together and any subsequent git commit captures both atomically. Full regeneration from canonical JSON means the projection has no independent state and therefore no drift surface - hand edits are deliberately clobbered. Opt-in flag (markdown_export.enabled, default off) keeps default behavior byte-for-byte unchanged; export_markdown backfills existing repos without the flag.",
+    "what_we_tried": "Smoke-rendered Balatron's real 59-decision store: format matches the hand-maintained convention (### summary - MM-DD (dec-NNN) + Why/Tried/Tradeoff/Rejected bullets), and the render surfaced pre-existing mojibake stored inside some Balatron entries - source-data corruption from a past session, not a renderer bug, flagged for a future store cleanup.",
+    "tradeoffs": "Hand annotations in the markdown are impossible by design - anything worth keeping must live in the store (update_entry), which is the point but changes the Balatron workflow where the .md was partly hand-curated. Only decisions are projected; constraints/pipelines stay JSON-only for now. Long stored summaries make long headings - a data-quality concern, not a renderer one.",
+    "alternatives": [
+      {
+        "option": "PostToolUse or post-commit git hook trigger",
+        "reason_rejected": "Renders after the commit snapshot is taken, so the committed markdown always lags the committed JSON by one commit - reintroduces exactly the drift the projection exists to eliminate."
+      },
+      {
+        "option": "Two-way sync (parse DECISIONS.md back into the store)",
+        "reason_rejected": "Creates a second source of truth and a merge/conflict surface; a one-way regenerated projection cannot drift."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-004",
+      "con-005"
+    ],
+    "tags": [
+      "markdown-export",
+      "projection",
+      "capture",
+      "git"
+    ],
+    "retrieval_hints": [
+      "keep DECISIONS.md in sync with the store",
+      "human readable decision log generation",
+      "markdown drifts from json store",
+      "render on write vs git hook timing"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-03T10:29:48.232719+00:00",
+    "verified_at": "2026-07-03T10:29:48.232719+00:00",
+    "updated_at": "2026-07-03T10:29:48.232719+00:00"
+  },
+  {
+    "id": "dec-009",
+    "summary": "v0.9: fixed the summary-truncation loop that injected an EMPTY summary for any store over the token budget; added topic clustering to get_project_summary, OpenAI-compatible embedding backends, trust-labeled similar_entries, and a published token-reduction measurement.",
+    "problem": "The truncation loop in get_project_summary evaluated the ORIGINAL summary_text in its while-condition instead of the remaining lines, so the condition never changed and every line got popped. Any store whose summary exceeded ~2000 tokens (roughly 30+ entries) silently injected an empty summary at session start - Balatron (78 entries) and Clark (55) were getting ~0 tokens of memory briefing, defeating the tool's entire retrieval half. Nobody noticed because the failure mode is silence.",
+    "why_chosen": "Found by measurement, not inspection: the token-reduction script (built to fill a comparison-table box) showed Balatron injecting ~128 tokens for a 75k-token store, which was impossibly low. Fix recomputes the estimate from the remaining lines each iteration. Regression test locks it: an over-budget store must produce a non-empty summary within budget. The companion clustering change (group decisions by most-frequent shared tag above 8 decisions) makes the now-actually-injected large-store summary scannable.",
+    "what_we_tried": "The bug survived two full review passes of this exact function earlier in the project (the v0.5 review even edited the adjacent dangling-header cleanup and misread the loop as recomputing). Lesson: silent-failure paths need a measurement that would notice, not more careful reading - same pattern as the corrupt-store data-loss bug (dec-004) and the metric-display lessons in Balatron's store.",
+    "tradeoffs": "Truncation recomputes the join per popped line (O(n^2) in lines) - negligible at summary sizes. Clustering changes summary layout for stores above 8 decisions, which downstream parsers of the summary text (none known) would see as a format change. The published token-reduction number carries an explicit by-construction caveat since the summary is budget-capped.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-007",
+      "dec-004",
+      "con-004"
+    ],
+    "tags": [
+      "bugfix",
+      "session-start",
+      "summary",
+      "retrieval",
+      "evals"
+    ],
+    "retrieval_hints": [
+      "session start injects nothing for big projects",
+      "empty project memory at conversation start",
+      "summary missing decisions in large store",
+      "truncation loop never terminates popping all lines"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-03T17:13:46.127972+00:00",
+    "verified_at": "2026-07-03T17:13:46.127972+00:00",
+    "updated_at": "2026-07-03T17:13:46.127972+00:00"
+  },
+  {
+    "id": "dec-010",
+    "summary": "v0.10: get_context returns no_confident_match when the top entry's tag/text relevance is below min_relevance (default 0.20), instead of always handing back its top-scored entry as if it were an answer. Annotates, never suppresses.",
+    "problem": "Studying the competitor Curion surfaced a blind spot: get_context always returned its top-scored entries, and the composite score banks ~55 points from recency/status/origin regardless of whether the entry matches the query. So a query with NO relevant memory silently got a confident-looking top result. Measured: 100% confabulation on no-answer queries. The retrieval eval never caught this because there is no gold id to miss on a no-answer query.",
+    "why_chosen": "Measured before building (evals/abstention.py), exactly the discipline dec-009 established. The signal keys on _relevance_signal (tag/text overlap only, stopword-filtered), not the inflated composite, because only the overlap reflects 'does this answer the query'. Chose annotate-not-suppress (unlike Curion's hard no_memory) so the vocabulary-mismatch recall that retrieval_hints and the semantic blend work to preserve survives - a weak match is returned but flagged. Floor 0.20 is the highest with zero false-abstention on the eval set (no positive query scores below it); TNR 38%.",
+    "what_we_tried": "Swept floors 0.10-0.40. High floors (0.30+) buy TNR at 16-35% false-abstention - unacceptable, they hurt the exact vocab-mismatch queries semantic/hints exist to rescue. Confirmed the honest limit: hard-negatives sharing real topic vocabulary (compaction snapshots present, encrypted absent) score ~0.50 and a lexical signal cannot separate them from real hits - Curion's own dense-vector TNR was 0% on the same class, so this is a field-wide hard problem, not a context-keeper defect.",
+    "tradeoffs": "Lexical abstention only catches queries with little shared vocabulary; hard-negatives still confabulate (documented honestly). The relevance signal uses a small hardcoded stopword set - language-specific, English-only. min_relevance is one global number; a store with unusually terse entries might need tuning.",
+    "alternatives": [
+      {
+        "option": "Hard suppression (return no_memory like Curion)",
+        "reason_rejected": "Would false-abstain on vocab-mismatch real queries - the ones retrieval_hints and semantic retrieval are specifically built to rescue. Annotation preserves recall while still killing false confidence."
+      },
+      {
+        "option": "Key abstention on the composite score threshold",
+        "reason_rejected": "The composite is inflated ~55pts by recency/status/origin, so it cannot separate 'relevant' from 'merely present, recent, and active' - the exact bug."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-007",
+      "dec-009"
+    ],
+    "tags": [
+      "retrieval",
+      "abstention",
+      "quality",
+      "evals",
+      "curion"
+    ],
+    "retrieval_hints": [
+      "memory tool confabulates when nothing is stored",
+      "return nothing when no relevant memory",
+      "false confident answer on unknown topic",
+      "how to know when get_context has no real match"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-03T18:25:37.065975+00:00",
+    "verified_at": "2026-07-03T18:25:37.065975+00:00",
+    "updated_at": "2026-07-03T18:25:37.065975+00:00"
+  },
+  {
+    "id": "dec-011",
+    "summary": "v0.10: record_decision accepts supersedes=[ids] to mark prior decisions 'superseded' - demoted in ranking but still recallable - as a distinct lifecycle state from deprecated (removed from retrieval entirely).",
+    "problem": "Deprecating a decision (deprecate_entry) removes it from retrieval completely, which is wrong for the common case where a decision was correct at the time and got replaced by a newer one. The history ('why did we change from X to Y') is exactly what a future session needs, but there was no way to keep an old decision recallable-but-demoted - only active (full weight) or deprecated (gone).",
+    "why_chosen": "Adapted from Curion's 'current-vs-previous truth, demote don't delete' but implemented dependency-free by reusing infrastructure already present: score_entry already demoted status=='superseded' (+5 vs +20 for active), and get_context already filtered only 'deprecated', so superseded entries already flowed through and ranked low. The only missing piece was that nothing ever SET the status. supersedes marks the referenced decisions in the SAME atomic write as the new one, so the store is never momentarily inconsistent. Superseded entries are skipped by prune_stale/verify_quality (intentional history, not stale work) and marked **SUPERSEDED by dec-NNN** in DECISIONS.md.",
+    "what_we_tried": "Considered making deprecate_entry take a demote flag, but keeping supersedes on record_decision matches the natural moment (you're recording the replacement) and keeps deprecate's meaning clean (gone means gone). Unknown or already-deprecated ids in supersedes are skipped silently so a bad id never fails the record.",
+    "tradeoffs": "supersedes only targets decisions (dec-*), not constraints/pipelines. The schema field cost ~30 tokens against the 2500 tools/list budget (con-004), forcing trims of three verbose descriptions to fit at 2493 - a real, if small, per-session tax on every client for a feature used occasionally.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-007",
+      "con-004",
+      "dec-010"
+    ],
+    "tags": [
+      "lifecycle",
+      "supersession",
+      "ranking",
+      "curion"
+    ],
+    "retrieval_hints": [
+      "keep old decision recallable after replacing it",
+      "demote superseded decision instead of deleting",
+      "history of why we changed a decision",
+      "superseded vs deprecated difference"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-03T18:25:53.325390+00:00",
+    "verified_at": "2026-07-03T18:25:53.325390+00:00",
+    "updated_at": "2026-07-03T18:25:53.325390+00:00"
+  },
+  {
+    "id": "dec-012",
+    "summary": "Dual-write mirror for context-keeper, local store canonical",
+    "problem": "Context-keeper memory only lived on the desktop that recorded it. A second device (e.g. a phone) could neither see desktop-recorded decisions nor contribute its own, so memory recorded away from the desk was lost. We needed two-way sync without giving up the local JSON store's simplicity, offline-first behavior, or zero-dependency guarantee.",
+    "why_chosen": "Dual-write mirror with the LOCAL store as single source of truth. Transport is the context-keeper-remote Cloudflare Worker's stateless JSON-RPC MCP endpoint (POST /mcp/<token>): mirror-out calls its import_entries tool (preserves ids, SKIPS existing ones = additive), pull calls query_entries and merges additively. Local-canonical keeps the offline path unchanged and avoids conflict resolution \u2014 the remote is a sync surface, never the authority. Push is fire-and-forget with a local queue fallback so the network can never affect a local write. stdlib urllib only; the auth token is the final URL path segment so there is no secret in code and no auth header.",
+    "what_we_tried": "First implemented against an assumed REST contract (POST /import, GET /entries) with a bearer token; on reading the actual remote source it was JSON-RPC MCP over one /mcp/<token> URL, token-in-path, one 'kind' per import call \u2014 rewrote mirror.py to that. Also initially chose Option A (origin-namespaced ids, dec-r001); switched to Option B (random suffix) on direction, because the remote mints bare sequential ids from its own nextId and won't emit a namespace tag, so a namespace scheme needs remote cooperation it can't give.",
+    "tradeoffs": "Because import_entries skips existing ids, edits/deprecations to an entry the remote ALREADY has do NOT propagate (additive-only): edits only reach the remote if made before the entry's first sync, since the offline queue dedupes to the latest state. Cross-device deprecation therefore doesn't hide an entry on other devices. Accepted as the meaning of 'additive-only' and the semantics of the chosen import tool. No real-time sync \u2014 pull runs at session start and on demand; watermark filtering is client-side since query_entries has no 'since'.",
+    "alternatives": [
+      {
+        "option": "Remote store canonical",
+        "reason_rejected": "Breaks offline-first; adds a network dependency to every retrieval"
+      },
+      {
+        "option": "Option A: origin-namespaced ids (dec-r001)",
+        "reason_rejected": "Requires the remote to mint ids in a cooperating namespace; the Worker's nextId emits bare dec-NNN, so namespaces can't stay disjoint"
+      },
+      {
+        "option": "Propagate edits via remote update/deprecate tools",
+        "reason_rejected": "Would make the mirror destructive on the remote; con-006 requires additive-only, and the user directed import_entries (skip-existing) for mirror-out"
+      }
+    ],
+    "constraints_created": [
+      "Mirror must fail soft (never block local), be additive only on remote, and contain no secrets in code"
+    ],
+    "related_to": [
+      "con-006"
+    ],
+    "tags": [
+      "mirror",
+      "architecture",
+      "sync",
+      "remote",
+      "mcp",
+      "json-rpc"
+    ],
+    "retrieval_hints": [
+      "two-way mirror local remote",
+      "phone mobile sync context keeper",
+      "dual write push pull entries",
+      "how does mirroring work"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-10T11:10:57.087309+00:00",
+    "verified_at": "2026-07-10T11:22:52.625035+00:00",
+    "updated_at": "2026-08-01T11:55:21.459392+00:00"
+  },
+  {
+    "id": "dec-013-4eb5",
+    "summary": "Mirror propagates edits/deprecations both ways via a remote upsert_entries tool + timestamp-based (newest-wins) merge, replacing the old additive-only sync.",
+    "problem": "The mirror pushed with import_entries and pulled additively, both of which SKIP any id that already exists. So an update or deprecation on one store never reached the other: the mirrored store kept showing the entry as active/old \u2014 confidently wrong. This defeats the purpose of a two-way mirror once an entry's lifecycle (edit, deprecate, supersede) matters, not just its creation.",
+    "why_chosen": "Last-writer-wins keyed on updated_at is the minimum mechanism that lets a lifecycle change cross the mirror without a central lock or clock. A new remote upsert_entries tool (same input shape as import_entries) inserts new ids and replaces an existing id only when the incoming updated_at is strictly newer, else skips; it never deletes, so deprecation rides across naturally as a status change. pull_remote mirrors the same rule locally: a newer remote row replaces the local copy, a newer local copy is kept and pushes back on its next write. To keep the data-loss guarantee that the old additive rule provided by refusing to overwrite, an overwrite whose loser differed in substance (not just timestamps) is appended to .context/.mirror_conflicts.json \u2014 the information is preserved even though last-writer-wins already resolved the winner.",
+    "what_we_tried": "The prior design (dec-012) was deliberately additive-only on both legs (import_entries skip-existing + id-guarded additive pull) to guarantee the remote could never clobber local integrity. That held for create-only workflows but froze every post-creation edit/deprecation out of the mirror. Rather than add a delete or a bespoke deprecate-sync RPC, upsert generalizes import: identical wire shape, one extra timestamp comparison, and deprecation is just a status field that upsert carries.",
+    "tradeoffs": "Introduces clock-skew sensitivity: last-writer-wins trusts wall-clock updated_at, so a badly-skewed device could win incorrectly. Accepted because both stores are the same user's devices and the conflict log preserves any overwritten substance for manual recovery. Also required making updated_at authoritative from the remote COLUMN (not the payload copy, which a remote-side update leaves stale) and stamping updated_at on record (only update/deprecate did before).",
+    "alternatives": [
+      {
+        "option": "Keep additive-only, add a separate deprecate-sync RPC",
+        "reason_rejected": "Only covers deprecation, not edits/supersession; more surface area than generalizing import into upsert."
+      },
+      {
+        "option": "Full CRDT / vector clocks",
+        "reason_rejected": "Massive complexity for a single-user two-device mirror; wall-clock last-writer-wins plus a conflict log is proportionate."
+      },
+      {
+        "option": "Let the remote delete on deprecation",
+        "reason_rejected": "Deletion is irreversible and breaks 'why did we change from X' history; status-change + newest-wins keeps history recallable."
+      }
+    ],
+    "constraints_created": [
+      "Mirror overwrite is timestamp-based newest-wins; the losing version of any substantive overwrite is preserved to .context/.mirror_conflicts.json (never silently lost)"
+    ],
+    "related_to": [
+      "dec-012",
+      "con-006",
+      "con-004"
+    ],
+    "tags": [
+      "mirror",
+      "sync",
+      "upsert",
+      "architecture",
+      "reliability"
+    ],
+    "retrieval_hints": [
+      "deprecation not propagating to remote mirror",
+      "edit update mirror stale active status",
+      "upsert_entries last writer wins updated_at",
+      "mirror conflict log .mirror_conflicts.json",
+      "timestamp merge newest wins two-way mirror"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-10T13:12:54.960327+00:00",
+    "verified_at": "2026-07-10T13:12:54.960327+00:00",
+    "updated_at": "2026-08-01T11:55:21.459392+00:00"
+  },
+  {
+    "id": "dec-014",
+    "summary": "Bought back tools/list schema budget: retired 3 record_* aliases, folded mirror tools into mirror(op=...), trimmed descriptions.",
+    "problem": "The tools/list schema payload hit ~4347/4350 tokens - effectively full - so every MCP client paid the full per-session token tax and no new field/tool could be added without raising the cap.",
+    "why_chosen": "Removing record_decision/record_pipeline/record_constraint from TOOLS (keeping their handlers in HANDLERS as hidden back-compat) is safe because dispatch routes via HANDLERS, tests call handlers directly, and no hook/command/config invokes the aliases by MCP name - only CLAUDE.md prose, which was updated to record_entry. Folding pull_remote+backfill_remote into one mirror(op=pull|backfill) tool cut two schemas to one. Net: 4347 -> 2927 tokens (1423 headroom).",
+    "what_we_tried": "The deprecation window deliberately kept both record_entry and the three aliases live (budget raised to 4000 then 4350 in the test comment); this change ends that window now that no caller depends on the alias names.",
+    "tradeoffs": "CLI/scripted callers of the alias names and pull_remote/backfill_remote still work (handlers retained) but are no longer discoverable via tools/list.",
+    "alternatives": [],
+    "constraints_created": [
+      "tools/list budget test tightened from 4350 to 3150 to lock in reclaimed headroom"
+    ],
+    "related_to": [],
+    "tags": [
+      "schema",
+      "budget",
+      "mirror",
+      "tools",
+      "consolidation"
+    ],
+    "retrieval_hints": [
+      "tools/list too big",
+      "schema token budget",
+      "retire record_decision alias",
+      "mirror op pull backfill",
+      "reduce MCP tool count"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-10T13:47:33.975723+00:00",
+    "updated_at": "2026-07-10T13:47:33.975723+00:00",
+    "verified_at": "2026-07-10T13:47:33.975723+00:00"
+  },
+  {
+    "id": "dec-015-5701",
+    "summary": "Project resolution is now per-call in _base_dir_from_params (env > shared Xylem session pointer > cwd/.context discovery) instead of the static import-time CONTEXT_DIR, so a persistent server follows whichever project the session is in.",
+    "problem": "context-keeper resolved its project once at module import (PROJECT_DIR/CONTEXT_DIR constants), so when the MCP server is launched from a parent dir and pinned via CONTEXT_KEEPER_PROJECT, every default (no project_dir param) call \u2014 including the SessionStart summary hook \u2014 targeted that one frozen project regardless of which project the session was actually in. Part of the Xylem-stack audit fix 1b.",
+    "why_chosen": "Nearly every handler already routes the default project through _base_dir_from_params, so making just that function (and _resolve_project_dir) resolve per call flows to all of them with minimal blast radius. The new source is a shared pointer file (~/.xylem/active_project.json) the Xylem SessionStart hook writes, honored like CONTEXT_KEEPER_PROJECT (an explicit opt-in, trusted even before .context exists) and slotted between env and cwd discovery. cwd discovery still only resolves to a dir that already has .context, so the never-pollute-a-parent guarantee is untouched.",
+    "what_we_tried": "",
+    "tradeoffs": "A few direct CONTEXT_DIR uses (makedirs fallback, _resolve_paths no-arg) still reflect the import-time value; the main handler path is dynamic. The unresolved-project test had to also neutralize _resolve_project_dir, since per-call resolution now finds the repo's own .context from cwd.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "context-keeper",
+      "resolution",
+      "xylem",
+      "session",
+      "per-call"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T14:31:19.958929+00:00",
+    "updated_at": "2026-07-21T14:31:19.958929+00:00",
+    "verified_at": "2026-07-21T14:31:19.958929+00:00"
+  },
+  {
+    "id": "dec-016-1bf6",
+    "summary": "Entry staleness is verified against the artifact the entry describes (commits on its scope path since verified_at), not against wall-clock age. verify_quality gains code_drift, orphaned_scope and unused; prune_stale's date check stays as the weaker complement.",
+    "problem": "prune_stale flags entries unverified for more than stale_threshold_days. That measures how long since someone looked, which does not decide whether an entry is still true. A decision about code nobody has touched in a year is fine; a decision about a function rewritten yesterday is already wrong, and by wall-clock it looks fresher. The store therefore had no way to notice its own rot, and separately no way to notice entries carried into every session that nobody ever actually wanted.",
+    "why_chosen": "An entry's health is a property of the thing it describes, so the check should read that thing. scope already names a file or directory on most entries, and git already records every change to it, so the signal was available and unused: no new dependency, no new user obligation, and it degrades to the previous behaviour wherever there is no work tree. It also composes with the existing similar-entry contradiction detection - that catches two live entries disagreeing with each other, this catches one entry disagreeing with the code it describes.",
+    "what_we_tried": "The pre-existing answer was prune_stale plus a 30-day threshold, and it demonstrably missed the case that mattered: cambium's k-571a3346 warned agents about an agentsync check_conflicts result that had already been fixed to stop being produced. It was the most-recalled item in the org store (9 recalls) and nothing flagged it, because by date it looked healthy.",
+    "tradeoffs": "Drift is a proxy, not proof: a commit touching a scoped file does not necessarily invalidate the entry, so this raises advisory flags and will produce false positives on busy paths. Usage counts are a weaker proxy still - an entry can be read and acted on without ever being queried again - which is why neither signal ever auto-deletes. Cost is one git log per verify_quality call, bounded by MAX_COMMITS.",
+    "alternatives": [
+      {
+        "option": "Per-entry git log",
+        "reason_rejected": "One subprocess spawn per scoped entry; a store with 40 scoped entries pays 40 spawns per scan. A single log for the whole store, bucketed by path, gives the same answer for one spawn."
+      },
+      {
+        "option": "Content hash of the scoped file compared at verify time",
+        "reason_rejected": "Detects that the file changed but cannot say what or when, so the flag carries no actionable detail. git log yields the commit subject, which tells the reader whether the change plausibly affects the entry."
+      },
+      {
+        "option": "Auto-deprecate entries whose scope drifted",
+        "reason_rejected": "Drift is a proxy for wrongness, not wrongness itself. Auto-deleting on a proxy destroys correct entries on busy files and makes the store untrustworthy in the direction that matters most."
+      },
+      {
+        "option": "Auto-record decisions from commit messages",
+        "reason_rejected": "Fills the store with restated commit messages. An entry nobody chose is an entry nobody trusts, so the hook proposes and the agent decides."
+      }
+    ],
+    "constraints_created": [
+      "verify_quality must distinguish 'could not check for drift' from 'no drift found'. drift_checked:false means there was no git work tree and must never be presented as a clean bill of health.",
+      "Set a real file or directory scope on any entry whose subject lives in the repo. A 'global' scope has nothing to compare against and silently opts the entry out of drift checking."
+    ],
+    "related_to": [],
+    "tags": [
+      "staleness",
+      "verification",
+      "retrieval",
+      "quality",
+      "git",
+      "architecture"
+    ],
+    "retrieval_hints": [
+      "entry was stale but looked fresh",
+      "how do we know a decision is still true",
+      "code changed under a recorded decision",
+      "which entries does nobody actually use",
+      "why is prune_stale not enough"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-25T20:18:46.983276+00:00",
+    "updated_at": "2026-07-25T20:18:46.983276+00:00",
+    "verified_at": "2026-07-25T20:18:46.983276+00:00"
+  },
+  {
+    "id": "dec-017-1a52",
+    "summary": "Migrated to MCP protocol revision 2026-07-28 by HAND, stdlib only, as a DUAL-ERA server answering both modern (per-request _meta) and legacy (initialize handshake) clients. mirror.py was also upgraded to send modern client metadata ahead of the remote's migration.",
+    "problem": "Revision 2026-07-28 removes the initialize/initialized handshake, makes server/discover mandatory, and requires resultType plus ttlMs/cacheScope on cacheable results. The obvious migration is to adopt the official mcp SDK, which is what the other Python servers in this suite did. That is not available here: zero dependencies is an advertised property of this project and the .mcpb Claude Desktop bundle installs with no pip step, so a dependency would break that install path outright.",
+    "why_chosen": "Hand-written so pyproject dependencies stays empty and the Desktop bundle keeps working. Dual-era rather than modern-only because the bundle ships to Claude Desktop installs we do not control, and per the spec legacy clients have no fall-forward mechanism: a modern-only server would strand anyone on an older Desktop build with no diagnostic path. Era detection keys on presence of io.modelcontextprotocol/protocolVersion in params._meta, since modern clients send it on every request and legacy clients never do. Legacy responses are byte-identical to pre-migration, asserted by test, so no modern field leaks into an old client's view.",
+    "what_we_tried": "Verified the mirror round-trips against the LIVE deployed Worker both before and after making it a modern client, using a read-only query_entries call rather than a write. Confirmed the legacy Worker ignores the added _meta and headers, which is what makes the ordering safe.",
+    "tradeoffs": "Hand-rolling means this project owns its own protocol conformance forever, with no SDK to inherit fixes from; the twelve conformance tests are therefore load-bearing rather than belt-and-braces. Dual-era also means carrying the legacy branch until Desktop installs age out.",
+    "alternatives": [
+      {
+        "option": "Adopt the official mcp SDK like the other Python servers",
+        "reason_rejected": "Breaks the advertised zero-dependency property and, concretely, the .mcpb Desktop bundle, which has no pip step in its install path."
+      },
+      {
+        "option": "Modern-only, drop the initialize handshake entirely",
+        "reason_rejected": "The bundle ships to Desktop installs we do not control. Legacy clients cannot fall forward, so they would break with no recourse."
+      },
+      {
+        "option": "Leave mirror.py alone until the remote is migrated",
+        "reason_rejected": "A migrated Worker MUST reject a POST with no MCP-Protocol-Version header, so the mirror would break in the window between the two deploys. The added metadata is additive and ignored by the current legacy Worker, so sending it early makes the deploy order irrelevant."
+      }
+    ],
+    "constraints_created": [
+      "mirror.MCP_PROTOCOL_VERSION and server.PROTOCOL_VERSION must stay equal; a drift means the mirror declares a revision this server does not implement. Guarded by tests/test_mcp_protocol.py::test_mirror_speaks_the_same_revision_as_the_server."
+    ],
+    "related_to": [],
+    "tags": [
+      "mcp",
+      "protocol-migration",
+      "2026-07-28",
+      "dual-era",
+      "mirror",
+      "zero-dependency"
+    ],
+    "retrieval_hints": [
+      "why is context-keeper not on the mcp SDK",
+      "why does the server still answer initialize",
+      "what breaks the mcpb Desktop bundle",
+      "why does mirror.py send MCP-Protocol-Version headers"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-31T17:10:47.451915+00:00",
+    "updated_at": "2026-07-31T17:10:47.451915+00:00",
+    "verified_at": "2026-07-31T17:10:47.451915+00:00",
+    "verified_sha": "25857be93e5fd1803b5386cfc62974394e7f5f3b"
+  },
+  {
+    "id": "dec-018-c8aa",
+    "summary": "v0.16: scoped constraints project into Claude Code's own .claude/rules/*.md with paths: frontmatter (opt-in rules_export), regenerated whole on every constraint write.",
+    "problem": "A scoped constraint only became visible through context-keeper's own hooks, and the earliest of those (scope_guard on PostToolUse) fired AFTER the edit had already been written. Claude Code has a native surface that fires earlier and needs no hook at all: a .claude/rules/*.md file carrying `paths:` frontmatter is loaded by the harness when Claude READS a matching file. context-keeper was storing exactly the data that surface consumes (a rule, a reason, a scope path) and not emitting it.",
+    "why_chosen": "Reusing the dec-008 DECISIONS.md projection contract meant no new architecture: JSON stays canonical, the markdown is derived, regenerated whole on the write path, and never parsed back in - a regenerated projection has no drift surface. Writing into the harness's own rules format rather than inventing another injection channel means the delivery is the harness's job, not a hook's, so it works with zero hook wiring and survives hook API changes. Two safety properties made it acceptable to point a generator at a directory inside the user's repo: it owns a SUBDIRECTORY (.claude/rules/context-keeper/) rather than .claude/rules/ itself, and it will only delete files carrying its own generated marker, so a deprecated constraint's file is reaped while a hand-written rule in the same folder is untouched. The marker is a block-level HTML comment, which Claude Code strips before the file enters context - so it identifies the file to both the tool and a human at zero token cost.",
+    "what_we_tried": "The prior answer to \"get the rule in front of the agent at the right moment\" was scope_guard (dec-005, v0.6), a PostToolUse hook. It works, but PostToolUse fires after the write lands, so the constraint arrives as a review note. constraint_reinject (v0.11) attacked the same decay problem from the other end - re-injecting the whole constraints block every N tool calls - which is broader and later than needed. Neither could deliver a rule before the model acted.",
+    "tradeoffs": "Claude Code specific: no other MCP client reads .claude/rules/. That is the same bet the six hooks already make, and the projection is opt-in and inert when off. A second generated artifact in the user's repo is a second thing to gitignore or commit. A scope containing glob metacharacters ([ ] { } * ?) cannot be expressed safely - Claude Code reads [ as a bracket expression and an unparseable pattern matches nothing - so those scopes are skipped and REPORTED in skipped_scopes, because a rule file that silently never fires looks like coverage and is worse than no file.",
+    "alternatives": [
+      {
+        "option": "Add export_rules to tools/list alongside export_markdown",
+        "reason_rejected": "con-004 caps the tools/list payload every connected client pays at session start; measured headroom was 195 tokens. export_rules is a one-time backfill and render-on-write covers the ongoing case, so it lives in HANDLERS (CLI-reachable) and out of TOOLS - the same hidden-handler pattern the retired record_* aliases use. Schema cost stayed at 2955."
+      },
+      {
+        "option": "Write into .claude/rules/ directly instead of a subdirectory",
+        "reason_rejected": "Regeneration has to retire the files of deprecated constraints. Reaping in a directory the user also hand-authors in means a generator deciding which of the user's files to delete. Owning a subdirectory makes that decision trivially safe."
+      },
+      {
+        "option": "Emit one rules file for all scopes",
+        "reason_rejected": "Each file carries exactly one paths: frontmatter block. One file per scope is what makes each rule load only for the code it governs; a combined file would have to match every scope at once and would load unconditionally."
+      },
+      {
+        "option": "Project global-scope constraints too",
+        "reason_rejected": "A global constraint has no path to trigger on, so it would need a match-everything pattern and would load on every read - duplicating the session-start injection at permanent token cost."
+      }
+    ],
+    "constraints_created": [
+      "A generated rules file may only be deleted if it carries the context-keeper:generated marker",
+      "A constraint scope must be a literal path, never a glob"
+    ],
+    "related_to": [
+      "dec-005",
+      "dec-008",
+      "con-004",
+      "con-002"
+    ],
+    "tags": [
+      "hooks",
+      "claude-code",
+      "context-injection",
+      "projection",
+      "constraints"
+    ],
+    "retrieval_hints": [
+      "why doesn't my scoped constraint fire before the edit",
+      "claude rules paths frontmatter generation",
+      "export_rules missing from tools list",
+      "scope with a glob doesn't produce a rule file",
+      "how do constraints reach the model before a write"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-01T03:10:39.826018+00:00",
+    "updated_at": "2026-08-01T03:10:39.826018+00:00",
+    "verified_at": "2026-08-01T03:10:39.826018+00:00",
+    "verified_sha": "25857be93e5fd1803b5386cfc62974394e7f5f3b"
+  },
+  {
+    "id": "dec-019-9c32",
+    "summary": "v0.16: scope_guard moves to PreToolUse (one script serves either wiring, defaulting to PostToolUse), and the session-start summary's truncation gets a floor at the constraints block plus explicit reporting.",
+    "problem": "Two silent-failure holes. (1) scope_guard fired on PostToolUse, so a scoped constraint reached the model only after the edit had been written - a review note, not a guardrail, while the hook's own docstring claimed it delivered the rule \"at the exact moment it is about to matter\". (2) The summary truncation loop pops lines from the end until the token budget is met, with no lower bound: a small enough budget walks up through the decisions and into the constraints block and empties the summary, which is dec-009's failure (a healthy-looking store injecting nothing) reachable by a different route.",
+    "why_chosen": "PreToolUse additionalContext is injected next to the tool result - verified against the hooks reference before building on it, precisely because con-002 exists to record what happens when you assume a hook surface reaches the model and it doesn't. Reading hook_event_name from the payload and echoing it back means ONE script serves PreToolUse, PostToolUse, or both wired at once during an upgrade, and an absent field defaults to PostToolUse so every existing installation keeps working with no config change. For truncation, the floor keeps the constraints block - the part a session genuinely cannot function without - and the response now carries summary_truncated / summary_lines_dropped / summary_truncation_note. Those keys are emitted ONLY when truncation happened, so the untruncated common case stays byte-identical and dec-012's cache-stable prefix is preserved. The principle is borrowed from Claude Code's own auto-memory index, which errors when it exceeds its read limit rather than silently dropping the tail: an over-budget summary is a condition to surface, not to absorb.",
+    "what_we_tried": "The dec-009 fix corrected the truncation loop's condition (it had been re-measuring the original text, so it popped every line). That fixed the bug but left the loop unbounded, so the same empty-summary outcome remained reachable whenever the constraints block alone exceeded the budget. Fixing a loop's condition is not the same as giving it a floor.",
+    "tradeoffs": "PreToolUse output is evaluated before the tool runs, so a slow or crashing hook now delays the edit rather than trailing it; the hook stays defensive and returns silently on any malformed input. The opt-in confirm_absolute escalation (permissionDecision \"ask\") triggers on SCOPE, not on an actual violation - nothing reads the diff - so it is documented as a speed bump and defaults to off rather than pretending to be violation detection.",
+    "alternatives": [
+      {
+        "option": "Have PreToolUse deny an edit that violates an absolute constraint",
+        "reason_rejected": "context-keeper cannot tell whether a diff violates a prose rule. A denial keyed on scope alone would block every edit to a governed file, which is wrong; a denial claiming to detect violations would be a lie in the one place the tool promises enforcement. Escalating to 'ask' is the honest ceiling and it is opt-in."
+      },
+      {
+        "option": "Ship a separate pre_scope_guard.py and leave scope_guard.py alone",
+        "reason_rejected": "Two near-identical scripts drift, and the once-per-session dedupe state would have to be shared between them or the rule would inject twice. One script that reads its own event has neither problem."
+      },
+      {
+        "option": "Raise the default token_budget instead of adding a truncation floor",
+        "reason_rejected": "Treats the symptom. Any budget can be exceeded by a large enough store, and the failure mode - silently injecting nothing - is what needed fixing, not the specific threshold at which it triggered."
+      }
+    ],
+    "constraints_created": [
+      "Verify a hook surface is model-visible against the hooks reference before building on it (con-002, widened)"
+    ],
+    "related_to": [
+      "dec-005",
+      "dec-009",
+      "dec-012",
+      "dec-018-c8aa",
+      "con-002"
+    ],
+    "tags": [
+      "hooks",
+      "claude-code",
+      "context-injection",
+      "constraints",
+      "retrieval"
+    ],
+    "retrieval_hints": [
+      "scope_guard fires after the edit instead of before",
+      "PreToolUse additionalContext is it injected",
+      "empty project summary at session start",
+      "summary silently truncated token budget",
+      "permissionDecision ask on absolute constraint"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-01T03:11:04.853978+00:00",
+    "updated_at": "2026-08-01T03:11:04.853978+00:00",
+    "verified_at": "2026-08-01T03:11:04.853978+00:00",
+    "verified_sha": "25857be93e5fd1803b5386cfc62974394e7f5f3b"
+  },
+  {
+    "id": "dec-020-9b22",
+    "summary": "Mojibake is now a first-class quality issue: verify_quality flags it and a hidden repair_mojibake handler fixes it, verified as an exact inverse. Healed 160 entries / 413 fields across 8 project stores.",
+    "problem": "con-008-dc30 fixed the CAUSE of mojibake in v0.11 by forcing UTF-8 on the stdio transport, so no new entry gets corrupted. It did nothing about entries already written, and nothing ever checked. 160 entries across 8 of this machine's project stores still carried cp1252-misdecoded UTF-8 - balatron alone had 76. The damage is invisible in the worst way: the text stays legible enough that nobody re-reads the entry, so a corrupted rationale silently degrades every retrieval that surfaces it, forever.",
+    "why_chosen": "A fix that stops the bleeding and leaves the wound is half a fix, and the missing half is the half the user actually reads. Detection belongs in verify_quality because that is where the store already reports its own damage (thin_reason, code_drift, unused) - a one-off script would have found it once and never again. The repair is the exact inverse of the corruption, so it is VERIFIED as one: re-applying the corruption to the candidate must reproduce the input byte for byte, and anything failing that check is left untouched. That matters because a partial or approximate repair of recorded reasoning is worse than legible damage - it looks fixed, so nobody looks again. A marker pre-filter gates the transform so innocent text that merely survives an encode/decode round trip is never 'repaired'. verified_at is deliberately NOT refreshed: an encoding fix is not a claim anyone re-confirmed the entry is true, and resetting the staleness clock would erase the exact signal prune_stale and the drift check exist to raise. updated_at IS bumped so the corrected copy wins the mirror's newest-wins merge instead of being overwritten by a corrupt remote.",
+    "what_we_tried": "The damage was first spotted by eye, in a rules-projection file that the projection itself injected mid-session - con-006's reason rendered with a visible 'a-hat-euro' sequence. An ad-hoc scan confirmed 11 fields in context-keeper's own store; only when the same scan was run across every .context/ on the machine did the real figure (160 entries, 413 fields, 8 projects) appear. Scanning one store would have produced a fix that looked complete and left 155 entries corrupt.",
+    "tradeoffs": "The repair rewrites stored prose, which is why it is dry-run by default and was preceded by a full backup of all 21 stores. Because the mirror is configured, applying pushed 160 corrected entries to the remote; the replaced remote copies were preserved to .mirror_conflicts.json (226 records) per con-006, so nothing was silently lost. repair_mojibake is deliberately absent from tools/list per con-004 - it is a one-time migration, and the ongoing surface is the verify_quality flag, which costs nothing.",
+    "alternatives": [
+      {
+        "option": "Repair the JSON by hand for the five context-keeper entries",
+        "reason_rejected": "Would have fixed 5 of 160 and left the other seven projects corrupt, with no way to notice. The scan across every store is what turned a cosmetic annoyance into a real migration."
+      },
+      {
+        "option": "Use update_entry so the writes go through the normal validated path",
+        "reason_rejected": "update_entry refreshes verified_at, which would falsely assert that every one of the 160 entries had just been re-confirmed as accurate. It also enforces min-lengths, which a pure encoding fix has no business tripping."
+      },
+      {
+        "option": "Expose repair_mojibake as an MCP tool",
+        "reason_rejected": "con-004 caps the tools/list payload every client pays at session start (195 tokens of headroom). A one-time migration does not deserve a permanent per-session tax; the CLI reaches it and verify_quality points at it."
+      },
+      {
+        "option": "Repair on read, transparently, whenever a garbled entry is retrieved",
+        "reason_rejected": "Hides the damage instead of fixing it, leaves the on-disk store corrupt, and would silently mutate text on a read path where a bug is much harder to notice."
+      }
+    ],
+    "constraints_created": [
+      "A data repair must be verified as an exact inverse of the corruption, never approximated",
+      "An encoding repair must not refresh verified_at"
+    ],
+    "related_to": [
+      "con-008-dc30",
+      "con-006",
+      "con-004",
+      "dec-016-1bf6",
+      "dec-018-c8aa"
+    ],
+    "tags": [
+      "data-integrity",
+      "quality",
+      "encoding",
+      "mirror"
+    ],
+    "retrieval_hints": [
+      "garbled em-dash in stored entries",
+      "a-hat-euro characters in decisions.json",
+      "how to fix mojibake in the store",
+      "verify_quality mojibake flag",
+      "cp1252 corruption of old entries"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-01T11:58:15.137453+00:00",
+    "updated_at": "2026-08-01T11:58:15.137453+00:00",
+    "verified_at": "2026-08-01T11:58:15.137453+00:00",
+    "verified_sha": "7748edc14ba3a440386d9e120c2206de501f9836"
+  },
+  {
+    "id": "dec-021-b607",
+    "summary": "v0.17: truncated entries leave a discoverable id trail inside the budget, global scope becomes a flagged quality issue when a path can be named, subagents get the constraints block via SubagentStart, and a release can no longer half-fail in silence.",
+    "problem": "Measuring real stores after v0.16 found two problems that multiply. Truncation made entries UNDISCOVERABLE, not merely unsummarised: the SessionStart hook prints the summary text and nothing else, so an id that fell off the end could not be asked for - balatron was losing 116 lines every session with no trace. Separately, 35 of 75 active constraints (47%) were scoped `global`, which excludes a rule from the drift check, the .claude/rules/ projection AND scope_guard at once, leaving that same truncating summary as its only delivery route. Every path-based mechanism built in v0.16 therefore routed around half the rules, and the half it routed around was competing for space in a block that was evicting itself. Two further gaps: subagents never received any project memory, and v0.16.0 published to PyPI and the registry while its desktop bundle silently failed to build.",
+    "why_chosen": "The id trail is paid for INSIDE the token budget rather than appended past it, because \"fits the budget\" quietly stops being true otherwise - bare ids cost a fraction of the entries they stand for, so the trade is cheap and honest. It is emitted in stable store order and deliberately NOT ranked against the working tree: dec-012's cache-stable prefix requires byte-identical text across sessions, and relevance ranking belongs in the volatile work-focus block appended after. The global_scope flag only fires when a concrete path can be named from the entry's own enforced_by or a tag matching a real directory, because a bare \"consider adding a scope\" on every global constraint is noise a reader learns to skip, and some rules genuinely are global. The subagent hook injects constraints ONLY and caps them: it fires once per spawned agent so a fan-out multiplies it, and rules are what a focused subagent cannot afford to miss and cannot infer. Moving constraint rendering into store_paths let that hook and constraint_reinject (matcher \"\", so it runs after EVERY tool call) drop the server import and land within ~5ms of Python's startup floor, while keeping exactly one implementation of the formatter.",
+    "what_we_tried": "The first instinct was to rank which entries survive truncation by relevance to the working tree, since work_focus already computes that signal. That directly contradicts dec-012: reordering the summary body by working-tree state changes the text every time a different file is touched, busting the session-start prompt cache every session. The existing design had already resolved that tension by appending the volatile focus block last, so the fix had to preserve discoverability without touching the stable prefix - hence a deterministic id list rather than a re-ranking. A second miss was caught by its own test: reporting only `summary_truncated` left the worst case silent, because when the constraints floor alone exceeds budget nothing is dropped, so the flag stayed False while the summary overspent every session forever. That needed a separate summary_over_budget signal.",
+    "tradeoffs": "The id trail spends budget that would otherwise hold entry summaries, so a truncated store shows slightly fewer full entries in exchange for knowing what it is missing. The global_scope flag is deliberately incomplete: an unflagged global constraint is not necessarily fine, just not obviously fixable, which is stated in CLAUDE.md so a missing flag is not read as a clean bill of health. The subagent hook adds a process spawn per subagent, measured at ~60ms against a ~56ms floor.",
+    "alternatives": [
+      {
+        "option": "Rank surviving entries by relevance to the working tree",
+        "reason_rejected": "Contradicts dec-012's cache-stable prefix - the summary would change every time a different file was touched, invalidating the session-start prompt cache on every session. The volatile work-focus block appended last is where relevance belongs."
+      },
+      {
+        "option": "Append the id trail outside the token budget, like the work-focus block",
+        "reason_rejected": "There is an existing tested guarantee that the summary fits its budget. Quietly exempting a new section would make that guarantee false without anything failing."
+      },
+      {
+        "option": "Flag every global-scoped constraint",
+        "reason_rejected": "47% of constraints are global; flagging all of them makes the quality scan a wall of unactionable noise, and some rules genuinely apply everywhere. Flagging only where a concrete path can be named keeps every flag actionable."
+      },
+      {
+        "option": "Inject the full project summary into subagents",
+        "reason_rejected": "The hook fires once per spawned agent, so a workflow fanning out a dozen agents pays it a dozen times. Constraints are what a subagent cannot infer and cannot afford to miss; everything else is one get_project_summary call away, which the injected text says."
+      }
+    ],
+    "constraints_created": [
+      "Hot-path hooks (PreToolUse, PostToolUse-any, SubagentStart) must not import server",
+      "A summary that exceeds its budget must report it even when nothing was dropped"
+    ],
+    "related_to": [
+      "dec-012",
+      "dec-009",
+      "dec-018-c8aa",
+      "dec-019-9c32",
+      "con-010-acde",
+      "con-013-4b25"
+    ],
+    "tags": [
+      "retrieval",
+      "hooks",
+      "claude-code",
+      "context-injection",
+      "release"
+    ],
+    "retrieval_hints": [
+      "entries missing from session start summary",
+      "how do I find what got truncated",
+      "subagent does not know the project rules",
+      "global scope constraint never fires",
+      "release published without the mcpb bundle"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-01T14:33:20.402078+00:00",
+    "updated_at": "2026-08-01T14:33:20.402078+00:00",
+    "verified_at": "2026-08-01T14:33:20.402078+00:00",
+    "verified_sha": "b59aa900cec7c877a75475c3cb547daad14ca17f"
+  },
+  {
+    "id": "dec-022-730e",
+    "summary": "v0.19: supersession becomes a first-class signal. record_* returns a write-time advisory scored on shared tags + whole-component scope overlap; get_context prepends one predecessor line (immediate only) to any entry that replaced something; scripts/survey_supersessions.py proposes backfill links read-only. The machine asks and renders; a human decides every link.",
+    "problem": "Reversals were landing as in-place EDITS, so the store could answer what is true now but not what changed or why. Its own dogfood store held 36 entries, 36 active, 0 deprecated, 0 supersedes links -- while dec-013-4eb5 stated it replaced the old additive-only sync and con-006 carried \"(was additive-only)\" inline. deprecate_entry had supported superseded_by since v0.10 and it was never once used. The capability was not missing; the prompt was. Nothing asked at the single moment the answer was known -- while the replacement was being written -- and nothing spent the link afterwards, so making one bought the author nothing they could see.",
+    "why_chosen": "Three changes that each address a different half of the loop, none of which infers a link. (1) Write time: on record_*, active SAME-KIND entries are scored for subject overlap and named in the result as \"possible supersession of <id>: <summary>\". The signal is deliberately NOT the text Jaccard _find_similar_entries already computes -- a replacement often shares almost no wording with what it replaces (\"the merge is additive-only\" vs \"the merge is timestamp-based newest-wins\") while addressing exactly the same subject. What survives a rewrite is the SUBJECT, so tags and scope are what get scored; the write-time test proving this fires where similar_entries does not is the whole justification for a second signal. Scope overlap compares whole path COMPONENTS per con-011-76f8 (hooks/ vs webhooks/ scores 0.0, not a partial match) and reuses that rule rather than adding a second matcher -- _scope_covers stays the only surface deciding scope-vs-FILE coverage, this one answers scope-vs-SCOPE for ranking, and a test pins them in agreement. None of it auto-links, blocks the write, or mutates the older entry: a supersedes edge written from a heuristic silently demotes a rule that may still be in force, which is a worse failure than the missing link it set out to fix, and it would be written into the one system whose job is to be trusted about what changed. (2) Read time: a link is only worth making if retrieval spends it. The predecessor is superseded, so every retrieval filter has already dropped it by the time an agent reads the replacement -- \"what changed\" cost a second deliberate lookup nobody made. One line now rides along: 'supersedes <id>: was \"<summary>\" -- changed because: <reason>'. ONE level deep, because a full chain grows without bound inside a budget that is already the scarce resource, and the entry before that is reachable from the predecessor's own entry. Under budget pressure what gets dropped is the LINE, never the entry, leaving a predecessor_id trail per dec-021-b607. (3) Backfill: a read-only survey over all 23 local stores proposes (older, newer, evidence) pairs from two weak signals -- text markers and subject overlap -- and writes a file. It opens no store for writing and calls no lifecycle tool, because \"these two look related\" is not the same claim as \"this replaced that\", and only the second justifies an edge.",
+    "what_we_tried": "The advisory was first sketched on the existing similar_entries machinery, since that already runs at write time and already classifies contradiction vs restatement. Rejected once the failing case was written down: those are lexical signals, and the con-006 / dec-013 pair that motivated this whole item shares barely any vocabulary with what it replaced. Reusing it would have missed the exact entries that prompted the work. Running the survey against real data then corrected a second assumption: \"was\" was specified as a supersession marker and it IS one (\"the merge WAS additive-only\"), but on 23 stores it also fires on ordinary past tense in every well-written triggering_incident, producing most of the 229 marker hits. Rather than drop it (which would hide real supersessions) the three markers that assert a REPLACEMENT -- previously / replaced / no longer -- are flagged strong and sorted first, so nothing is filtered and attention still lands on the likely candidates. what_we_tried and (initially) triggering_incident were excluded as marker fields for the same reason: a field that is ABOUT the past carries no signal when it mentions the past.",
+    "tradeoffs": "The advisory will sometimes name an entry that is merely adjacent -- two constraints about hooks/ score 0.7 without either replacing the other, and the first real run shows exactly that. Accepted: a false suggestion costs one read, a false auto-link costs a demoted rule that is still in force, and the asymmetry is the entire design. The backfill's 36 proposals and 229 unpaired markers are likewise mostly not supersessions; they are reported anyway, sorted by strength, because a silent cap reads as \"nothing there\". get_context now reads all three store files once more per call to build the predecessor map (the predecessor is deprecated/superseded, so the already-loaded active set cannot see it) -- three small JSON reads against a budget-bound retrieval that already does the same. The predecessor line and the remote's predecessorLine are the same format maintained in two languages; a test in each repo pins the shape, but an edit to one is an edit to both.",
+    "alternatives": [
+      {
+        "option": "Auto-link above a confidence threshold, with an undo",
+        "reason_rejected": "The store's value is that it is trusted about what changed. A heuristic edge demotes an entry in ranking the moment it is written, and the reader who is misled is a future session that will never see the undo. Advisory-only makes the failure mode 'one wasted read' instead of 'a live rule silently ranked as history'."
+      },
+      {
+        "option": "Reuse _find_similar_entries' text Jaccard for the advisory",
+        "reason_rejected": "It measures restatement, not replacement. The con-006/dec-013 pair that motivated the work shares almost no wording; a test now pins the case where the advisory fires and similar_entries does not."
+      },
+      {
+        "option": "Render the full supersedes chain in get_context",
+        "reason_rejected": "Unbounded growth inside the token budget, which is already the scarce resource. One level answers 'why is this entry the way it is'; the level above is reachable from the predecessor's own entry."
+      },
+      {
+        "option": "Have the backfill survey write the links it is confident about",
+        "reason_rejected": "Explicitly out of scope per the work item, and correctly so: on 23 real stores the strongest bucket still contains adjacent-but-unrelated pairs. The human reviewing the file is the only place the judgement can be made."
+      }
+    ],
+    "constraints_created": [
+      "A supersedes link must never be written by inference -- the write-time advisory and the backfill survey both propose and neither links."
+    ],
+    "related_to": [
+      "dec-013-4eb5",
+      "con-006",
+      "con-011-76f8",
+      "dec-021-b607",
+      "con-004",
+      "dec-006"
+    ],
+    "tags": [
+      "supersession",
+      "retrieval",
+      "capture",
+      "mirror",
+      "lifecycle",
+      "advisory"
+    ],
+    "retrieval_hints": [
+      "why does record_entry say possible supersession",
+      "what is the predecessor line in get_context",
+      "how do I backfill supersedes links",
+      "store shows what is true but not what changed",
+      "supersession_advisory",
+      "0 supersedes links"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-05T11:38:00.327657+00:00",
+    "updated_at": "2026-08-05T11:38:00.327657+00:00",
+    "verified_at": "2026-08-05T11:38:00.327657+00:00",
+    "verified_sha": "7bfd900a99117d0faa40ca142bb02b441e036c97"
+  },
+  {
+    "id": "dec-023-af8d",
+    "summary": "Retrieval quality now has a number: a 59-case golden set plus evals/run_retrieval_eval.py, arms lexical vs embedding. Measured 2026-08-05 -- lexical recall@5 0.483 / MRR 0.383, embedding(w=150) recall@5 0.691 / MRR 0.565, FPR 0.667 in both. The embedding blend earns its complexity. tests/test_retrieval_eval.py pins the lexical positive-case recall@5 and pins the history gap at 0.000.",
+    "problem": "The suite proved the store was CORRECT and never that it was USEFUL: nothing measured whether get_context returns the entry that answers a real question. So the opt-in embedding path could not be shown to earn its complexity over the lexical fallback, and a ranking change could not be shown not to have made things worse. A prior measurement did exist (2026-06-17: hit@5 80% lexical vs 93.3% semantic on 31 cases) and it justified shipping the blend, but it depended on the llm-evals sibling repo so it could never run in CI, was partly paraphrase-derived, and had no negatives, no history cases, no per-project breakdown and nothing pinning it.",
+    "why_chosen": "A dev script plus a test, never an MCP tool, so the tools/list payload does not grow (con-004). The design turns on one authoring rule: every question is written from the PROBLEM the entry solves -- the symptom you would be staring at before you knew the entry existed -- never by paraphrasing its summary. Paraphrase contamination is the main threat to an exercise like this, because a query derived from a summary shares surface tokens with its target and lexical scoring hits it for free; measured against a contaminated set the lexical arm looks far better than it is, which is exactly the comparison this was built to make. 59 cases over 9 real stores: 44 positive, 9 negative (plausible in-domain questions with no answer, so the failure being measured is inventing one), 6 history. recall@k is strict (|gold and top-k| / |gold|) with hit@k carried alongside for comparability with the 2026-06-17 run. The harness runs against COPIES of every store, because get_context is not read-only twice over -- usage.py records retrieval telemetry on every call, and the semantic path caches embeddings.json next to the entries it embeds -- so a naive loop would write to 23 stores and pollute the very usage signal verify_quality's `unused` check reads. Only the lexical arm is pinned: it is bit-for-bit deterministic and needs no network, so it can fail honestly, while the embedding arm depends on a local embedder and is measured but not asserted. RESULT: embedding beats lexical by +21 points recall@5 and +18 MRR, and the gain is entirely in the large prose-heavy stores (Clark 0.333 -> 0.744, context-keeper 0.398 -> 0.741) while small stores are already at 1.000 lexically -- the blend earns its keep as a store GROWS, not from the first entry.",
+    "what_we_tried": "The first harness draft probed the embedder once and silently dropped the embedding arm when the probe failed -- and it did fail, because loading nomic-embed cold exceeds query_cosines' 10s embed timeout. That run reported the LEXICAL number under the embedding label: precisely the silent-fallback failure the probe existed to prevent, arriving through the probe itself. It now retries and refuses an arm it cannot prove is live. The golden set then had to be trimmed from 64 cases to 59: the first draft drew 5 cases from a private repo, and since a case's query and notes paraphrase the entry they target, committing them to this public repo would have published that project's design (con-015-12da). A third trap was quieter -- .gitignore's unanchored `.context/` rule matched the committed eval fixtures at any depth and silently excluded them, which would have left the history cases unrunnable on a fresh clone.",
+    "tradeoffs": "The pinned number depends on real stores that exist on this machine and not in CI, so the test SKIPS there -- a skip is not a pass, and a ranking change still has to be run locally to be trusted. The tolerance (about two cases' worth) will absorb a small genuine regression rather than firing on it; that is the price of not failing every time a real store gains an entry underneath the eval. The history cases run against evals/fixtures/ rather than live data, because across all 23 stores there are 4 deprecated entries and ZERO superseded ones -- there was nothing real to ask about, which is itself the finding that motivated dec-022-730e. The fixtures are real entries with synthesized supersedes edges, so they test ranking honestly but cannot catch a problem that only appears in organically-aged history.",
+    "alternatives": [
+      {
+        "option": "Extend the existing llm-evals-based harness",
+        "reason_rejected": "It needs the llm-evals repo checked out as a sibling, so it can never run in CI or on a fresh clone, and its dataset was partly paraphrase-derived -- the exact contamination the new measurement had to control for."
+      },
+      {
+        "option": "Expose the eval as an MCP tool",
+        "reason_rejected": "Every connected client pays the tools/list schema in context tokens at every session start (con-004). A measurement run a few times a release does not belong in a payload paid for continuously."
+      },
+      {
+        "option": "Pin the combined recall@5 including history cases",
+        "reason_rejected": "History scores 0.000, so a future fix to history reachability would show up as an unexplained jump in the pinned value. Pinning positives and asserting the history gap separately keeps each signal readable."
+      },
+      {
+        "option": "Run the eval directly against the real stores",
+        "reason_rejected": "get_context writes usage telemetry and the semantic arm writes an embedding cache, so measuring would mutate all 23 stores and skew verify_quality's unused check with queries no human ever asked."
+      }
+    ],
+    "constraints_created": [
+      "A retrieval golden-set case may only be drawn from a public-repo store (con-015-12da), enforced by tests/test_retrieval_eval.py.",
+      "The eval must run against store COPIES, never live .context, because get_context writes usage telemetry and embedding caches."
+    ],
+    "related_to": [
+      "dec-022-730e",
+      "con-015-12da",
+      "con-004",
+      "con-009-6bdc",
+      "dec-010",
+      "dec-007",
+      "dec-016-1bf6"
+    ],
+    "tags": [
+      "evals",
+      "retrieval",
+      "measurement",
+      "embeddings",
+      "regression-test"
+    ],
+    "retrieval_hints": [
+      "is the embedding path worth it",
+      "how good is get_context actually",
+      "retrieval recall numbers",
+      "why is history not retrievable",
+      "golden set for retrieval",
+      "does semantic beat lexical"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-05T14:24:54.355914+00:00",
+    "updated_at": "2026-08-05T14:24:54.355914+00:00",
+    "verified_at": "2026-08-05T14:24:54.355914+00:00",
+    "verified_sha": "8ed92c47efcde613c5f973212d01b0b6d208ed40"
+  }
+]

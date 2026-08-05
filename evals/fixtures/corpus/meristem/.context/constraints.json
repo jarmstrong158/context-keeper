@@ -1,0 +1,25 @@
+[
+  {
+    "id": "con-001-fb66",
+    "rule": "Tiles and item icons stay within 15 colours. CHARACTERS may use up to 24 (palette.max_colors_by_class.character) so config-driven prop/accessory layers (held staff/shield, garment, stone arms, hair flora) can each add a real 3-shade ramp on top of skin/hair/shirt/pants/hat \u2014 distinctness of silhouette is worth the extra ramps. Still prefer discipline: ornament small details with an EXISTING ramp shade (hat.highlight), not a new literal colour, and share shades where natural. The raised budget is headroom for meaningful props, not licence for palette sprawl.",
+    "reason": "5 materials x 3 hue-shifted shades = 15 for a bare character, and the outline folds into an existing shade. Prop layers legitimately need more: a scarf + flamestaff-ember + skin/hair/shirt/pants already exceeds 15, and forcing shares produced muddy, illegible props. So the gate now enforces a per-class budget via contract.budget_for() (character=24, everything else 15) instead of one global 15-colour cap. User explicitly authorized going over 15 for character prop work on 2026-07-22.",
+    "triggering_incident": "The wizard and king humanoid combos failed the gate at 16 colours until the wizard-hat star and crown jewel accents were changed to reuse hat.highlight instead of new literal colours.",
+    "scope": "packages/generators/meristem_generators/humanoid.py",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "meristem",
+      "sprites",
+      "palette",
+      "humanoid"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "deprecated",
+    "created_at": "2026-07-23T01:22:53.712192+00:00",
+    "updated_at": "2026-07-23T12:35:42.612542+00:00",
+    "verified_at": "2026-07-23T02:03:21.081650+00:00",
+    "deprecated_reason": "Colour-count limits were removed from the asset gate entirely (user directive). The 15-colour budget this constraint was built around no longer exists, so the '~5 materials per character / ornament with existing ramp shades' rule is no longer a hard requirement \u2014 it survives only as optional style guidance for cohesion, not an enforced cap."
+  }
+]

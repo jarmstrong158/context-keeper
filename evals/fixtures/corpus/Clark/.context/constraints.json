@@ -1,0 +1,350 @@
+[
+  {
+    "id": "con-001",
+    "rule": "Clark rollout buffers must store log-probs and values as 0-D torch tensors, not Python floats",
+    "reason": "Calling .item() on every rollout step forces a GPU\u2192CPU sync and serializes the next kernel launch. For a small model where the forward is already kernel-launch-bound, this doubles per-step latency on CUDA. Batch-flush once at update time via torch.stack \u2014 needs .float() to upcast bf16 before numpy conversion because numpy doesn't support bf16.",
+    "scope": "clark/agent/ppo.py",
+    "hardness": "absolute",
+    "tags": [
+      "clark",
+      "gpu",
+      "performance",
+      "ppo"
+    ],
+    "status": "active",
+    "created_at": "2026-04-11T02:26:43.757667+00:00",
+    "verified_at": "2026-04-11T19:41:59.936643+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-002",
+    "rule": "Clark checkpoint save() must deep-copy optimizer state via recursive _deep_cpu helper, never mutate optimizer.state_dict() in place",
+    "reason": "torch.optim.Optimizer.state_dict() returns a dict whose tensor values are REFERENCES to the live optimizer state, not copies. Rewriting entries in that dict to CPU clones moves the real live momentum buffers (exp_avg, exp_avg_sq) onto CPU \u2014 next optimizer.step() crashes inside torch._foreach_lerp_ with a mixed-device error because model gradients are still on CUDA. Caught at ep 50 of a batched pretrain run (triggered by save_interval=50). Fix: recursive _deep_cpu helper that walks dicts/lists/tuples and detach().cpu()s tensors into a brand-new container, leaving the live state untouched. Subtlety: PyTorch's newer Adam keeps the 'step' counter as a CPU scalar tensor by design \u2014 don't treat that as corruption at load time. Load() must use map_location and re-move optimizer state to target device so GPU-trained checkpoints load on CPU-only hosts.",
+    "scope": "clark/agent/ppo.py:save",
+    "hardness": "absolute",
+    "tags": [
+      "clark",
+      "checkpoint",
+      "gpu",
+      "serialization",
+      "bug-caught"
+    ],
+    "status": "active",
+    "created_at": "2026-04-11T02:26:43.787097+00:00",
+    "verified_at": "2026-04-11T11:26:07.469841+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-003",
+    "rule": "When launching pretrain training, ALWAYS open a visible Windows PowerShell window the user can see, NOT a hidden background process or a file-tail workaround.",
+    "reason": "User explicitly demanded this multiple times after I tried to substitute background processes + log file tail for what they wanted (a visible terminal). The reliable spawn pattern from this Bash environment is `powershell -Command \"Start-Process powershell -ArgumentList '-NoExit','-Command','cd C:/Users/jarms/repos/clark; python -m cli.main pretrain ...'\"`. The `cmd //c start \"Title\" cmd //k \"...\"` pattern was unreliable \u2014 sometimes the window didn't appear for the user.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "training",
+      "ux",
+      "windows"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:19.593515+00:00",
+    "verified_at": "2026-05-16T13:10:19.593515+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-004",
+    "rule": "Before any architectural change to the value head, model architecture, or major reward weight, BACKUP the current checkpoint as clark_foundation.pt.preXXX.bak.",
+    "reason": "We've shipped many destructive changes this session (value head reset 3x, reward weight redesigns, curriculum changes). Each backup gave a known-good rollback point. Lost-progress recovery is days of training; backup is 207MB and 1 second.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "checkpointing",
+      "safety"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:25.633955+00:00",
+    "verified_at": "2026-05-16T13:10:25.633955+00:00",
+    "updated_at": "2026-05-16T13:10:25.633955+00:00"
+  },
+  {
+    "id": "con-005",
+    "rule": "When user reports \"Cmp dropping\" or similar surface metric concern, check the TRAJECTORY across many time-windows (oldest to newest chunks of 200 days), not just the latest snapshot. Day-grade data is heavily affected by where each env is in its 261-day year (early-year is easy, mid-year is hard).",
+    "reason": "Multiple times I anchored on a current Cmp value (e.g., 'last 25 days = 87%') and concluded the model was failing, when the actual trajectory across the run showed monotonic improvement. Comparing 'last 25' to 'first 25' is misleading because of year-position sampling bias.",
+    "scope": "global",
+    "hardness": "advisory",
+    "tags": [
+      "analysis",
+      "metrics",
+      "interpretation"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:33.164342+00:00",
+    "verified_at": "2026-05-16T13:10:33.164342+00:00",
+    "updated_at": "2026-05-16T13:10:33.164342+00:00"
+  },
+  {
+    "id": "con-006",
+    "rule": "Never propose value-head reset as a solution without first checking whether the upstream cause (return distribution) has been addressed. Reset is symptomatic; without fixing the root distribution shift, saturation will recur within hours.",
+    "reason": "Reset the value head 3 times in this session. Each time we thought a per-trigger fix would prevent recurrence; each time a new distribution shift triggered it again. The permanent fix was symlog target compression, which makes the value head structurally robust to any future shift.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "value-head",
+      "debugging",
+      "lesson-learned"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:38.665171+00:00",
+    "verified_at": "2026-05-16T13:10:38.665171+00:00",
+    "updated_at": "2026-05-16T13:10:38.665171+00:00"
+  },
+  {
+    "id": "con-007",
+    "rule": "When changing PPO hparams (LR, entropy_coeff, etc.), consider the relative balance between policy gradient magnitude and entropy bonus. Halving LR effectively doubles the relative weight of the entropy term.",
+    "reason": "After dropping LR 2e-5 \u00e2\u2020\u2019 1e-5, performance silently degraded for 12 hours: entropy rose 1.83 \u00e2\u2020\u2019 2.02, policy hedged, Cmp slid 94% \u00e2\u2020\u2019 82%. Root cause: entropy_coeff stayed at 0.10 but the policy gradient halved with LR, so entropy term went from ~20\u00c3\u2014 to ~40\u00c3\u2014 the policy gradient. Fix: halve entropy_coeff in tandem (0.10 \u00e2\u2020\u2019 0.05).",
+    "scope": "global",
+    "hardness": "advisory",
+    "tags": [
+      "ppo",
+      "hparams",
+      "lesson-learned"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:45.235529+00:00",
+    "verified_at": "2026-05-16T13:10:45.235529+00:00",
+    "updated_at": "2026-05-16T13:10:45.235529+00:00"
+  },
+  {
+    "id": "con-008",
+    "rule": "Always ship 1-2 changes per training restart, never bundle 3+ unrelated changes. Lost attribution is the most expensive bug in RL debugging.",
+    "reason": "Multiple times this session bundled changes ('reset + reward + curriculum') and couldn't tell which fix did the work. The cleanest experiment is a single-knob change against a known baseline. Worth the extra restarts.",
+    "scope": "global",
+    "hardness": "advisory",
+    "tags": [
+      "debugging",
+      "process"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:49.227753+00:00",
+    "verified_at": "2026-05-16T13:10:49.227753+00:00",
+    "updated_at": "2026-05-16T13:10:49.227753+00:00"
+  },
+  {
+    "id": "con-009",
+    "rule": "Per-worker per-task time tracking (worker.task_hours_today, aggregated into day_grades.task_hours) is now a permanent diagnostic. Don't remove it \u2014 it was critical for finding the filler-task escape valves.",
+    "reason": "Without per-worker time visibility, we couldn't distinguish 'model chose idle' from 'model chose pack but no orders existed' from 'model chose filler tasks during crunch.' That diagnostic was the basis for the filler-suppression fix and the demerit-signal extension.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "instrumentation",
+      "diagnostics"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:10:54.478513+00:00",
+    "verified_at": "2026-05-16T13:10:54.478513+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-010",
+    "rule": "When extending a gated reward penalty to new tasks, ALSO audit the gate threshold to confirm it fires on the failure modes the extension is meant to address. Extension without gate-audit is a half-fix.",
+    "reason": "We extended filler_during_crunch from side_project to 5 more filler tasks (loading/training/qc/returns/receiving), correctly. But left the _in_crunch threshold at 30% pending. On real failure days (24% completion = below 30% remaining), the penalty never fired despite being applied to more tasks. We caught it by inspecting day_grades.task_hours showing filler dominance with reward_breakdown showing no filler_during_crunch entries. Cost: weeks of training where the \"fix\" was inert on the exact bad days it was designed to address.",
+    "scope": "global",
+    "hardness": "absolute",
+    "tags": [
+      "reward-shaping",
+      "debugging-discipline",
+      "env-design"
+    ],
+    "status": "active",
+    "created_at": "2026-05-16T13:59:18.957684+00:00",
+    "verified_at": "2026-05-16T13:59:18.957684+00:00",
+    "updated_at": "2026-05-16T13:59:18.957684+00:00"
+  },
+  {
+    "id": "con-011",
+    "rule": "Performance bottleneck claims must be validated against the live production training loop (the permanent pretrain.py tick profiler), never a microbench or analogy to the canonical RL bottleneck. Do not act on a projected speedup until the production profiler confirms it.",
+    "reason": "Microbenchmarks and \"this is the usual RL bottleneck\" reasoning measure the wrong thing in a pipelined multiprocess loop. Acting on them wastes restarts, churns the training run, and produces fixes that don't move wall-clock \u2014 exactly the failure this project keeps having.",
+    "triggering_incident": "Three independent analysis rounds (two profiling sub-agents, a manual thread, plus targeted web research on Sample Factory / async actor-learner) all concluded Clark was env/IPC/sampler-bound and recommended more parallel envs or an async-actor-learner rewrite. The production-tick profiler, built specifically to stop the guessing, showed in one 5-minute run that env-worker wait (recv) is 0.4% of wall-clock and the PPO update is 82-83%. The vectorized-sampler change shipped on the agent's microbench projection (dec-016) produced ~1.15x, not the projected 5-6x, because the sampler was ~15% of the loop, not the bottleneck. Every guess pointed the opposite direction from the measurement.",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-016",
+      "pipe-001",
+      "con-008"
+    ],
+    "tags": [
+      "performance",
+      "profiling",
+      "debugging-discipline",
+      "measurement"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-16T21:15:42.324514+00:00",
+    "verified_at": "2026-05-16T21:15:42.324514+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-012",
+    "rule": "Every user-facing CLI verb (clark plan, finetune, validate, wizard, dashboard, init) must have an end-to-end test that actually invokes its real call path, not just component tests. Treat function docstrings that state return arity/shape as contracts: when a return signature changes, update the docstring AND every call site in the same change.",
+    "reason": "Component-only coverage gives false confidence: a broken headline command can ship green. Docstrings that lie about return shape cause silent caller breakage that no component test catches.",
+    "triggering_incident": "An external Codex review found `clark plan` (and the now-removed api /plan) crashed with 'too many values to unpack (expected 4)' the instant a checkpoint existed: select_action_from_dict returns a 5-tuple but cli/main.py unpacked 4. Root cause was the function's docstring documenting a 4-tuple while the code returned 5 \u2014 callers trusted the stale docstring. The 392-test suite missed it entirely because it tested training-path components and never exercised `clark plan` end to end. tests/test_plan_path.py + CI now close the gap.",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-020",
+      "con-011"
+    ],
+    "tags": [
+      "testing",
+      "ci",
+      "regression",
+      "debugging-discipline"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-16T23:44:08.716753+00:00",
+    "verified_at": "2026-05-16T23:44:08.716753+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-013",
+    "rule": "Treat grade and win_year as evaluation/reporting ONLY \u2014 they are not in the PPO loss and not in curriculum gating (_get_stage is config-count driven). Changing the grade rule or the win metric is non-learning-affecting and needs no training restart. Do NOT assume the inverse: before labelling any newly added metric eval-only, grep the reward path and curriculum to confirm it is not fed into the gradient or stage advancement.",
+    "reason": "The eval-metric split and the proposed grade-realignment both depended on this being true; mislabelling a gradient- or curriculum-feeding metric as eval-only would silently corrupt training or attribution. Verified this session by grepping the reward path (only comments reference grade) and _get_stage (driven purely by configs_seen count).",
+    "triggering_incident": "The whole-project audit's top recommendation (realign the conflated grade) hinged on whether grade feeds the gradient/curriculum; verification confirmed it does not, which is what made a no-restart eval-side fix possible (dec-025).",
+    "scope": "global",
+    "hardness": "advisory",
+    "related_to": [
+      "dec-024",
+      "dec-025"
+    ],
+    "tags": [
+      "evaluation",
+      "grade",
+      "verification-discipline",
+      "non-learning-affecting"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-17T23:30:00.911989+00:00",
+    "verified_at": "2026-05-17T23:30:00.912982+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-014",
+    "rule": "The cmp_year>1.0 carryover accounting fix (clamping cmp_year) is LEARNING-AFFECTING \u2014 cmp_year feeds year_completion_bonus (= 500 x cmp_year), a reward term. Never bundle it into an eval-side/non-learning-affecting commit; it requires backup + isolated A/B restart discipline and must ride a dedicated learning-affecting restart.",
+    "reason": "On order_carryover configs a catch-up day can ship more than the day's base order total, so cmp_year exceeds 1.0 and year_completion_bonus overpays. Clamping changes the gradient on those days, so treating it as a harmless accounting fix and bundling it with non-learning-affecting work would silently perturb training and destroy attribution (con-008).",
+    "triggering_incident": "During the audit-fix bundle (dec-025) the cmp_year>1.0 fix was identified as touching year_completion_bonus and was deliberately excluded from the non-learning-affecting commit and flagged deferred.",
+    "scope": "clark/env/year_env.py",
+    "hardness": "absolute",
+    "related_to": [
+      "con-008",
+      "dec-025"
+    ],
+    "tags": [
+      "reward-shaping",
+      "carryover",
+      "attribution-discipline",
+      "learning-affecting",
+      "deferred"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-17T23:30:09.274398+00:00",
+    "verified_at": "2026-05-17T23:30:09.274398+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-015",
+    "rule": "Before shipping ANY gated reward term, empirically measure how often the gate is actually open during the hours the target behavior occurs \u2014 using the REAL trained policy (not reasoning, not a masked-random policy whose pacing differs). The measurement (gate-open hours/day, % actionable with an eligible worker present, % of days with a usable window, % of days still inert) is a precondition of the change, not a post-hoc check.",
+    "reason": "A gate that is reasoned to \"open a real window\" can be inert in practice. The management bonus shipped TWICE on reasoning alone: first gate (pending<=0) fired literally zero times for ~1700 episodes; it was only caught because the user asked 'did you check the frequency?'. Reasoning about gate frequency is not a substitute for measuring it; an inert gate silently wastes entire training cycles.",
+    "triggering_incident": "dec-027 gate (pending<=0) was dead-on-arrival and undetected for ~1700 episodes; the dec-028 replacement (pending<=10% of total) was also shipped before measuring, then verified post-hoc with tools/probe_mgmt_gate.py using the real checkpoint: gate open mean 7.42h/day, 7.38h actionable, 88% of days >=2h, only 3.2% inert \u2014 sound, but only confirmed because the user forced the check.",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-027",
+      "dec-028",
+      "con-008",
+      "pipe-001"
+    ],
+    "tags": [
+      "reward-shaping",
+      "gated-reward",
+      "verification-discipline",
+      "measure-not-reason",
+      "process"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-18T22:39:35.331544+00:00",
+    "verified_at": "2026-05-18T22:39:35.331544+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-016",
+    "rule": "Before proposing any reward-weight or env-mechanic change to fix a behavior failure, run a measurement probe against the current foundation that quantifies the suspected root cause. The probe must produce numbers, not reasoning. Only after the data EXCLUDES simpler explanations (reward gradient already correct, env mechanic already firing, etc.) may a curriculum or training change be proposed. This rule extends con-015 from gate-frequency measurement to root-cause measurement generally.",
+    "reason": "In a single session today, four sequential rounds of \"the obvious problem is X, let's change X and retrain\" would have burned 4 \u00c3\u2014 ~12h foundation retrains chasing the wrong levers. Probes invalidated all four before any retrain cost was paid. The pattern is general: under time pressure, reasoning leans toward the most-recently-discussed mechanism; only data exposes which mechanism is actually firing on the failure mode in question. The cost of writing a probe is ~30 minutes; the cost of an unwarranted retrain is half a day plus the attribution chaos of changing two things at once.",
+    "triggering_incident": "Today's jack_baseline F=100% investigation. Initial hypothesis chain: (1) per_filler_unit reward pulls policy toward filler. Probe P1: F-day filler reward is +1.5 mean (noise). (2) The -5000 crunch cap leaks per dec-026 and enables tank-then-free-filler. Probe P2: cap never binds in 30 days (worst -525). (3) Buffer-full mask doesn't extend to non-OT, letting policy pick filler when carts are full. Probe P3: 0 buffer-full ticks in 30 non-OT days. Only the FOURTH probe (curriculum coverage) found the real cause: peak vol/cap is hard-capped at OT rescue, and jack_baseline at vol=450 is 1.56x rescue, literally outside the training distribution. Without probes, the project would have shipped 3 reward/env restarts that solved nothing.",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [
+      "con-015",
+      "con-008",
+      "dec-032"
+    ],
+    "tags": [
+      "audit-discipline",
+      "verification",
+      "probe-first",
+      "training-cost-control"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-24T21:26:42.495669+00:00",
+    "verified_at": "2026-05-24T21:26:42.495669+00:00",
+    "updated_at": "2026-05-24T21:26:42.495669+00:00"
+  },
+  {
+    "id": "con-017",
+    "rule": "When auditing what's preventing higher grade rates, treat OT use as a binary disqualifier \u2014 measure A-rate stratified by `ot_hours == 0` separately from days that used any OT. The env's grading collapses A\u2192B (or lower) on any OT >0, regardless of completion. Trying to optimize \"A-rate\" without isolating this gate misattributes the bottleneck.",
+    "reason": "The v2.5 audit revealed: among 227 perfect-ship days (100% orders shipped), the A-rate was 69% for `ot_hours==0` days and 0% for any `ot_hours > 0`. This made \"what's preventing A-rate gains\" a question about preventing OT use, which traced back to restock-collapse \u00e2\u2020\u2019 5%-picking-speed \u00e2\u2020\u2019 OT cascade. Mis-attributing this would have sent v2.6 design in the wrong direction (e.g., trying to push more pick/pack allocation when the actual fix is preventing the restock cliff).",
+    "triggering_incident": "252-ep audit of v2.5 fine-tune showed A-rate stuck at ~48% despite 90% perfect-ship rate. Without stratifying by OT use, the obvious-but-wrong conclusion was \"policy needs to ship more.\" Stratification revealed shipping was already at 90% perfect and 99.1% mean \u2014 the gate was OT. Among non-OT perfect-ship days the policy was hitting 69% A-rate, so the headroom was in eliminating the 51 perfect-ship-with-OT days (which all graded B/C/D).",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-033",
+      "con-016"
+    ],
+    "tags": [
+      "grading",
+      "audit-discipline",
+      "ot-mechanics",
+      "v2.6-design-input"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-25T17:33:23.640028+00:00",
+    "verified_at": "2026-05-25T17:33:23.640028+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  },
+  {
+    "id": "con-018",
+    "rule": "In FacilityEnv per-tick logging, route absent workers' tracked time to the \"off\" key instead of \"idle\" in task_hours_today (and therefore in the episode footer's worker_time dict). The simulator still treats absent workers as idle internally and the action mask still forces idle as the only valid action \u2014 only the LABEL in the log changes.",
+    "reason": "Absent workers contribute their full shift to the per-worker time tally. Without separation, post-hoc audits cannot distinguish \"worker called off / didn't show up\" from \"policy chose to idle this worker.\" On heavy-roster days with 3-5 absentees, this can inflate the idle (or via misreading, the filler) bucket by 10-15% of total worker-hours. The v2.5 audit explicitly verified absences were NOT inflating filler (only 2.8% of hours), but the verification only worked because of this tag. Without it, every post-hoc claim about filler% or idle% needs a footnote.",
+    "triggering_incident": "v2.5 audit at 252 eps: user asked whether high-filler episodes were \"really filler or just call-offs.\" Initial check required reverse-engineering absentees from per-worker time patterns (looking for `idle > 85% of tracked time AND productive < 0.5h`). This heuristic worked but was fragile. The fix codifies the distinction at write-time so future audits never need the heuristic.",
+    "scope": "clark/env/facility_env.py",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-033"
+    ],
+    "tags": [
+      "logging",
+      "audit-discipline",
+      "worker-tracking"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-05-25T17:33:33.508863+00:00",
+    "verified_at": "2026-05-25T17:33:33.508863+00:00",
+    "updated_at": "2026-08-01T11:54:51.280369+00:00"
+  }
+]
