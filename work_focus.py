@@ -34,6 +34,8 @@ from __future__ import annotations
 import os
 import subprocess
 
+import scope_rules
+
 # How far back "recently worked on" reaches when the tree is clean. Small on
 # purpose: the point is what this session is about, not project history.
 RECENT_COMMITS = 5
@@ -121,15 +123,17 @@ def active_paths(root):
 
 
 def _covers(scope, path):
-    """Does a constraint scoped to `scope` cover `path`?
+    """Does a constraint scoped to `scope` cover `path`? Delegates to scope_rules.
 
-    Directory scopes cover everything beneath; a file scope matches itself.
-    Guarded on the separator so 'hooks' does not also claim 'hooks_backup/'.
+    This used to be its own `startswith(s + "/")` test, and it DISAGREED with
+    scope_guard on two of ten cases from the con-011-76f8 table: it did not cover
+    `pkg/server.py` for scope `server.py` (the hook does), and it did cover a
+    bare `hooks` path for scope `hooks/` (the hook does not). Two surfaces
+    disagreeing about coverage means one of them is claiming protection the
+    other does not provide -- which is the whole point of con-011, and it was
+    quietly false because the rule lived in two places.
     """
-    s = _norm(scope).rstrip("/")
-    if not s:
-        return False
-    return path == s or path.startswith(s + "/")
+    return scope_rules.covers(scope, path)
 
 
 def relevant_entries(entries, paths):
@@ -144,7 +148,7 @@ def relevant_entries(entries, paths):
     hits = []
     for e in entries:
         scope = e.get("scope")
-        if not scope or _norm(scope).lower() in ("global", "all", "*", ""):
+        if not scope or scope_rules.is_domain(scope):
             continue
         if any(_covers(scope, p) for p in paths):
             hits.append(e)

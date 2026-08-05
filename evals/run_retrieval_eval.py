@@ -99,21 +99,35 @@ def _ascii(text):
     return str(text).encode("ascii", "replace").decode("ascii")
 
 
-def resolve_store_dir(store):
-    """A case's `store` -> the real directory holding its .context/."""
+def resolve_store_dir(store, live=False):
+    """A case's `store` -> the directory holding its .context/.
+
+    Defaults to the FROZEN corpus under evals/fixtures/corpus. Pointed at live
+    stores the pinned number measures the ranker and whatever anybody recorded
+    since, which is not a regression signal: recording three entries moved
+    lexical recall@5 by 0.076 with no code change. Freezing also lets the
+    regression test run in CI instead of skipping for want of sibling repos.
+
+    `live=True` runs against the real stores for a current read rather than a
+    comparable one.
+    """
     if store.startswith("fixtures/"):
         return os.path.join(HERE, "fixtures", store.split("/", 1)[1])
+    if not live:
+        frozen = os.path.join(HERE, "fixtures", "corpus", store)
+        if os.path.isdir(os.path.join(frozen, ".context")):
+            return frozen
     return os.path.join(REPOS_ROOT, store)
 
 
-def snapshot(store, workdir):
+def snapshot(store, workdir, live=False):
     """Copy one store's .context into workdir. Returns the copy's project dir.
 
     The eval never touches the original. Copies are keyed by store name so the
     embedding cache written into a copy survives between runs in the same
     workdir, which is what makes the embedding arm tolerable to re-run.
     """
-    src = os.path.join(resolve_store_dir(store), ".context")
+    src = os.path.join(resolve_store_dir(store, live), ".context")
     dst_project = os.path.join(workdir, store.replace("/", "__"))
     dst = os.path.join(dst_project, ".context")
     os.makedirs(dst, exist_ok=True)
@@ -134,7 +148,7 @@ def load_golden(path=GOLDEN):
     return data["cases"]
 
 
-def validate(cases):
+def validate(cases, live=False):
     """Every gold id must exist in its store, and be superseded for history cases.
 
     A golden set that quietly references a renamed or deleted id measures
@@ -146,7 +160,7 @@ def validate(cases):
         if case["id"] in seen_ids:
             problems.append(f"{case['id']}: duplicate case id")
         seen_ids.add(case["id"])
-        base = os.path.join(resolve_store_dir(case["store"]), ".context")
+        base = os.path.join(resolve_store_dir(case["store"], live), ".context")
         if not os.path.isdir(base):
             problems.append(f"{case['id']}: store not found: {case['store']}")
             continue
@@ -226,11 +240,11 @@ def aggregate(rows):
     return agg
 
 
-def run_arm(arm, cases, workdir, token_budget):
+def run_arm(arm, cases, workdir, token_budget, live=False):
     desc, patch = ARMS[arm]
     rows = []
     for case in cases:
-        project_dir = snapshot(case["store"], workdir)
+        project_dir = snapshot(case["store"], workdir, live)
         retrieved, no_conf = run_case(case, project_dir, patch, token_budget)
         row = {
             "case": case["id"],
@@ -245,7 +259,7 @@ def run_arm(arm, cases, workdir, token_budget):
     return rows
 
 
-def embedding_available(cases, workdir, token_budget, attempts=3):
+def embedding_available(cases, workdir, token_budget, attempts=3, live=False):
     """Did the embedding arm actually embed anything, or silently fall back?
 
     query_cosines returns None on any failure and the caller drops to lexical --
@@ -259,7 +273,7 @@ def embedding_available(cases, workdir, token_budget, attempts=3):
     to catch, arriving through the probe itself.
     """
     probe = cases[0]
-    project_dir = snapshot(probe["store"], workdir)
+    project_dir = snapshot(probe["store"], workdir, live)
     base = os.path.join(project_dir, ".context")
     for attempt in range(attempts):
         try:
@@ -362,6 +376,10 @@ def main(argv=None):
                         help="get_context token_budget per call (default 4000).")
     parser.add_argument("--workdir", default=os.path.join(HERE, ".snapshots"),
                         help="Where store COPIES live. Never a real store.")
+    parser.add_argument(
+        "--live", action="store_true",
+        help="Run against the real project stores instead of the frozen corpus "
+             "in evals/fixtures/corpus. A current read, not a comparable one.")
     parser.add_argument("--json", dest="json_out",
                         help="Also write the full per-case results here.")
     args = parser.parse_args(argv)
@@ -369,7 +387,7 @@ def main(argv=None):
     random.seed(SEED)
     cases = load_golden(args.golden)
 
-    problems = validate(cases)
+    problems = validate(cases, live=args.live)
     if problems:
         print("golden set is invalid:")
         for p in problems:
@@ -388,7 +406,7 @@ def main(argv=None):
 
     try:
         if any(a.startswith("embedding") for a in arms):
-            if not embedding_available(cases, workdir, args.token_budget):
+            if not embedding_available(cases, workdir, args.token_budget, live=args.live):
                 print("embedding arm unavailable (no embedder reachable) -- "
                       "it would silently report the lexical number. Dropping it.")
                 arms = [a for a in arms if not a.startswith("embedding")]
@@ -397,7 +415,7 @@ def main(argv=None):
 
         results = {}
         for arm in arms:
-            rows = run_arm(arm, cases, workdir, args.token_budget)
+            rows = run_arm(arm, cases, workdir, args.token_budget, live=args.live)
             results[arm] = {"rows": rows, "overall": aggregate(rows)}
 
         print(report(results, arms))

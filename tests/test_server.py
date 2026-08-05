@@ -1,149 +1,12 @@
-"""Comprehensive test suite for context-keeper server.py.
+"""Core store behaviour: recording, retrieval, ranking, and lifecycle.
 
-Strategy: All tests pass ``project_dir`` explicitly in params so that the
-module-level CONTEXT_DIR (resolved once at import time) is irrelevant.  This
-lets us use ``tmp_path`` for full isolation without mocking any file I/O.
+Quality, projections, hooks, packaging and transport tests live in their own
+files; shared builders live in tests/helpers.py.
 """
 
-import json
-import os
-import re
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-import pytest
-
-# ---------------------------------------------------------------------------
-# Import the handler functions directly from server.py
-# ---------------------------------------------------------------------------
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from server import (
-    CONTEXT_DIR_NAME,
-    UNRESOLVED_PROJECT_ERROR,
-    _base_dir_from_params,
-    _classify_overlap,
-    _resolve_project_dir,
-    _text_words,
-    build_constraints_block,
-    handle_deprecate_entry,
-    handle_get_compaction_report,
-    handle_get_context,
-    handle_get_project_summary,
-    handle_prune_stale,
-    handle_record_constraint,
-    handle_record_decision,
-    handle_record_entry,
-    handle_query_entries,
-    handle_record_pipeline,
-    handle_reload_constraints,
-    handle_update_entry,
-    next_id,
-    read_json_file,
-    score_entry,
-)
+from helpers import *  # noqa: F401,F403
 
 
-# ---------------------------------------------------------------------------
-# Helper: build a params dict that targets a tmp project directory
-# ---------------------------------------------------------------------------
-
-# Sentinel strings that satisfy v0.4 min-length validation. Tests use
-# these so they exercise real code paths instead of the validation
-# rejection path. Use _DECISION_DEFAULTS / _CONSTRAINT_DEFAULTS /
-# _PIPELINE_DEFAULTS to populate required fields without obscuring
-# test intent at every call site.
-_LONG_PROBLEM = (
-    "Test scenario requires a problem description long enough to satisfy "
-    "the v0.4 min-length validation enforced by the record handlers."
-)
-_LONG_WHY = (
-    "Test scenario requires a why_chosen explanation long enough to clear "
-    "the 60-character minimum that the v0.4 schema enforces server-side."
-)
-_LONG_REASON = (
-    "Test scenario requires reasoning text long enough to satisfy the "
-    "v0.4 minimum length requirement so the handler proceeds normally."
-)
-_LONG_PURPOSE = (
-    "Test pipeline purpose long enough to clear the v0.4 minimum length "
-    "requirement applied during pipeline registration."
-)
-
-
-def project_params(tmp_path: Path, extra: dict = None) -> dict:
-    """Return a params dict with project_dir set to ``tmp_path``.
-
-    v0.4 compat shim: when ``extra`` looks like a record_* call (has
-    ``summary``, ``rule``, or ``name``+``steps``), auto-fill the v0.4
-    required fields (``problem``/``why_chosen``/``reason``/``purpose``)
-    if they aren't already set, so legacy test cases keep working
-    without rewriting every call site.
-    """
-    params = {"project_dir": str(tmp_path)}
-    if extra:
-        params.update(extra)
-    # decision shape — extend short summaries to clear min-length
-    if "summary" in params:
-        params.setdefault("problem", _LONG_PROBLEM)
-        params.setdefault("why_chosen", _LONG_WHY)
-        if isinstance(params["summary"], str) and len(params["summary"]) < 5:
-            params["summary"] = params["summary"] + " (test entry)"
-    # constraint shape — extend the existing 'reason' if it's too short
-    if "rule" in params and "reason" in params:
-        if isinstance(params["reason"], str) and len(params["reason"]) < 40:
-            params["reason"] = params["reason"] + " " + _LONG_REASON
-        if isinstance(params["rule"], str) and len(params["rule"]) < 5:
-            params["rule"] = params["rule"] + " (test rule placeholder)"
-    # pipeline shape
-    if "name" in params and "steps" in params:
-        params.setdefault("purpose", _LONG_PURPOSE)
-        if isinstance(params["name"], str) and len(params["name"]) < 3:
-            params["name"] = params["name"] + " (test pipeline)"
-    return params
-
-
-def decision_params(tmp_path: Path, **overrides) -> dict:
-    """Build a valid v0.4 record_decision params dict. Overrides
-    win, so a test can pass a longer summary or extra tags."""
-    base = {
-        "project_dir": str(tmp_path),
-        "summary": "Test decision summary text",
-        "problem": _LONG_PROBLEM,
-        "why_chosen": _LONG_WHY,
-    }
-    base.update(overrides)
-    return base
-
-
-def constraint_params(tmp_path: Path, **overrides) -> dict:
-    """Build a valid v0.4 record_constraint params dict."""
-    base = {
-        "project_dir": str(tmp_path),
-        "rule": "Test rule that is long enough",
-        "reason": _LONG_REASON,
-    }
-    base.update(overrides)
-    return base
-
-
-def pipeline_params(tmp_path: Path, **overrides) -> dict:
-    """Build a valid v0.4 record_pipeline params dict."""
-    base = {
-        "project_dir": str(tmp_path),
-        "name": "Test Pipeline",
-        "purpose": _LONG_PURPOSE,
-        "steps": [{"order": 1, "action": "do something"}],
-    }
-    base.update(overrides)
-    return base
-
-
-def context_dir(tmp_path: Path) -> Path:
-    """Return the .context/ path inside tmp_path."""
-    return tmp_path / CONTEXT_DIR_NAME
 
 
 # ===========================================================================
@@ -297,6 +160,8 @@ class TestProjectResolution:
             srv._base_dir_from_params = original
 
 
+
+
 # ===========================================================================
 # 2. record_decision
 # ===========================================================================
@@ -370,6 +235,8 @@ class TestRecordDecision:
         assert context_dir(tmp_path).exists()
 
 
+
+
 # ===========================================================================
 # 3. record_pipeline
 # ===========================================================================
@@ -434,6 +301,8 @@ class TestRecordPipeline:
         }))
         data = read_json_file(str(context_dir(tmp_path) / "pipelines.json"))
         assert data[0]["status"] == "active"
+
+
 
 
 # ===========================================================================
@@ -513,6 +382,8 @@ class TestRecordConstraint:
         assert "verified_at" in entry
 
 
+
+
 class TestRecordEntry:
     """Unified record_entry(kind=...) dispatches to the same impls; the three
     record_* tools are now thin wrappers producing identical results."""
@@ -565,6 +436,8 @@ class TestRecordEntry:
         from server import HANDLERS
         for name in ("record_entry", "record_decision", "record_pipeline", "record_constraint"):
             assert name in HANDLERS
+
+
 
 
 # ===========================================================================
@@ -672,6 +545,8 @@ class TestGetContext:
             }))
         result = handle_get_context(project_params(tmp_path, {"token_budget": 50}))
         assert result["tokens_used"] <= 50
+
+
 
 
 # ===========================================================================
@@ -805,6 +680,8 @@ class TestGetProjectSummary:
         assert "dec-001" in stale_ids
 
 
+
+
 # ===========================================================================
 # 7. update_entry
 # ===========================================================================
@@ -934,6 +811,8 @@ class TestUpdateEntry:
         assert data[0]["summary"] == "Persisted update"
 
 
+
+
 # ===========================================================================
 # 8. deprecate_entry
 # ===========================================================================
@@ -1007,6 +886,8 @@ class TestDeprecateEntry:
         }))
         data = read_json_file(str(context_dir(tmp_path) / "decisions.json"))
         assert "updated_at" in data[0]
+
+
 
 
 class TestDeprecateMerge:
@@ -1119,19 +1000,6 @@ class TestDeprecateMerge:
         assert a["tags"] == ["storage"]
 
 
-# ===========================================================================
-# 9. prune_stale
-# ===========================================================================
-
-
-def _backdate_entry(file_path: Path, entry_id: str, days_ago: int):
-    """Helper: set verified_at on an entry to ``days_ago`` days in the past."""
-    data = json.loads(file_path.read_text(encoding="utf-8"))
-    old_date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
-    for e in data:
-        if e["id"] == entry_id:
-            e["verified_at"] = old_date
-    file_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 class TestPruneStale:
@@ -1219,6 +1087,8 @@ class TestPruneStale:
         assert result["threshold_days"] == 45
 
 
+
+
 # ===========================================================================
 # 10. get_compaction_report
 # ===========================================================================
@@ -1279,6 +1149,8 @@ class TestGetCompactionReport:
         (ctx / "compaction_report.json").write_text("NOT JSON{{{", encoding="utf-8")
         result = handle_get_compaction_report(project_params(tmp_path))
         assert "error" in result
+
+
 
 
 # ===========================================================================
@@ -1361,6 +1233,8 @@ class TestSchemaValidation:
         assert entry["tradeoffs"].startswith("Slight loss")
 
 
+
+
 # ===========================================================================
 # 12. related_to graph traversal
 # ===========================================================================
@@ -1411,128 +1285,6 @@ class TestRelatedToTraversal:
         assert result["related_added"] == 0
 
 
-# ===========================================================================
-# 13. verify_quality
-# ===========================================================================
-
-
-class TestVerifyQuality:
-    def test_legacy_decision_flagged(self, tmp_path):
-        """Pre-v0.4 entries (no schema_version, no why_chosen) get flagged."""
-        ctx = context_dir(tmp_path)
-        ctx.mkdir(parents=True)
-        # Write a legacy entry directly (bypassing the handler so no
-        # auto-migration happens). Reasoning text is intentionally long
-        # enough so the only flag we get is 'legacy'.
-        legacy = [{
-            "id": "dec-001",
-            "summary": "Old decision",
-            "rationale": (
-                "Some long enough rationale text that easily clears the "
-                "thin-reason threshold so we isolate the legacy flag in this test."
-            ),
-            "tags": ["old"],
-            "status": "active",
-            "created_at": "2024-01-01T00:00:00+00:00",
-            "verified_at": "2024-01-01T00:00:00+00:00",
-        }]
-        (ctx / "decisions.json").write_text(
-            json.dumps(legacy), encoding="utf-8"
-        )
-        from server import handle_verify_quality
-        result = handle_verify_quality(project_params(tmp_path))
-        assert result["count"] >= 1
-        flag = next(f for f in result["flagged"] if f["id"] == "dec-001")
-        issue_types = [i["type"] for i in flag["issues"]]
-        assert "legacy" in issue_types
-
-    def test_thin_reason_flagged(self, tmp_path):
-        """v0.4 entry with why_chosen that clears the 60-char validation
-        minimum but trips the higher quality-scan threshold."""
-        # 70 chars — above validation min (60), below test threshold (200)
-        why = "Short answer that passes server-side validation but trips quality scan."
-        assert 60 <= len(why) < 200
-        handle_record_decision({
-            "project_dir": str(tmp_path),
-            "summary": "Decision",
-            "problem": "We needed a quick test of the thin-reason quality flag.",
-            "why_chosen": why,
-            "tags": ["test"],
-        })
-        from server import handle_verify_quality
-        result = handle_verify_quality(project_params(tmp_path, {"min_reason_chars": 200}))
-        assert any(
-            "thin_reason" in [i["type"] for i in f["issues"]]
-            for f in result["flagged"]
-        )
-
-    def test_no_tags_flagged(self, tmp_path):
-        handle_record_decision({
-            "project_dir": str(tmp_path),
-            "summary": "Decision",
-            "problem": "We needed an entry with no tags so we can flag it for the test.",
-            "why_chosen": (
-                "Tags are the primary retrieval signal — entries without tags "
-                "won't surface from get_context queries, which is the issue we want to flag here."
-            ),
-        })
-        from server import handle_verify_quality
-        result = handle_verify_quality(project_params(tmp_path))
-        assert any(
-            "no_tags" in [i["type"] for i in f["issues"]]
-            for f in result["flagged"]
-        )
-
-    def test_isolated_flagged(self, tmp_path):
-        """Two entries sharing a tag but no related_to link → both flagged isolated."""
-        for i in range(2):
-            handle_record_decision({
-                "project_dir": str(tmp_path),
-                "summary": f"Decision {i}",
-                "problem": "We needed two entries that share a tag for the isolation flag test.",
-                "why_chosen": (
-                    "Both entries share the 'shared' tag but neither links to the other, "
-                    "which is exactly the missed-link condition the isolated flag is designed to catch."
-                ),
-                "tags": ["shared"],
-            })
-        from server import handle_verify_quality
-        result = handle_verify_quality(project_params(tmp_path))
-        isolated = [
-            f for f in result["flagged"]
-            if any(i["type"] == "isolated" for i in f["issues"])
-        ]
-        assert len(isolated) == 2
-
-    def test_clean_entry_not_flagged(self, tmp_path):
-        """Entry with full v0.4 schema + tags + related_to should pass clean."""
-        handle_record_decision({
-            "project_dir": str(tmp_path),
-            "summary": "First decision",
-            "problem": "We need a clean entry that passes every quality check we run today.",
-            "why_chosen": (
-                "Full v0.4 schema, populated tags, and a related_to link to dec-002 "
-                "should make this entry survive verify_quality with zero flags."
-            ),
-            "tags": ["clean"],
-            "related_to": ["dec-002"],
-        })
-        handle_record_decision({
-            "project_dir": str(tmp_path),
-            "summary": "Second decision",
-            "problem": "We need a second entry so the related_to link target exists in scope.",
-            "why_chosen": (
-                "Same shape as the first entry, with related_to pointing back at dec-001 "
-                "so neither shows up isolated despite sharing the 'clean' tag."
-            ),
-            "tags": ["clean"],
-            "related_to": ["dec-001"],
-        })
-        from server import handle_verify_quality
-        result = handle_verify_quality(project_params(tmp_path))
-        flagged_ids = [f["id"] for f in result["flagged"]]
-        assert "dec-001" not in flagged_ids
-        assert "dec-002" not in flagged_ids
 
 
 # ===========================================================================
@@ -1560,6 +1312,8 @@ class TestNextId:
         assert next_id([], "con") == "con-001"
         entries = [{"id": "con-009"}]
         assert next_id(entries, "con") == "con-010"
+
+
 
 
 # ===========================================================================
@@ -1615,6 +1369,8 @@ class TestDataIntegrity:
         # And the written file parses back
         entries = json.loads((ctx / "decisions.json").read_text(encoding="utf-8"))
         assert len(entries) == 1
+
+
 
 
 # ===========================================================================
@@ -1676,6 +1432,8 @@ class TestUpdateEntryValidation:
         assert result["entry"]["tags"] == ["new-tag"]
 
 
+
+
 # ===========================================================================
 # Budget packing: oversized entries are skipped, not blocking
 # ===========================================================================
@@ -1701,6 +1459,8 @@ class TestBudgetPackingSkip:
         assert "dec-001" not in ids
 
 
+
+
 # ===========================================================================
 # Recency scoring clamp
 # ===========================================================================
@@ -1715,6 +1475,8 @@ class TestRecencyClamp:
         s_future = score_entry(future_entry, now_dt=now_dt)
         s_fresh = score_entry(fresh_entry, now_dt=now_dt)
         assert s_future <= s_fresh + 1e-9
+
+
 
 
 # ===========================================================================
@@ -1734,6 +1496,8 @@ class TestSemanticFallback:
             "semantic": {"enabled": True, "url": "http://127.0.0.1:9"},
         })
         assert result["entries_returned"] >= 1
+
+
 
 
 # ===========================================================================
@@ -1790,6 +1554,8 @@ class TestSimilarEntrySurfacing:
         # Caller already acknowledged the relation — no warning needed.
         flagged_ids = [m["id"] for m in second.get("similar_entries", [])]
         assert first["id"] not in flagged_ids
+
+
 
 
 # ===========================================================================
@@ -1853,6 +1619,8 @@ class TestOverlapClassification:
         relations = [m["relation"] for m in second.get("similar_entries", [])]
         assert relations and all(r == "likely_restatement" for r in relations)
         assert "contradiction_note" not in second
+
+
 
 
 # ===========================================================================
@@ -2113,74 +1881,6 @@ class TestQueryEntries:
         assert ids["c1"] not in returned
 
 
-# ===========================================================================
-# scope_guard hook (v0.6): edit-time injection of scoped constraints
-# ===========================================================================
-
-import subprocess
-
-_HOOK = str(Path(__file__).parent.parent / "hooks" / "scope_guard.py")
-
-
-def _run_scope_guard(project: Path, file_path: str, session_id: str = "s1",
-                     event: str = None):
-    payload = {
-        "session_id": session_id,
-        "tool_name": "Edit",
-        "tool_input": {"file_path": file_path},
-    }
-    # Omitted entirely by default: that is the pre-upgrade payload shape, and
-    # every existing installation has this hook wired under PostToolUse.
-    if event is not None:
-        payload["hook_event_name"] = event
-    payload = json.dumps(payload)
-    env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
-    proc = subprocess.run(
-        [sys.executable, _HOOK], input=payload, capture_output=True,
-        text=True, env=env, timeout=30,
-    )
-    return proc.stdout.strip()
-
-
-class TestScopeGuardHook:
-    def _record_scoped(self, tmp_path):
-        return handle_record_constraint(constraint_params(
-            tmp_path,
-            rule="Hook output must be ASCII only in this project",
-            scope="hooks/",
-            tags=["hooks"],
-        ))
-
-    def test_scoped_constraint_fires_on_matching_edit(self, tmp_path):
-        rec = self._record_scoped(tmp_path)
-        out = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "session_start.py"))
-        assert rec["id"] in out
-        data = json.loads(out)
-        assert "additionalContext" in data["hookSpecificOutput"]
-
-    def test_global_constraint_does_not_fire(self, tmp_path):
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="A global rule that applies everywhere in the project"))
-        out = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "x.py"))
-        assert out == ""
-
-    def test_non_matching_path_does_not_fire(self, tmp_path):
-        self._record_scoped(tmp_path)
-        out = _run_scope_guard(tmp_path, str(tmp_path / "src" / "main.py"))
-        assert out == ""
-
-    def test_fires_once_per_session(self, tmp_path):
-        rec = self._record_scoped(tmp_path)
-        first = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-a")
-        second = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "b.py"), "sess-a")
-        assert rec["id"] in first
-        assert second == ""
-
-    def test_new_session_fires_again(self, tmp_path):
-        rec = self._record_scoped(tmp_path)
-        _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-a")
-        again = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-b")
-        assert rec["id"] in again
 
 
 # ===========================================================================
@@ -2214,6 +1914,8 @@ class TestRetrievalHints:
         assert result["results"][0]["entry"]["id"] == hinted["id"]
 
 
+
+
 # ===========================================================================
 # origin + trust weighting (v0.7)
 # ===========================================================================
@@ -2241,6 +1943,8 @@ class TestOriginTrust:
             "project_dir": str(tmp_path), "tags": ["x"], "include_related": False,
         })
         assert result["results"][0]["entry"]["id"] == user_rec["id"]
+
+
 
 
 # ===========================================================================
@@ -2297,111 +2001,6 @@ class TestTemporalFilters:
         assert result["entries_returned"] == 1
 
 
-# ===========================================================================
-# DECISIONS.md projection (v0.8): render-on-write + export_markdown
-# ===========================================================================
-
-from server import handle_export_markdown
-
-
-def _enable_md_export(tmp_path, path=None):
-    ctx = context_dir(tmp_path)
-    ctx.mkdir(exist_ok=True)
-    cfg = {"markdown_export": {"enabled": True}}
-    if path:
-        cfg["markdown_export"]["path"] = path
-    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-
-
-class TestMarkdownProjection:
-    def test_flag_off_by_default_no_file_created(self, tmp_path):
-        handle_record_decision(decision_params(tmp_path))
-        assert not (tmp_path / "DECISIONS.md").exists()
-
-    def test_render_on_write_creates_projection(self, tmp_path):
-        _enable_md_export(tmp_path)
-        rec = handle_record_decision(decision_params(
-            tmp_path, summary="Use JSON files over SQLite"))
-        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
-        assert f"### Use JSON files over SQLite" in md
-        assert f"(`{rec['id']}`)" in md
-        assert "- **Why:**" in md
-        assert "do not edit by hand" in md
-
-    def test_regenerated_whole_hand_edits_clobbered(self, tmp_path):
-        _enable_md_export(tmp_path)
-        handle_record_decision(decision_params(tmp_path, summary="First decision here"))
-        md_path = tmp_path / "DECISIONS.md"
-        md_path.write_text("HAND EDIT THAT MUST NOT SURVIVE", encoding="utf-8")
-        handle_record_decision(decision_params(tmp_path, summary="Second decision here"))
-        md = md_path.read_text(encoding="utf-8")
-        assert "HAND EDIT" not in md
-        assert "First decision here" in md
-        assert "Second decision here" in md
-
-    def test_update_entry_regenerates(self, tmp_path):
-        _enable_md_export(tmp_path)
-        rec = handle_record_decision(decision_params(tmp_path, summary="Original title here"))
-        handle_update_entry({
-            "project_dir": str(tmp_path), "id": rec["id"],
-            "updates": {"summary": "Revised title here"},
-        })
-        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
-        assert "Revised title here" in md
-        assert "Original title here" not in md
-
-    def test_deprecate_regenerates_with_marker(self, tmp_path):
-        _enable_md_export(tmp_path)
-        rec = handle_record_decision(decision_params(tmp_path))
-        handle_deprecate_entry({
-            "project_dir": str(tmp_path), "id": rec["id"],
-            "reason": "replaced by a better approach",
-            "superseded_by": "dec-099",
-        })
-        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
-        assert "**DEPRECATED**" in md
-        assert "replaced by a better approach" in md
-        assert "`dec-099`" in md
-
-    def test_non_decision_writes_do_not_render(self, tmp_path):
-        _enable_md_export(tmp_path)
-        handle_record_constraint(constraint_params(tmp_path))
-        assert not (tmp_path / "DECISIONS.md").exists()
-
-    def test_legacy_rationale_renders_as_why(self, tmp_path):
-        ctx = context_dir(tmp_path)
-        ctx.mkdir(exist_ok=True)
-        legacy = [{
-            "id": "dec-001", "summary": "Legacy entry from before v0.4",
-            "rationale": "The old freeform reasoning text lives here.",
-            "status": "active", "created_at": "2026-01-05T00:00:00+00:00",
-        }]
-        (ctx / "decisions.json").write_text(json.dumps(legacy), encoding="utf-8")
-        result = handle_export_markdown({"project_dir": str(tmp_path)})
-        assert result["success"] is True
-        md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
-        assert "- **Why:** The old freeform reasoning text lives here." in md
-        assert "01-05" in md
-
-    def test_export_markdown_backfills_without_flag(self, tmp_path):
-        handle_record_decision(decision_params(tmp_path))
-        assert not (tmp_path / "DECISIONS.md").exists()  # flag off
-        result = handle_export_markdown({"project_dir": str(tmp_path)})
-        assert result["success"] is True
-        assert result["decisions_rendered"] == 1
-        assert (tmp_path / "DECISIONS.md").exists()
-
-    def test_export_markdown_custom_path(self, tmp_path):
-        handle_record_decision(decision_params(tmp_path))
-        result = handle_export_markdown({
-            "project_dir": str(tmp_path), "path": "docs/LOG.md"})
-        assert result["success"] is True
-        # Custom relative path resolves against the project root
-        assert (tmp_path / "docs" / "LOG.md").exists()
-
-    def test_export_markdown_unresolved_project(self, tmp_path):
-        result = handle_export_markdown({"project_dir": str(tmp_path / "nowhere")})
-        assert "error" in result
 
 
 # ===========================================================================
@@ -2429,6 +2028,8 @@ class TestSummaryBudgetTruncation:
         assert "Decision number 0" in summary or "Active Decisions" in summary
         from server import estimate_tokens
         assert estimate_tokens(summary) <= 500
+
+
 
 
 class TestSummaryClustering:
@@ -2461,6 +2062,8 @@ class TestSummaryClustering:
         assert "(untagged) (9):" in result["summary"]
 
 
+
+
 class TestSimilarEntriesTrust:
     def test_matches_carry_origin(self, tmp_path):
         handle_record_decision(decision_params(
@@ -2476,6 +2079,8 @@ class TestSimilarEntriesTrust:
         similar = second.get("similar_entries", [])
         assert similar and similar[0]["origin"] == "user"
         assert "origin trust" in second["similar_note"]
+
+
 
 
 # ===========================================================================
@@ -2541,6 +2146,8 @@ class TestAbstention:
             "min_relevance": 1.01, "include_related": False}).get("no_confident_match") is True
 
 
+
+
 class TestSupersession:
     def test_supersedes_marks_old_entry(self, tmp_path):
         old = handle_record_decision(decision_params(
@@ -2602,6 +2209,8 @@ class TestSupersession:
         md = (tmp_path / "DECISIONS.md").read_text(encoding="utf-8")
         assert "**SUPERSEDED**" in md
         assert f"by `{new['id']}`" in md
+
+
 
 
 # ===========================================================================
@@ -2788,6 +2397,8 @@ class TestSupersessionAdvisory:
         assert "supersession" not in json.dumps(TOOLS).lower()
 
 
+
+
 # ===========================================================================
 # Predecessor line in get_context
 #
@@ -2934,835 +2545,6 @@ class TestPredecessorLine:
         direct["predecessor"].encode("ascii")  # raises if it is not
 
 
-# ===========================================================================
-# Tool-schema token budget (v0.7.1)
-# ===========================================================================
-
-
-class TestToolSchemaBudget:
-    def test_tools_list_payload_within_budget(self):
-        """Every connected MCP client pays the tools/list payload in context
-        tokens at every session start. Keep it bounded: a new field or a
-        wordier description must fit the budget or consciously raise it here,
-        with the cost acknowledged. Rich guidance belongs in _FIELD_GUIDANCE
-        rejection messages and CLAUDE.md, not in schema descriptions.
-        Measured ~2374 tokens at v0.7.1; ~2579 at v0.11.0 after adding the
-        12th tool (reload_constraints) with a deliberately terse description
-        — budget raised to 2650 to accommodate one more real tool. ~3053 at
-        v0.13.0 after adding the 13th tool (query_entries): a field-rich
-        structured-query tool with 13 predicates is inherently ~470 tokens
-        even with trimmed per-field descriptions — budget raised to 3100,
-        cost consciously accepted for a distinct query capability. ~3121 at
-        v0.14.0 after adding the merge_into param to deprecate_entry (dedup
-        merge) — one param, no new tool; budget raised to 3150. ~3923 after
-        adding record_entry, the unified write tool: it carries the union of the
-        three record_* schemas, and during the deprecation window we
-        deliberately keep BOTH record_entry and the three aliases so no caller
-        breaks — that transitional overlap is the cost. Budget raised to 4000;
-        it can drop again once the aliases are eventually retired. ~4066 after
-        the consolidation items: query_entries gained kind/text/limit filters and
-        get_project_summary's description became the one-call orientation blurb.
-        Budget raised to 4150. ~4280 after adding export_snapshot /
-        import_snapshot (team-shared snapshot) — two small schemas; budget
-        raised to 4350. ~2927 after buying budget back: the three deprecated
-        record_* aliases (record_decision/pipeline/constraint) were retired from
-        tools/list — their handlers stay in HANDLERS as hidden back-compat, so
-        the schema tax is gone but existing callers still work; pull_remote /
-        backfill_remote were folded into one `mirror(op=...)` tool; and the
-        heaviest descriptions were trimmed. Budget tightened to 3150 to LOCK IN
-        the reclaimed headroom — a new tool or wordier field must consciously
-        raise it again rather than silently re-spending what was bought back."""
-        from server import TOOLS, estimate_tokens
-        total = estimate_tokens(json.dumps(TOOLS))
-        assert total <= 3150, (
-            f"tools/list payload is ~{total} tokens (budget: 3150). "
-            "Trim schema descriptions or consciously raise the budget."
-        )
-
-
-# ===========================================================================
-# Constraint re-injection (v0.11): mid-session rules refresh
-# ===========================================================================
-
-_REINJECT_HOOK = str(Path(__file__).parent.parent / "hooks" / "constraint_reinject.py")
-
-
-def _write_config(project: Path, cfg: dict):
-    ctx = project / CONTEXT_DIR_NAME
-    ctx.mkdir(parents=True, exist_ok=True)
-    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-
-
-def _run_reinject(project: Path, session_id: str = "s1"):
-    payload = json.dumps({"session_id": session_id, "tool_name": "Bash"})
-    env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
-    proc = subprocess.run(
-        [sys.executable, _REINJECT_HOOK], input=payload, capture_output=True,
-        text=True, env=env, timeout=30,
-    )
-    return proc.stdout.strip()
-
-
-class TestBuildConstraintsBlock:
-    """The constraints-only block builder and the reload_constraints tool."""
-
-    def test_block_contains_only_constraints(self, tmp_path):
-        # Record one of each entry type; the block must surface only the
-        # constraint, not the decision or pipeline.
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="Never bypass the auth middleware", hardness="absolute"))
-        handle_record_decision(decision_params(
-            tmp_path, summary="Adopt JSON store for memory"))
-        handle_record_pipeline(pipeline_params(tmp_path, name="Deploy flow"))
-
-        block = build_constraints_block(str(tmp_path / CONTEXT_DIR_NAME))
-        assert block["initialized"] is True
-        assert block["count"] == 1
-        assert "Never bypass the auth middleware" in block["text"]
-        assert "Absolute Constraints (1):" in block["text"]
-        # No decision / pipeline leakage.
-        assert "JSON store" not in block["text"]
-        assert "Deploy flow" not in block["text"]
-        assert "Decisions" not in block["text"]
-        assert "Pipelines" not in block["text"]
-
-    def test_block_format_matches_session_start(self, tmp_path):
-        # The re-injected block must render constraints identically to the
-        # session-start summary. Extract the constraint lines from the full
-        # summary and assert they appear verbatim in the block.
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="Absolute one here", hardness="absolute"))
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="Advisory two here", hardness="advisory"))
-        base = str(tmp_path / CONTEXT_DIR_NAME)
-        block = build_constraints_block(base)
-        summary = handle_get_project_summary({"project_dir": str(tmp_path)})["summary"]
-        assert block["text"] in summary
-
-    def test_deprecated_constraints_excluded(self, tmp_path):
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, rule="Soon to be deprecated rule"))
-        handle_deprecate_entry({
-            "project_dir": str(tmp_path), "id": rec["id"], "reason": "no longer true"})
-        block = build_constraints_block(str(tmp_path / CONTEXT_DIR_NAME))
-        assert block["count"] == 0
-        assert block["text"] == ""
-
-    def test_no_context_dir_uninitialized(self, tmp_path):
-        block = build_constraints_block(str(tmp_path / "does_not_exist"))
-        assert block["initialized"] is False
-        assert block["count"] == 0
-        assert block["text"] == ""
-
-    def test_reload_tool_returns_current_constraints(self, tmp_path):
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="Rule surfaced on demand"))
-        out = handle_reload_constraints({"project_dir": str(tmp_path)})
-        assert out["initialized"] is True
-        assert out["count"] == 1
-        assert "Rule surfaced on demand" in out["constraints"]
-
-    def test_reload_tool_reflects_updates(self, tmp_path):
-        # Recording another constraint changes what reload returns — it reads
-        # live, not a snapshot.
-        handle_record_constraint(constraint_params(tmp_path, rule="First rule here"))
-        first = handle_reload_constraints({"project_dir": str(tmp_path)})
-        assert first["count"] == 1
-        handle_record_constraint(constraint_params(tmp_path, rule="Second rule here"))
-        second = handle_reload_constraints({"project_dir": str(tmp_path)})
-        assert second["count"] == 2
-        assert "Second rule here" in second["constraints"]
-
-    def test_reload_tool_uninitialized_when_no_store(self, tmp_path):
-        out = handle_reload_constraints({"project_dir": str(tmp_path / "nope")})
-        assert out["initialized"] is False
-        assert out["count"] == 0
-
-
-class TestConstraintReinjectHook:
-    """The PostToolUse periodic re-injection hook: opt-in, default off."""
-
-    def _record(self, tmp_path):
-        return handle_record_constraint(constraint_params(
-            tmp_path, rule="Re-injected rule that must persist"))
-
-    def test_disabled_by_default(self, tmp_path):
-        # No config.json at all -> feature off -> never fires.
-        self._record(tmp_path)
-        for _ in range(6):
-            assert _run_reinject(tmp_path) == ""
-
-    def test_explicit_disabled_never_fires(self, tmp_path):
-        self._record(tmp_path)
-        _write_config(tmp_path, {"constraint_reinjection": {"enabled": False}})
-        for _ in range(6):
-            assert _run_reinject(tmp_path) == ""
-
-    def test_fires_every_n_tools(self, tmp_path):
-        rec = self._record(tmp_path)
-        _write_config(tmp_path, {
-            "constraint_reinjection": {"enabled": True, "every_n_tools": 3}})
-        fired = [bool(_run_reinject(tmp_path)) for _ in range(7)]
-        # Silent for the first 2, fires on the 3rd, then every 3rd after.
-        assert fired == [False, False, True, False, False, True, False]
-
-    def test_injected_payload_is_constraints_only(self, tmp_path):
-        rec = self._record(tmp_path)
-        handle_record_decision(decision_params(
-            tmp_path, summary="A decision that must not appear"))
-        _write_config(tmp_path, {
-            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
-        out = _run_reinject(tmp_path)
-        data = json.loads(out)
-        ctx = data["hookSpecificOutput"]["additionalContext"]
-        assert data["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
-        assert rec["id"] in ctx
-        assert "Re-injected rule that must persist" in ctx
-        assert "A decision that must not appear" not in ctx
-
-    def test_counter_resets_per_session(self, tmp_path):
-        self._record(tmp_path)
-        _write_config(tmp_path, {
-            "constraint_reinjection": {"enabled": True, "every_n_tools": 3}})
-        # Two calls in session A (no fire yet), then a new session B restarts
-        # the count, so B also needs 3 calls before its first fire.
-        assert _run_reinject(tmp_path, "sess-a") == ""
-        assert _run_reinject(tmp_path, "sess-a") == ""
-        assert _run_reinject(tmp_path, "sess-b") == ""
-        assert _run_reinject(tmp_path, "sess-b") == ""
-        assert _run_reinject(tmp_path, "sess-b") != ""
-
-    def test_no_constraints_stays_silent(self, tmp_path):
-        # Feature on, but nothing recorded yet -> nothing to surface.
-        _write_config(tmp_path, {
-            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
-        # Need a .context/ dir for the hook to resolve the project.
-        assert _run_reinject(tmp_path) == ""
-
-    def test_output_is_ascii(self, tmp_path):
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="Rule with unicode: cafe resume naive"))
-        _write_config(tmp_path, {
-            "constraint_reinjection": {"enabled": True, "every_n_tools": 1}})
-        out = _run_reinject(tmp_path)
-        out.encode("ascii")  # raises if any non-ASCII slipped through
-
-
-# ===========================================================================
-# CLI parity (Item 6): context-keeper <tool> '<json>' -> same HANDLERS
-# ===========================================================================
-
-_SERVER = str(Path(__file__).parent.parent / "server.py")
-
-
-def _run_cli(project, *args, env_project=True):
-    env = dict(os.environ)
-    if env_project:
-        env["CONTEXT_KEEPER_PROJECT"] = str(project)
-    return subprocess.run(
-        [sys.executable, _SERVER, *args], capture_output=True, text=True,
-        env=env, timeout=30,
-    )
-
-
-class TestCLI:
-    def test_record_then_query_roundtrip(self, tmp_path):
-        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
-        rec = _run_cli(tmp_path, "record_entry", json.dumps({
-            "kind": "constraint",
-            "rule": "Never log the signing secret anywhere",
-            "reason": "A leaked secret in logs lets anyone forge authenticated requests, a bypass.",
-        }))
-        assert rec.returncode == 0
-        assert json.loads(rec.stdout)["id"] == "con-001"
-
-        q = _run_cli(tmp_path, "query_entries", json.dumps({"kind": "constraint"}))
-        assert q.returncode == 0
-        assert json.loads(q.stdout)["matched_entries"] == 1
-
-    def test_project_dir_in_json_args(self, tmp_path):
-        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
-        r = _run_cli(tmp_path, "get_project_summary",
-                     json.dumps({"project_dir": str(tmp_path)}), env_project=False)
-        assert r.returncode == 0
-        assert json.loads(r.stdout)["initialized"] in (True, False)
-
-    def test_unknown_tool_exit_2(self, tmp_path):
-        r = _run_cli(tmp_path, "bogus_tool", "{}")
-        assert r.returncode == 2
-        assert "Unknown tool" in r.stderr
-
-    def test_bad_json_exit_2(self, tmp_path):
-        r = _run_cli(tmp_path, "query_entries", "not json")
-        assert r.returncode == 2
-        assert "Invalid JSON" in r.stderr
-
-    def test_handler_error_exit_1(self, tmp_path):
-        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
-        # get_context with an unknown id returns {"error": ...} -> exit 1
-        r = _run_cli(tmp_path, "get_context", json.dumps({"id": "dec-999"}))
-        assert r.returncode == 1
-        assert "error" in json.loads(r.stdout)
-
-    def test_help_exit_0_lists_tools(self, tmp_path):
-        r = _run_cli(tmp_path, "--help")
-        assert r.returncode == 0
-        assert "record_entry" in r.stderr and "query_entries" in r.stderr
-
-    def test_no_args_is_stdio_not_cli(self, tmp_path):
-        # With no args the process serves stdio: feed one initialize request.
-        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
-        proc = subprocess.run(
-            [sys.executable, _SERVER], capture_output=True, text=True, env=env,
-            input='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
-            timeout=30,
-        )
-        assert proc.returncode == 0
-        assert json.loads(proc.stdout.splitlines()[0])["result"]["serverInfo"]["name"] == "context-keeper"
-
-
-# ===========================================================================
-# Team-shared snapshot (Item 5): export / import / first-run bootstrap
-# ===========================================================================
-
-from server import (  # noqa: E402
-    handle_export_snapshot,
-    handle_import_snapshot,
-    SNAPSHOT_DIR_NAME,
-    SNAPSHOT_FILE_NAME,
-)
-
-
-class TestSnapshot:
-    def _seed(self, tmp_path):
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="Never log the signing secret in any output",
-            reason="A leaked secret in logs lets anyone forge authenticated requests here."))
-        handle_record_decision(decision_params(
-            tmp_path, summary="Use gzip snapshots for team sharing"))
-
-    def _snap_file(self, tmp_path):
-        return tmp_path / SNAPSHOT_DIR_NAME / SNAPSHOT_FILE_NAME
-
-    def test_export_writes_snapshot_and_gitattributes(self, tmp_path):
-        self._seed(tmp_path)
-        r = handle_export_snapshot({"project_dir": str(tmp_path)})
-        assert r["success"] is True
-        assert self._snap_file(tmp_path).exists()
-        assert r["counts"] == {"decisions": 1, "pipelines": 0, "constraints": 1}
-        ga = (tmp_path / ".gitattributes").read_text()
-        assert f"{SNAPSHOT_DIR_NAME}/{SNAPSHOT_FILE_NAME} merge=ours" in ga
-
-    def test_export_is_byte_stable_for_same_content(self, tmp_path):
-        self._seed(tmp_path)
-        handle_export_snapshot({"project_dir": str(tmp_path)})
-        first = self._snap_file(tmp_path).read_bytes()
-        handle_export_snapshot({"project_dir": str(tmp_path)})
-        second = self._snap_file(tmp_path).read_bytes()
-        assert first == second  # mtime=0 -> reproducible, no git churn
-
-    def test_gitattributes_idempotent(self, tmp_path):
-        self._seed(tmp_path)
-        assert handle_export_snapshot({"project_dir": str(tmp_path)})["gitattributes"] == "added"
-        assert handle_export_snapshot({"project_dir": str(tmp_path)})["gitattributes"] == "present"
-        # not duplicated
-        ga = (tmp_path / ".gitattributes").read_text()
-        assert ga.count("merge=ours") == 1
-
-    def test_import_into_empty_store_restores(self, tmp_path):
-        self._seed(tmp_path)
-        handle_export_snapshot({"project_dir": str(tmp_path)})
-        # simulate a fresh clone: remove the working store, keep the snapshot
-        import shutil
-        shutil.rmtree(context_dir(tmp_path))
-        r = handle_import_snapshot({"project_dir": str(tmp_path)})
-        assert r["success"] is True
-        assert r["imported"]["decisions"] == 1 and r["imported"]["constraints"] == 1
-        assert (context_dir(tmp_path) / "decisions.json").exists()
-
-    def test_import_is_non_destructive(self, tmp_path):
-        self._seed(tmp_path)
-        handle_export_snapshot({"project_dir": str(tmp_path)})
-        # store still populated -> import must skip, not overwrite
-        r = handle_import_snapshot({"project_dir": str(tmp_path)})
-        assert r["skipped"] == {"decisions": True, "constraints": True}
-
-    def test_import_errors_without_snapshot(self, tmp_path):
-        (context_dir(tmp_path)).mkdir(parents=True, exist_ok=True)
-        r = handle_import_snapshot({"project_dir": str(tmp_path)})
-        assert "error" in r
-
-    def test_get_project_summary_bootstraps_on_first_run(self, tmp_path):
-        self._seed(tmp_path)
-        handle_export_snapshot({"project_dir": str(tmp_path)})
-        import shutil
-        shutil.rmtree(context_dir(tmp_path))
-        assert not context_dir(tmp_path).exists()
-        # first orienting call hydrates from the snapshot, then summarizes
-        s = handle_get_project_summary({"project_dir": str(tmp_path)})
-        assert s["initialized"] is True
-        assert s["counts"]["decisions"] == 1
-        assert len(s["active_constraints"]) == 1
-
-    def test_bootstrap_noop_when_store_present(self, tmp_path):
-        self._seed(tmp_path)
-        handle_export_snapshot({"project_dir": str(tmp_path)})
-        # add an entry AFTER export; bootstrap must not clobber it back
-        handle_record_decision(decision_params(tmp_path, summary="Added after the snapshot export"))
-        s = handle_get_project_summary({"project_dir": str(tmp_path)})
-        assert s["counts"]["decisions"] == 2  # the post-snapshot entry survives
-
-
-# ===========================================================================
-# UTF-8 stdio boundary: non-ASCII input must not be decoded as cp1252 mojibake
-# ===========================================================================
-
-_SERVER_PATH = str(Path(__file__).parent.parent / "server.py")
-
-
-class TestStdioUtf8RoundTrip:
-    """Regression: the MCP stdio transport must decode client input as UTF-8.
-
-    On Windows, stdin defaults to cp1252, so a UTF-8 em-dash (U+2014, wire
-    bytes e2 80 94) was decoded to the mojibake 'a\\u20ac\"' and persisted --
-    the upstream source of the mojibake that corrupted the knowledge base.
-    We drive the REAL stdio server in a subprocess and force its default
-    stdio codepage to cp1252 (PYTHONIOENCODING) so the bug reproduces on any
-    OS; the fix (reconfigure to UTF-8 in _serve_stdio) must override it.
-    """
-
-    def _drive(self, tmp_path, marker):
-        (tmp_path / CONTEXT_DIR_NAME).mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path),
-                   PYTHONIOENCODING="cp1252")
-        env.pop("CONTEXT_KEEPER_REMOTE_URL", None)
-        requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-                "name": "record_decision", "arguments": {
-                    "summary": marker,
-                    "problem": "p" * 50,
-                    "why_chosen": "w" * 70,
-                }}},
-        ]
-        # ensure_ascii=False so the non-ASCII chars travel as RAW UTF-8 bytes on
-        # the wire -- exactly what a JavaScript MCP client's JSON.stringify emits
-        # (it does not \u-escape). That raw-byte path is what a cp1252 stdin
-        # mis-decodes; ASCII \u-escapes would sidestep the bug and prove nothing.
-        stdin_bytes = ("\n".join(json.dumps(r, ensure_ascii=False) for r in requests)
-                       + "\n").encode("utf-8")
-        subprocess.run(
-            [sys.executable, _SERVER_PATH], input=stdin_bytes,
-            capture_output=True, env=env, timeout=30,
-        )
-        disk = json.loads(
-            (tmp_path / CONTEXT_DIR_NAME / "decisions.json").read_text(encoding="utf-8"))
-        return disk
-
-    def test_em_dash_arrow_check_round_trip(self, tmp_path):
-        # em-dash (U+2014), arrow (U+2192), check (U+2713)
-        marker = "scope—wide flow→step done✓"
-        disk = self._drive(tmp_path, marker)
-        assert len(disk) == 1
-        # Exact codepoints preserved -- not cp1252 mojibake.
-        assert disk[0]["summary"] == marker
-        # And explicitly assert the classic em-dash mojibake is absent.
-        assert "â" not in disk[0]["summary"]
-
-
-# ===========================================================================
-# Transport: JSON-RPC batch handling (audit #1)
-# ===========================================================================
-
-from server import _handle_line, _dispatch_message  # noqa: E402
-
-
-class TestJsonRpcTransport:
-    """A legal JSON-RPC 2.0 batch must not kill the transport.
-
-    Regression: _serve_stdio called msg.get("id") on the parsed line
-    *outside* the only try block, so a top-level array -- which the spec
-    explicitly permits a client to send at any time -- raised
-    AttributeError out of the read loop and terminated the server process,
-    taking every subsequent request with it.
-    """
-
-    def test_batch_array_does_not_crash_and_answers_each(self, tmp_path):
-        line = json.dumps([
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        ])
-        out = _handle_line(line)
-        assert out is not None
-        payload = json.loads(out)
-        assert isinstance(payload, list) and len(payload) == 2
-        assert [r["id"] for r in payload] == [1, 2]
-        assert payload[0]["result"]["serverInfo"]["name"] == "context-keeper"
-        assert "tools" in payload[1]["result"]
-
-    def test_batch_of_only_notifications_writes_nothing(self):
-        line = json.dumps([
-            {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            {"jsonrpc": "2.0", "method": "notifications/cancelled"},
-        ])
-        assert _handle_line(line) is None
-
-    def test_batch_mixed_notification_and_request_answers_only_request(self):
-        line = json.dumps([
-            {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}},
-        ])
-        payload = json.loads(_handle_line(line))
-        assert isinstance(payload, list) and len(payload) == 1
-        assert payload[0]["id"] == 7
-
-    def test_empty_batch_is_invalid_request_not_a_crash(self):
-        payload = json.loads(_handle_line("[]"))
-        assert payload["error"]["code"] == -32600
-        assert payload["id"] is None
-
-    def test_batch_with_junk_member_still_answers_the_good_one(self):
-        line = json.dumps([42, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}])
-        payload = json.loads(_handle_line(line))
-        assert len(payload) == 2
-        assert payload[0]["error"]["code"] == -32600
-        assert payload[1]["id"] == 3
-
-    def test_scalar_toplevel_is_invalid_request(self):
-        for raw in ("42", '"hello"', "true", "null"):
-            payload = json.loads(_handle_line(raw))
-            assert payload["error"]["code"] == -32600, raw
-
-    def test_malformed_json_is_parse_error(self):
-        payload = json.loads(_handle_line("{not json"))
-        assert payload["error"]["code"] == -32700
-
-    def test_non_string_method_is_invalid_request(self):
-        payload = json.loads(_handle_line(json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": {"a": 1}})))
-        assert payload["error"]["code"] == -32600
-
-    def test_null_params_does_not_crash(self):
-        payload = json.loads(_handle_line(json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": None})))
-        # Falls through to the unknown-tool branch rather than raising.
-        assert payload["result"]["isError"] is True
-
-    def test_single_request_shape_unchanged(self):
-        payload = json.loads(_handle_line(json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
-        assert isinstance(payload, dict)
-        assert payload["result"]["protocolVersion"] == "2024-11-05"
-
-    def test_live_server_survives_a_batch_and_keeps_serving(self, tmp_path):
-        """End-to-end: drive the REAL stdio process. Before the fix the batch
-        line killed it, so the follow-up request got no answer at all."""
-        (tmp_path / CONTEXT_DIR_NAME).mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
-        env.pop("CONTEXT_KEEPER_REMOTE_URL", None)
-        stdin = (
-            json.dumps([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}])
-            + "\n"
-            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-            + "\n"
-        )
-        proc = subprocess.run(
-            [sys.executable, _SERVER_PATH], input=stdin, capture_output=True,
-            text=True, env=env, timeout=30,
-        )
-        assert proc.returncode == 0, proc.stderr
-        lines = [l for l in proc.stdout.splitlines() if l.strip()]
-        # Line 1: the batch response (an array). Line 2: the follow-up, which
-        # only exists if the batch did not kill the process.
-        assert isinstance(json.loads(lines[0]), list)
-        assert json.loads(lines[1])["id"] == 2
-
-
-# ===========================================================================
-# Read-modify-write races: index must not survive the re-read (audit #2)
-# ===========================================================================
-
-
-class TestStaleIndexWrites:
-    """update_entry / deprecate_entry must re-find by id after the re-read.
-
-    Both handlers used to take `index` from _find_entry_by_id's read, then
-    _load_entries_for_write the file AGAIN and blind-assign
-    entries[index] = entry. If the file changed in between -- another
-    agent's record_*, a mirror pull, or the hand-edit README.md:537
-    explicitly invites -- that index points at a DIFFERENT record and the
-    write silently overwrites it. The merge path in deprecate_entry was
-    already hardened against exactly this (it rebuilds an id->index map
-    after the re-read) but the fix was never back-ported to the two plain
-    paths.
-
-    Each test reproduces the corruption by changing the store between the
-    two reads, which is what a hand-edit or a concurrent write looks like
-    from the handler's point of view.
-    """
-
-    def _decisions(self, tmp_path):
-        return context_dir(tmp_path) / "decisions.json"
-
-    def _seed_three(self, tmp_path):
-        ids = []
-        for n in ("alpha", "bravo", "charlie"):
-            r = handle_record_decision(decision_params(
-                tmp_path, summary=f"Decision about {n} subsystem", tags=[n]))
-            ids.append(r["entry"]["id"])
-        return ids
-
-    def _change_between_reads(self, monkeypatch, path, mutate, fire_on=2):
-        """Run mutate(path) exactly once, on the handler's Nth read of `path`.
-
-        Read 1 is _find_entry_by_id's (where the stale index came from); read
-        2 is _load_entries_for_write's, so firing on read 2 places the change
-        precisely in the window between them -- the race being fixed. The
-        mutated content is what read 2 returns.
-        """
-        import server as srv
-        original = srv._read_json_file_checked
-        state = {"reads": 0, "fired": False}
-
-        def hooked(p):
-            if os.path.abspath(p) == os.path.abspath(path):
-                state["reads"] += 1
-                if not state["fired"] and state["reads"] == fire_on:
-                    state["fired"] = True
-                    mutate(path)
-            return original(p)
-
-        monkeypatch.setattr(srv, "_read_json_file_checked", hooked)
-        return state
-
-    @staticmethod
-    def _reverse_on_disk(p):
-        disk = json.loads(Path(p).read_text(encoding="utf-8"))
-        disk.reverse()
-        Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
-
-    def test_update_entry_does_not_clobber_a_reordered_neighbor(
-            self, tmp_path, monkeypatch):
-        a, b, c = self._seed_three(tmp_path)
-        path = self._decisions(tmp_path)
-
-        # 'a' is at index 0 on the first read; after the reversal index 0 is
-        # 'c'. The old code wrote the mutated 'a' into slot 0 -- destroying 'c'.
-        self._change_between_reads(monkeypatch, str(path), self._reverse_on_disk)
-        r = handle_update_entry({
-            "project_dir": str(tmp_path), "id": a,
-            "updates": {"summary": "Rewritten alpha summary"}})
-        assert "error" not in r, r
-
-        disk = json.loads(path.read_text(encoding="utf-8"))
-        by_id = {e["id"]: e for e in disk}
-        # Nothing lost, nothing duplicated.
-        assert len(disk) == 3
-        assert sorted(by_id) == sorted([a, b, c])
-        # The update landed on 'a' ...
-        assert by_id[a]["summary"] == "Rewritten alpha summary"
-        # ... and the neighbors are untouched, not overwritten by a copy of 'a'.
-        assert by_id[c]["summary"] == "Decision about charlie subsystem"
-        assert by_id[b]["summary"] == "Decision about bravo subsystem"
-
-    def test_deprecate_entry_does_not_clobber_a_reordered_neighbor(
-            self, tmp_path, monkeypatch):
-        a, b, c = self._seed_three(tmp_path)
-        path = self._decisions(tmp_path)
-
-        self._change_between_reads(monkeypatch, str(path), self._reverse_on_disk)
-        r = handle_deprecate_entry({
-            "project_dir": str(tmp_path), "id": a,
-            "reason": "Superseded during a concurrent-edit regression test."})
-        assert "error" not in r, r
-
-        disk = json.loads(path.read_text(encoding="utf-8"))
-        by_id = {e["id"]: e for e in disk}
-        assert len(disk) == 3
-        assert sorted(by_id) == sorted([a, b, c])
-        # Exactly ONE entry got deprecated, and it is the one we asked for.
-        assert by_id[a]["status"] == "deprecated"
-        assert by_id[b].get("status") != "deprecated"
-        assert by_id[c].get("status") != "deprecated"
-
-    def test_update_entry_preserves_a_concurrent_edit_to_another_field(
-            self, tmp_path, monkeypatch):
-        """The stale COPY was assigned back wholesale, so a concurrent edit to
-        a field the caller never mentioned got reverted. Applying the update
-        to the freshly-read object keeps it."""
-        a, _b, _c = self._seed_three(tmp_path)
-        path = self._decisions(tmp_path)
-
-        def hand_edit(p):
-            disk = json.loads(Path(p).read_text(encoding="utf-8"))
-            for e in disk:
-                if e["id"] == a:
-                    e["tradeoffs"] = "Added by hand while the tool was running"
-            Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
-
-        self._change_between_reads(monkeypatch, str(path), hand_edit)
-        handle_update_entry({
-            "project_dir": str(tmp_path), "id": a,
-            "updates": {"summary": "Rewritten alpha summary"}})
-
-        disk = json.loads(path.read_text(encoding="utf-8"))
-        entry = next(e for e in disk if e["id"] == a)
-        assert entry["summary"] == "Rewritten alpha summary"
-        assert entry["tradeoffs"] == "Added by hand while the tool was running"
-
-    @staticmethod
-    def _deleter(target_id):
-        def delete(p):
-            disk = json.loads(Path(p).read_text(encoding="utf-8"))
-            disk = [e for e in disk if e["id"] != target_id]
-            Path(p).write_text(json.dumps(disk, indent=2), encoding="utf-8")
-        return delete
-
-    def test_update_entry_errors_if_the_entry_vanishes_mid_write(
-            self, tmp_path, monkeypatch):
-        a, b, c = self._seed_three(tmp_path)
-        path = self._decisions(tmp_path)
-
-        self._change_between_reads(monkeypatch, str(path), self._deleter(a))
-        r = handle_update_entry({
-            "project_dir": str(tmp_path), "id": a,
-            "updates": {"summary": "Rewritten alpha summary"}})
-        assert "error" in r and "retry" in r["error"].lower()
-
-        # Refusing is the point: the survivors stay intact and the vanished
-        # entry is not resurrected into someone else's slot.
-        disk = json.loads(path.read_text(encoding="utf-8"))
-        assert sorted(e["id"] for e in disk) == sorted([b, c])
-        assert all("Rewritten alpha" not in e["summary"] for e in disk)
-
-    def test_deprecate_entry_errors_if_the_entry_vanishes_mid_write(
-            self, tmp_path, monkeypatch):
-        a, b, c = self._seed_three(tmp_path)
-        path = self._decisions(tmp_path)
-
-        self._change_between_reads(monkeypatch, str(path), self._deleter(a))
-        r = handle_deprecate_entry({
-            "project_dir": str(tmp_path), "id": a,
-            "reason": "Deprecating an entry that vanished under us."})
-        assert "error" in r and "retry" in r["error"].lower()
-
-        disk = json.loads(path.read_text(encoding="utf-8"))
-        assert sorted(e["id"] for e in disk) == sorted([b, c])
-        assert not any(e.get("status") == "deprecated" for e in disk)
-
-    def test_update_entry_happy_path_unchanged(self, tmp_path):
-        """Guard: no concurrent change, behavior identical to before."""
-        a, _b, _c = self._seed_three(tmp_path)
-        r = handle_update_entry({
-            "project_dir": str(tmp_path), "id": a,
-            "updates": {"summary": "Plain update, no race"}})
-        assert r["success"] is True
-        assert r["entry"]["summary"] == "Plain update, no race"
-        disk = json.loads(self._decisions(tmp_path).read_text(encoding="utf-8"))
-        assert len(disk) == 3
-        assert next(e for e in disk if e["id"] == a)["summary"] == "Plain update, no race"
-
-    def test_deprecate_entry_happy_path_unchanged(self, tmp_path):
-        a, _b, _c = self._seed_three(tmp_path)
-        r = handle_deprecate_entry({
-            "project_dir": str(tmp_path), "id": a,
-            "reason": "No race here; the ordinary deprecation path must still work."})
-        assert r["success"] is True and r["status"] == "deprecated"
-        disk = json.loads(self._decisions(tmp_path).read_text(encoding="utf-8"))
-        assert len(disk) == 3
-        assert next(e for e in disk if e["id"] == a)["status"] == "deprecated"
-
-
-# ===========================================================================
-# Distribution metadata: packaging, manifest, version (audit #4 and #6)
-# ===========================================================================
-
-_REPO_ROOT = Path(__file__).parent.parent
-_PYPROJECT = _REPO_ROOT / "pyproject.toml"
-_MANIFEST = _REPO_ROOT / "mcpb" / "manifest.json"
-_SERVER_JSON = _REPO_ROOT / "server.json"
-
-# Top-level .py files that are deliberately NOT shipped to pip users.
-# Keep this list tiny and justified -- it is the only escape hatch from the
-# completeness check below, so anything added here needs a reason.
-_NOT_SHIPPED = {
-    "setup.py",      # (none today) build shim, not runtime
-    "conftest.py",   # test-only
-}
-
-
-def _pyproject_section(name):
-    """Return the raw text of one [section] of pyproject.toml.
-
-    Deliberately a text scan rather than tomllib: tomllib is 3.11+, the
-    project supports 3.10, and importorskip would let this check silently
-    vanish on exactly the interpreter someone might be releasing from.
-    """
-    text = _PYPROJECT.read_text(encoding="utf-8")
-    start = text.index(f"[{name}]") + len(name) + 2
-    rest = text[start:]
-    nxt = rest.find("\n[")
-    return rest if nxt == -1 else rest[:nxt]
-
-
-def _shipped_python_modules():
-    """Every Python module the installed package needs at runtime, derived
-    from the repo rather than from a hand-maintained list."""
-    mods = {p.name for p in _REPO_ROOT.glob("*.py")} - _NOT_SHIPPED
-    mods |= {f"hooks/{p.name}" for p in (_REPO_ROOT / "hooks").glob("*.py")}
-    return mods
-
-
-class TestPackagingCompleteness:
-    """Every runtime module must appear in BOTH hatch include lists.
-
-    This is a flat module layout, not a package, so hatch sweeps no
-    directory -- each file must be named explicitly. A module missing from
-    these lists is silently absent from the pip install and the feature it
-    implements just stops existing for pip users, with no error anywhere.
-
-    That has now happened twice: mirror.py (fixed in b5acffa) and
-    hooks/constraint_reinject.py, which dropped the entire v0.11 constraint-
-    reinjection feature from every pip install. Deriving the expected set
-    from the repo is what stops a third occurrence -- a hand-maintained
-    checklist is exactly what failed the first two times.
-    """
-
-    def test_every_runtime_module_is_in_the_sdist_include(self):
-        section = _pyproject_section("tool.hatch.build.targets.sdist")
-        missing = sorted(m for m in _shipped_python_modules()
-                         if f'"{m}"' not in section)
-        assert not missing, (
-            f"Modules exist in the repo but are missing from the sdist "
-            f"include list in pyproject.toml: {missing}")
-
-    def test_every_runtime_module_is_in_the_wheel_force_include(self):
-        section = _pyproject_section("tool.hatch.build.targets.wheel.force-include")
-        missing = sorted(m for m in _shipped_python_modules()
-                         if f'"{m}" = "{m}"' not in section)
-        assert not missing, (
-            f"Modules exist in the repo but are missing from the wheel "
-            f"force-include map in pyproject.toml: {missing}")
-
-    def test_constraint_reinject_hook_specifically_is_packaged(self):
-        """Named explicitly: this is the regression that motivated the check,
-        and the hook README.md documents as a configurable PostToolUse hook."""
-        for section_name in ("tool.hatch.build.targets.sdist",
-                             "tool.hatch.build.targets.wheel.force-include"):
-            assert "hooks/constraint_reinject.py" in _pyproject_section(section_name)
-
-    def test_every_documented_hook_is_packaged(self):
-        """README tells users to wire these paths into settings.json. A hook
-        the docs configure but the package omits is a broken install."""
-        readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        documented = {
-            f"hooks/{p.name}" for p in (_REPO_ROOT / "hooks").glob("*.py")
-            if f"hooks/{p.name}" in readme
-        }
-        assert documented, "expected README to document at least one hook path"
-        sdist = _pyproject_section("tool.hatch.build.targets.sdist")
-        assert all(f'"{h}"' in sdist for h in documented), sorted(
-            h for h in documented if f'"{h}"' not in sdist)
 
 
 class TestSemanticAbstention:
@@ -3937,258 +2719,6 @@ class TestSemanticAbstention:
         assert "no_confident_match" not in r
 
 
-class TestMcpbBundleStaging:
-    """The Claude Desktop .mcpb bundle must stage every first-party module.
-
-    Third instance of the same bug found by this audit: build-mcpb.sh
-    hand-picked server.py + semantic_index.py and omitted mirror.py.
-    server.py imports mirror inside a try/except so it can never fail loudly
-    -- the desktop bundle just shipped with the mirror feature silently
-    missing, exactly like the pip package did before b5acffa.
-    """
-
-    def test_build_script_stages_every_top_level_module(self):
-        script = (_REPO_ROOT / "scripts" / "build-mcpb.sh").read_text(encoding="utf-8")
-        modules = {p.name for p in _REPO_ROOT.glob("*.py")} - _NOT_SHIPPED
-        missing = sorted(m for m in modules if f'"$ROOT/{m}"' not in script)
-        assert not missing, (
-            f"scripts/build-mcpb.sh does not stage: {missing} -- the desktop "
-            f"bundle would ship without them")
-
-    def test_mirror_specifically_is_staged(self):
-        script = (_REPO_ROOT / "scripts" / "build-mcpb.sh").read_text(encoding="utf-8")
-        assert '"$ROOT/mirror.py"' in script
-
-
-class TestManifestToolsMatchServer:
-    """mcpb/manifest.json advertises the tool list to Claude Desktop.
-
-    It had drifted badly: it still advertised record_decision /
-    record_pipeline / record_constraint, which were folded into record_entry
-    and are no longer in server.TOOLS at all, while omitting record_entry
-    itself plus export_snapshot, import_snapshot and mirror. So the bundle
-    promised three tools that do not exist over MCP and hid four that do.
-    """
-
-    def _manifest_names(self):
-        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
-        return sorted(t["name"] for t in manifest["tools"])
-
-    def test_manifest_advertises_exactly_the_server_tools(self):
-        import server as srv
-        assert self._manifest_names() == sorted(t["name"] for t in srv.TOOLS)
-
-    def test_manifest_advertises_no_retired_tool(self):
-        import server as srv
-        live = {t["name"] for t in srv.TOOLS}
-        retired = {"record_decision", "record_pipeline", "record_constraint"}
-        assert not retired & live, "retired names came back into TOOLS"
-        assert not retired & set(self._manifest_names())
-
-    def test_manifest_tools_are_all_callable_handlers(self):
-        import server as srv
-        assert all(n in srv.HANDLERS for n in self._manifest_names())
-
-
-class TestVersionConsistency:
-    """One release, five version literals, and CI syncs only one of them.
-
-    pyproject.toml, server.json (twice: the server version and the pypi
-    package version), mcpb/manifest.json and server.py all carry the number
-    verbatim, because each format requires a literal. Nothing checked they
-    agreed, so a partial bump ships a wheel whose initialize response,
-    registry entry and desktop bundle all claim different versions.
-    """
-
-    def _versions(self):
-        pyproject = _PYPROJECT.read_text(encoding="utf-8")
-        m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
-        assert m, "no version in pyproject.toml"
-        server_json = json.loads(_SERVER_JSON.read_text(encoding="utf-8"))
-        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
-        import server as srv
-        return {
-            "pyproject.toml": m.group(1),
-            "server.json:version": server_json["version"],
-            "server.json:packages[0].version": server_json["packages"][0]["version"],
-            "mcpb/manifest.json": manifest["version"],
-            "server.py:__version__": srv.__version__,
-        }
-
-    def test_all_five_version_literals_agree(self):
-        versions = self._versions()
-        assert len(set(versions.values())) == 1, (
-            "version literals disagree -- bump them together: "
-            + json.dumps(versions, indent=2))
-
-    def test_initialize_response_reports_the_packaged_version(self):
-        """The wire version a client sees must be the packaged one, not a
-        literal frozen into the transport code."""
-        payload = json.loads(_handle_line(json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})))
-        assert payload["result"]["serverInfo"]["version"] == \
-            self._versions()["pyproject.toml"]
-
-
-# ===========================================================================
-# .claude/rules/ projection: scoped constraints as path-triggered rules
-#
-# Claude Code loads a rule file with `paths:` frontmatter when it READS a
-# matching file -- earlier than the scope_guard hook, which fires after the
-# write. These tests pin the properties that make the projection safe to
-# point at a directory inside the user's repo: it only ever writes its own
-# generated files, and it only ever deletes its own.
-# ===========================================================================
-
-from server import (
-    _RULES_MARKER,
-    _rule_filenames,
-    _scope_to_paths,
-    handle_export_rules,
-    render_scope_rule,
-)
-
-
-def _enable_rules_export(tmp_path, path=None):
-    ctx = context_dir(tmp_path)
-    ctx.mkdir(exist_ok=True)
-    cfg = {"rules_export": {"enabled": True}}
-    if path:
-        cfg["rules_export"]["path"] = path
-    (ctx / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-
-
-def _rules_dir(tmp_path):
-    return tmp_path / ".claude" / "rules" / "context-keeper"
-
-
-class TestScopeToGlob:
-    def test_directory_scope_matches_everything_beneath(self):
-        assert _scope_to_paths("hooks/") == ["hooks/**/*", "**/hooks/**/*"]
-
-    def test_file_scope_matches_the_file(self):
-        assert _scope_to_paths("server.py") == ["server.py", "**/server.py"]
-
-    def test_nested_file_scope_keeps_its_directory(self):
-        assert _scope_to_paths("tests/test_server.py") == [
-            "tests/test_server.py", "**/tests/test_server.py"]
-
-    def test_global_scope_produces_no_pattern(self):
-        # A global constraint has no path to trigger on; it is session-start
-        # material and projecting it would load it unconditionally.
-        assert _scope_to_paths("global") == []
-        assert _scope_to_paths("") == []
-
-    def test_glob_metacharacters_are_refused_not_emitted(self):
-        """A '[' Claude Code cannot read as a bracket expression matches
-        NOTHING. Emitting such a pattern would produce a rule that silently
-        never fires -- worse than no rule, because the file exists and looks
-        like coverage."""
-        for scope in ("photos [2024/", "src/*.py", "a{b,c}/", "log?/"):
-            assert _scope_to_paths(scope) == [], scope
-
-
-class TestRuleFilenames:
-    def test_collisions_resolved_deterministically(self):
-        """'a/b' and 'a-b' slugify identically. The mapping must be stable
-        across regenerations or every render churns the output directory."""
-        scopes = ["a/b", "a-b", "hooks/"]
-        first = _rule_filenames(scopes)
-        assert first == _rule_filenames(list(reversed(scopes)))
-        assert len(set(first.values())) == 3
-
-
-class TestRulesProjection:
-    def test_flag_off_by_default_no_directory_created(self, tmp_path):
-        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        assert not _rules_dir(tmp_path).exists()
-
-    def test_render_on_write_creates_rule_file(self, tmp_path):
-        _enable_rules_export(tmp_path)
-        handle_record_constraint(constraint_params(
-            tmp_path, scope="hooks/", rule="Hook output must be ASCII only"))
-        content = (_rules_dir(tmp_path) / "hooks.md").read_text(encoding="utf-8")
-        assert content.startswith("---\npaths:\n")
-        assert '"hooks/**/*"' in content
-        assert "Hook output must be ASCII only" in content
-        assert "**Why:**" in content
-
-    def test_global_constraints_are_not_projected(self, tmp_path):
-        _enable_rules_export(tmp_path)
-        handle_record_constraint(constraint_params(tmp_path, scope="global"))
-        assert list(_rules_dir(tmp_path).glob("*.md")) == []
-
-    def test_absolute_constraints_sort_before_advisory(self):
-        rendered = render_scope_rule("hooks/", [
-            {"id": "con-002", "rule": "Advisory one", "hardness": "advisory"},
-            {"id": "con-001", "rule": "Absolute one", "hardness": "absolute"},
-        ])
-        assert rendered.index("Absolute one") < rendered.index("Advisory one")
-
-    def test_deprecating_a_constraint_retires_its_rule_file(self, tmp_path):
-        _enable_rules_export(tmp_path)
-        rec = handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        assert (_rules_dir(tmp_path) / "hooks.md").exists()
-        handle_deprecate_entry({
-            "project_dir": str(tmp_path), "id": rec["id"],
-            "reason": "No longer applies",
-        })
-        assert not (_rules_dir(tmp_path) / "hooks.md").exists()
-
-    def test_hand_written_rules_in_the_directory_are_never_deleted(self, tmp_path):
-        """The projection points at a directory inside the user's repo. It
-        may only reap files carrying its own marker -- anything else in
-        there belongs to the user."""
-        _enable_rules_export(tmp_path)
-        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        mine = _rules_dir(tmp_path) / "my-own-rule.md"
-        mine.write_text('---\npaths:\n  - "**/*"\n---\nHand written.',
-                        encoding="utf-8")
-        # A second write triggers a full regeneration + reap pass.
-        handle_record_constraint(constraint_params(tmp_path, scope="server.py"))
-        assert mine.read_text(encoding="utf-8").endswith("Hand written.")
-
-    def test_regenerated_whole_hand_edits_to_generated_files_clobbered(self, tmp_path):
-        _enable_rules_export(tmp_path)
-        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        target = _rules_dir(tmp_path) / "hooks.md"
-        target.write_text(_RULES_MARKER + "\nHAND EDIT", encoding="utf-8")
-        handle_record_constraint(constraint_params(
-            tmp_path, scope="hooks/", rule="Second rule for the same scope"))
-        content = target.read_text(encoding="utf-8")
-        assert "HAND EDIT" not in content
-        assert "Second rule for the same scope" in content
-
-    def test_generated_marker_is_an_html_comment(self):
-        """Block-level HTML comments are stripped before a rules file enters
-        the model's context, so the marker costs zero context tokens."""
-        assert _RULES_MARKER.startswith("<!--") and _RULES_MARKER.endswith("-->")
-
-    def test_export_rules_backfills_without_flag(self, tmp_path):
-        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        result = handle_export_rules({"project_dir": str(tmp_path)})
-        assert result["rules_written"] == 1
-        assert (_rules_dir(tmp_path) / "hooks.md").exists()
-
-    def test_unprojectable_scopes_are_reported_not_swallowed(self, tmp_path):
-        """Silence would read as full coverage. These constraints get no rule
-        file at all, so the caller has to be told."""
-        handle_record_constraint(constraint_params(tmp_path, scope="src/*.py"))
-        result = handle_export_rules({"project_dir": str(tmp_path)})
-        assert result["rules_written"] == 0
-        assert result["skipped_scopes"][0]["scope"] == "src/*.py"
-
-    def test_export_rules_is_not_in_tools_list(self):
-        """con-004 caps the tools/list payload every client pays at session
-        start. This is a one-time backfill reachable from the CLI; it stays
-        in HANDLERS and out of TOOLS."""
-        from server import HANDLERS, TOOLS
-        assert "export_rules" in HANDLERS
-        assert "export_rules" not in {t["name"] for t in TOOLS}
-
-    def test_export_rules_unresolved_project(self, tmp_path):
-        result = handle_export_rules({"project_dir": str(tmp_path / "nowhere")})
-        assert "error" in result
 
 
 class TestSummaryTruncationFloor:
@@ -4230,660 +2760,6 @@ class TestSummaryTruncationFloor:
         assert "summary_lines_dropped" not in result
 
 
-# ===========================================================================
-# scope_guard under PreToolUse: the rule arrives BEFORE the write
-#
-# PostToolUse delivers a scoped constraint after the edit has landed, which
-# makes it a review note rather than a guardrail. PreToolUse additionalContext
-# is injected next to the tool result, so the same hook wired one event
-# earlier states the rule while the model can still act on it. One script
-# serves both wirings so an upgrade is a config change, not a rewrite.
-# ===========================================================================
-
-
-class TestScopeGuardPreToolUse:
-    def _record_scoped(self, tmp_path, **overrides):
-        params = constraint_params(
-            tmp_path,
-            rule="Hook output must be ASCII only in this project",
-            scope="hooks/",
-            tags=["hooks"],
-        )
-        params.update(overrides)
-        return handle_record_constraint(params)
-
-    def test_answers_with_the_event_it_was_called_on(self, tmp_path):
-        """Echoing the wrong hookEventName is how a hook silently does
-        nothing -- the harness routes on this field."""
-        self._record_scoped(tmp_path)
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
-        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-
-    def test_post_tool_use_still_answers_post_tool_use(self, tmp_path):
-        self._record_scoped(tmp_path)
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PostToolUse")
-        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
-
-    def test_missing_event_defaults_to_post_tool_use(self, tmp_path):
-        """Back-compat: every installation predating this change is wired
-        under PostToolUse and sends no hook_event_name we rely on."""
-        self._record_scoped(tmp_path)
-        out = _run_scope_guard(tmp_path, str(tmp_path / "hooks" / "a.py"))
-        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
-
-    def test_unknown_event_falls_back_rather_than_echoing_it(self, tmp_path):
-        self._record_scoped(tmp_path)
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="SomeFutureEvent")
-        assert json.loads(out)["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
-
-    def test_pre_tool_use_wording_is_about_to_write(self, tmp_path):
-        self._record_scoped(tmp_path)
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
-        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert "about to write" in ctx
-        assert "BEFORE writing" in ctx
-
-    def test_no_permission_decision_by_default(self, tmp_path):
-        """confirm_absolute is opt-in. Interrupting every edit to a scoped
-        file is not the default anyone wants."""
-        self._record_scoped(tmp_path)
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
-        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
-
-    def test_confirm_absolute_escalates_to_ask(self, tmp_path):
-        self._record_scoped(tmp_path, hardness="absolute")
-        (context_dir(tmp_path) / "config.json").write_text(
-            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
-        hso = json.loads(out)["hookSpecificOutput"]
-        assert hso["permissionDecision"] == "ask"
-        assert "absolute constraint" in hso["permissionDecisionReason"]
-
-    def test_confirm_absolute_ignores_advisory_constraints(self, tmp_path):
-        self._record_scoped(tmp_path, hardness="advisory")
-        (context_dir(tmp_path) / "config.json").write_text(
-            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
-        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
-
-    def test_confirm_absolute_never_asks_after_the_fact(self, tmp_path):
-        """Prompting the user about an edit that already happened is theatre."""
-        self._record_scoped(tmp_path, hardness="absolute")
-        (context_dir(tmp_path) / "config.json").write_text(
-            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PostToolUse")
-        assert "permissionDecision" not in json.loads(out)["hookSpecificOutput"]
-
-    def test_output_is_ascii_only(self, tmp_path):
-        """con-001: Windows hook stdout is cp1252. A non-ASCII byte here
-        raises UnicodeEncodeError and takes the whole hook down."""
-        self._record_scoped(
-            tmp_path,
-            rule="Never use an em-dash — or an arrow → in hook output",
-        )
-        (context_dir(tmp_path) / "config.json").write_text(
-            json.dumps({"scope_guard": {"confirm_absolute": True}}), encoding="utf-8")
-        out = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), event="PreToolUse")
-        out.encode("ascii")  # raises if the hook emitted anything non-ASCII
-
-
-# ===========================================================================
-# Edit-path latency: what a PreToolUse hook is allowed to cost
-#
-# PostToolUse ran after the tool, so its cost trailed the edit. PreToolUse
-# runs BEFORE it, which puts every millisecond on the critical path of every
-# Edit and Write in every project. Importing server cost ~73ms of machinery
-# this hook never touches (mirror's urllib.request -> http.client ->
-# email.parser stack, secrets, usage, code_drift) and took a hook run to
-# ~142ms; going through store_paths instead put it at ~69ms against a ~62ms
-# bare-interpreter floor.
-#
-# These tests defend the PROPERTY, not the measurement: a hook on the edit
-# path must not import the heavy module. Timing assertions would be flaky on
-# shared CI; "did this module get imported" is exact.
-# ===========================================================================
-
-_EDIT_PATH_HOOKS = ["scope_guard.py"]
-
-
-def _modules_after_running_hook(hook_name, payload):
-    """Run a hook in a fresh interpreter; report whether it imported server."""
-    repo = str(Path(__file__).parent.parent)
-    hook = str(Path(repo) / "hooks" / hook_name)
-    probe = (
-        "import sys, io, json, runpy\n"
-        f"sys.path.insert(0, {repo!r})\n"
-        f"sys.stdin = io.StringIO({payload!r})\n"
-        "try:\n"
-        f"    runpy.run_path({hook!r}, run_name='__main__')\n"
-        "except SystemExit:\n"
-        "    pass\n"
-        "sys.stderr.write('server' in sys.modules and 'HEAVY' or 'LIGHT')\n"
-    )
-    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
-                          text=True, timeout=60)
-    return proc.stderr.strip()[-5:]
-
-
-class TestEditPathHookCost:
-    def test_scope_guard_does_not_import_server(self, tmp_path):
-        """server costs ~73ms to import and this hook needs none of it.
-        store_paths carries the resolution rules and the raw reads. If this
-        fails, someone reached for `import server` and doubled the latency of
-        every edit in every project."""
-        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        payload = json.dumps({
-            "session_id": "cost-probe",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Edit",
-            "tool_input": {"file_path": str(tmp_path / "hooks" / "a.py")},
-        })
-        env_before = os.environ.get("CONTEXT_KEEPER_PROJECT")
-        os.environ["CONTEXT_KEEPER_PROJECT"] = str(tmp_path)
-        try:
-            verdict = _modules_after_running_hook("scope_guard.py", payload)
-        finally:
-            if env_before is None:
-                os.environ.pop("CONTEXT_KEEPER_PROJECT", None)
-            else:
-                os.environ["CONTEXT_KEEPER_PROJECT"] = env_before
-        assert verdict == "LIGHT", (
-            "hooks/scope_guard.py imported server. It runs before every Edit "
-            "and Write; use store_paths for project resolution and raw reads.")
-
-    def test_store_paths_imports_nothing_expensive(self):
-        """store_paths is the cheap half by construction. Anything it imports
-        is paid on every edit, so the allowlist is stdlib essentials only."""
-        source = (Path(__file__).parent.parent / "store_paths.py").read_text(
-            encoding="utf-8")
-        imported = set(re.findall(r"^import (\w+)", source, re.M))
-        imported |= set(re.findall(r"^from (\w+) import", source, re.M))
-        assert imported <= {"json", "os"}, (
-            f"store_paths imports {sorted(imported - {'json', 'os'})}. It is on "
-            "the edit-path critical section; keep it to json and os.")
-
-    def test_resolution_logic_has_exactly_one_implementation(self):
-        """The hook and the server must agree on which project they are
-        looking at. Two copies of the precedence order (env > Xylem pointer >
-        cwd > parent walk) would drift, and the copy that drifts is the one
-        nothing executes."""
-        import server as srv
-        import store_paths
-        assert srv._resolve_project_dir is store_paths._resolve_project_dir
-        assert srv.CONTEXT_DIR_NAME is store_paths.CONTEXT_DIR_NAME
-
-
-# ===========================================================================
-# Scope matching: components, not substrings
-#
-# `scope in path` fired a constraint scoped to `src/` on `mysrc/main.py`, and
-# one scoped to `server.py` on `test_server.py`. That was survivable while the
-# hook ran AFTER the edit. On PreToolUse it states an unrelated rule right
-# before an unrelated edit -- and the once-per-session dedupe then burns that
-# constraint, so the file it actually governs never receives it.
-# ===========================================================================
-
-_SCOPE_CASES = [
-    # (scope, path, covered?)
-    ("src/", "C:/proj/src/main.py", True),
-    ("src/", "C:/proj/mysrc/main.py", False),
-    ("src/", "C:/proj/src2/main.py", False),
-    ("hooks/", "C:/proj/hooks/a.py", True),
-    ("hooks/", "C:/proj/webhooks/send.py", False),
-    ("hooks/", "C:/proj/hooks/nested/deep.py", True),
-    ("server.py", "C:/proj/server.py", True),
-    ("server.py", "C:/proj/test_server.py", False),
-    ("server.py", "C:/proj/pkg/server.py", True),
-    ("tests/test_server.py", "C:/proj/tests/test_server.py", True),
-    ("tests/test_server.py", "C:/proj/tests/test_server.py.bak", False),
-    ("api/", "C:/proj/rapid/api2/x.py", False),
-    # A directory scope must not match the directory entry itself, only
-    # things inside it.
-    ("hooks/", "C:/proj/hooks", False),
-]
-
-
-class TestScopeCovers:
-    def _fn(self):
-        import importlib.util
-        path = Path(__file__).parent.parent / "hooks" / "scope_guard.py"
-        spec = importlib.util.spec_from_file_location("_sg_probe", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod._scope_covers
-
-    @pytest.mark.parametrize("scope,path,expected", _SCOPE_CASES)
-    def test_scope_covers(self, scope, path, expected):
-        assert self._fn()(scope, path) is expected, f"{scope} vs {path}"
-
-    def test_backslash_paths_normalize(self):
-        """Windows hands the hook backslashes; scopes are recorded with
-        forward slashes."""
-        assert self._fn()("hooks/", r"C:\proj\hooks\a.py") is True
-        assert self._fn()("hooks/", r"C:\proj\webhooks\a.py") is False
-
-    def test_agrees_with_the_rules_projection_on_directory_scopes(self):
-        """The hook and the .claude/rules/ projection are two deliveries of
-        the same rule. If they disagree about which files a scope covers,
-        one of them is lying about coverage."""
-        from server import _scope_to_paths
-        covers = self._fn()
-        for scope in ("src/", "hooks/", "tests/"):
-            patterns = _scope_to_paths(scope)
-            assert patterns, scope
-            # The projection anchors on the scope's own components; so must
-            # the hook. A sibling directory merely ENDING in the scope name
-            # must be covered by neither.
-            sibling = f"C:/proj/my{scope.strip('/')}/file.py"
-            assert covers(scope, sibling) is False, sibling
-
-
-class TestScopeGuardFalsePositives:
-    """End-to-end: the constraint must not be spent on the wrong file."""
-
-    def test_sibling_directory_does_not_consume_the_constraint(self, tmp_path):
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="hooks/", rule="Hook output must be ASCII only"))
-        # An edit to webhooks/ must NOT fire...
-        decoy = _run_scope_guard(
-            tmp_path, str(tmp_path / "webhooks" / "send.py"), "sess-fp",
-            event="PreToolUse")
-        assert decoy == ""
-        # ...and must therefore leave the constraint available for the file
-        # it actually governs, in the same session.
-        real = _run_scope_guard(
-            tmp_path, str(tmp_path / "hooks" / "a.py"), "sess-fp",
-            event="PreToolUse")
-        assert rec["id"] in real
-
-    def test_test_file_does_not_consume_a_source_file_constraint(self, tmp_path):
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="server.py", rule="Keep the schema payload bounded"))
-        decoy = _run_scope_guard(
-            tmp_path, str(tmp_path / "test_server.py"), "sess-fp2",
-            event="PreToolUse")
-        assert decoy == ""
-        real = _run_scope_guard(
-            tmp_path, str(tmp_path / "server.py"), "sess-fp2", event="PreToolUse")
-        assert rec["id"] in real
-
-
-# ===========================================================================
-# Findings from the v0.16 audit. Each of these shipped in the first pass and
-# was found by probing the projection adversarially rather than by reading it.
-# ===========================================================================
-
-import shutil
-
-# Aliased: this module already has a local _rules_dir(tmp_path) helper, and a
-# bare import would silently rebind it for every test defined above.
-from server import RulesPathOutsideProject
-from server import _rules_dir as _server_rules_dir
-
-
-class TestScopeYamlSafety:
-    def test_quote_in_scope_is_refused_not_emitted(self):
-        """Each pattern is emitted as a double-quoted YAML scalar. A quote
-        inside the scope closes it early and the WHOLE frontmatter block
-        stops parsing, so the harness loads no rule from the file at all --
-        not even the patterns that were fine."""
-        assert _scope_to_paths('we"ird/') == []
-
-    def test_control_characters_are_refused(self):
-        assert _scope_to_paths("bad\nscope/") == []
-        assert _scope_to_paths("bad\tscope/") == []
-
-    def test_emitted_frontmatter_always_parses(self, tmp_path):
-        """Whatever survives the filter must produce a frontmatter block that
-        a YAML reader can actually read."""
-        for scope in ("hooks/", "src/api/", "server.py", "tests/test_x.py",
-                      "a-b/", "a_b/", "dir.with.dots/"):
-            rendered = render_scope_rule(scope, [
-                {"id": "con-001", "rule": "r", "reason": "why", "hardness": "absolute"}])
-            assert rendered.startswith("---\npaths:\n")
-            block = rendered.split("---")[1]
-            for line in block.splitlines():
-                line = line.strip()
-                if not line.startswith("- "):
-                    continue
-                value = line[2:]
-                # A well-formed double-quoted scalar: quotes only at the ends.
-                assert value.startswith('"') and value.endswith('"'), (scope, line)
-                assert '"' not in value[1:-1], (scope, line)
-
-    def test_unprojectable_scopes_are_reported(self, tmp_path):
-        handle_record_constraint(constraint_params(tmp_path, scope='we"ird/'))
-        result = handle_export_rules({"project_dir": str(tmp_path)})
-        assert result["rules_written"] == 0
-        assert result["skipped_scopes"][0]["scope"] == 'we"ird/'
-
-
-class TestRulesPathContainment:
-    """The rules directory is REAPED, not just written: every marker-carrying
-    .md file in it is a deletion candidate on each regeneration. A config
-    value must not be able to aim that at a directory outside the project."""
-
-    def test_parent_traversal_is_refused(self, tmp_path):
-        ctx = context_dir(tmp_path)
-        ctx.mkdir(exist_ok=True)
-        with pytest.raises(RulesPathOutsideProject):
-            _server_rules_dir(str(ctx), out_dir="../../ESCAPED")
-
-    def test_absolute_path_outside_project_is_refused(self, tmp_path, tmp_path_factory):
-        ctx = context_dir(tmp_path)
-        ctx.mkdir(exist_ok=True)
-        elsewhere = tmp_path_factory.mktemp("elsewhere")
-        with pytest.raises(RulesPathOutsideProject):
-            _server_rules_dir(str(ctx), out_dir=str(elsewhere))
-
-    def test_sibling_prefix_directory_is_refused(self, tmp_path):
-        """`/proj-evil` must not read as inside `/proj`. A startswith check
-        would have let it through; commonpath does not."""
-        ctx = context_dir(tmp_path)
-        ctx.mkdir(exist_ok=True)
-        sibling = str(tmp_path) + "-evil"
-        with pytest.raises(RulesPathOutsideProject):
-            _server_rules_dir(str(ctx), out_dir=sibling)
-
-    def test_absolute_path_inside_project_is_allowed(self, tmp_path):
-        ctx = context_dir(tmp_path)
-        ctx.mkdir(exist_ok=True)
-        inside = str(tmp_path / "docs" / "rules")
-        assert _server_rules_dir(str(ctx), out_dir=inside) == os.path.realpath(inside)
-
-    def test_export_rules_reports_the_refusal_instead_of_raising(self, tmp_path):
-        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        result = handle_export_rules({
-            "project_dir": str(tmp_path), "path": "../../ESCAPED"})
-        assert "error" in result
-        assert "outside the project" in result["error"]
-
-    def test_render_on_write_never_raises_on_a_bad_path(self, tmp_path):
-        """A misconfigured path must not take down the constraint write --
-        projections are derived, the JSON store is canonical."""
-        ctx = context_dir(tmp_path)
-        ctx.mkdir(exist_ok=True)
-        (ctx / "config.json").write_text(json.dumps(
-            {"rules_export": {"enabled": True, "path": "../../ESCAPED"}}),
-            encoding="utf-8")
-        result = handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        assert result.get("success") is True
-
-
-class TestProjectionsFollowInboundWrites:
-    """Entries arriving from a snapshot or the mirror are still writes to the
-    store. If the projections only follow LOCAL writes, a fresh clone imports
-    its constraints and gets no rule files until someone happens to record
-    another one -- the moment the rules are most wanted is the moment they
-    are absent."""
-
-    def _rules_dir(self, tmp_path):
-        return tmp_path / ".claude" / "rules" / "context-keeper"
-
-    def test_import_snapshot_regenerates_the_rules_projection(self, tmp_path,
-                                                              tmp_path_factory):
-        source = tmp_path_factory.mktemp("snapsrc")
-        handle_record_constraint(constraint_params(
-            source, scope="shared/", rule="A rule that travels in a snapshot"))
-        handle_export_snapshot({"project_dir": str(source)})
-
-        dest = tmp_path
-        context_dir(dest).mkdir(parents=True, exist_ok=True)
-        (context_dir(dest) / "config.json").write_text(
-            json.dumps({"rules_export": {"enabled": True}}), encoding="utf-8")
-        shutil.copytree(source / ".context-keeper", dest / ".context-keeper",
-                        dirs_exist_ok=True)
-
-        handle_import_snapshot({"project_dir": str(dest)})
-        assert (self._rules_dir(dest) / "shared.md").exists()
-
-    def test_import_snapshot_regenerates_the_markdown_projection(self, tmp_path,
-                                                                 tmp_path_factory):
-        source = tmp_path_factory.mktemp("snapsrc2")
-        handle_record_decision(decision_params(source, summary="Imported decision"))
-        handle_export_snapshot({"project_dir": str(source)})
-
-        dest = tmp_path
-        context_dir(dest).mkdir(parents=True, exist_ok=True)
-        (context_dir(dest) / "config.json").write_text(
-            json.dumps({"markdown_export": {"enabled": True}}), encoding="utf-8")
-        shutil.copytree(source / ".context-keeper", dest / ".context-keeper",
-                        dirs_exist_ok=True)
-
-        handle_import_snapshot({"project_dir": str(dest)})
-        assert "Imported decision" in (dest / "DECISIONS.md").read_text(encoding="utf-8")
-
-
-# ===========================================================================
-# Mojibake: the damage con-008-dc30 stopped causing but never repaired
-#
-# Forcing UTF-8 on the stdio transport meant no NEW entry gets corrupted. It
-# did nothing for entries already written, and that damage is invisible in
-# the worst way: the text stays legible enough that nobody re-reads it, so a
-# corrupted rationale quietly degrades every retrieval that surfaces it.
-# ===========================================================================
-
-from server import (
-    demojibake,
-    handle_repair_mojibake,
-    handle_verify_quality,
-    looks_like_mojibake,
-)
-
-# What "the local store is canonical -- the exact operations" becomes when
-# its UTF-8 bytes are decoded as cp1252.
-_GARBLED = "the local store is canonical â€” the exact operations"
-_CLEAN = "the local store is canonical — the exact operations"
-
-
-class TestDemojibake:
-    def test_repairs_a_known_misdecode(self):
-        assert demojibake(_GARBLED) == _CLEAN
-
-    def test_clean_text_is_left_alone(self):
-        for text in (_CLEAN, "plain ascii text", "already fine — em dash",
-                     "accented café latte", ""):
-            assert demojibake(text) is None, text
-
-    def test_non_strings_are_ignored(self):
-        for value in (None, 42, [], {}, True):
-            assert demojibake(value) is None
-
-    def test_repair_is_verified_as_an_exact_inverse(self):
-        """Re-applying the corruption to the candidate must reproduce the
-        input byte for byte. A partial or approximate repair of someone's
-        recorded reasoning is worse than legible damage: it looks fixed."""
-        repaired = demojibake(_GARBLED)
-        assert repaired.encode("utf-8").decode("cp1252") == _GARBLED
-
-    def test_repair_is_idempotent(self):
-        once = demojibake(_GARBLED)
-        assert demojibake(once) is None
-
-    def test_marker_prefilter_gates_the_transform(self):
-        """Some innocent strings survive the encode/decode round trip. The
-        marker check is what keeps those from being 'repaired'."""
-        assert looks_like_mojibake(_GARBLED) is True
-        assert looks_like_mojibake(_CLEAN) is False
-
-
-class TestRepairMojibake:
-    def _garble(self, tmp_path, entry_id, field, value):
-        path = context_dir(tmp_path) / "decisions.json"
-        entries = json.loads(path.read_text(encoding="utf-8"))
-        for e in entries:
-            if e["id"] == entry_id:
-                e[field] = value
-        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-
-    def test_dry_run_reports_without_writing(self, tmp_path):
-        rec = handle_record_decision(decision_params(tmp_path))
-        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
-        result = handle_repair_mojibake({"project_dir": str(tmp_path)})
-        assert result["applied"] is False
-        assert result["entries_affected"] == 1
-        on_disk = json.loads(
-            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
-        assert on_disk[0]["why_chosen"] == _GARBLED, "dry run wrote to disk"
-
-    def test_apply_repairs_the_entry(self, tmp_path):
-        rec = handle_record_decision(decision_params(tmp_path))
-        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
-        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
-        on_disk = json.loads(
-            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
-        assert on_disk[0]["why_chosen"] == _CLEAN
-
-    def test_verified_at_is_not_refreshed(self, tmp_path):
-        """An encoding fix is not a claim that anyone re-confirmed the entry
-        is still true. Resetting the staleness clock here would erase the
-        exact signal prune_stale and the drift check exist to raise."""
-        rec = handle_record_decision(decision_params(tmp_path))
-        before = rec["entry"]["verified_at"]
-        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
-        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
-        on_disk = json.loads(
-            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
-        assert on_disk[0]["verified_at"] == before
-
-    def test_updated_at_is_bumped_so_the_repair_wins_the_mirror_merge(self, tmp_path):
-        rec = handle_record_decision(decision_params(tmp_path))
-        before = rec["entry"]["updated_at"]
-        self._garble(tmp_path, rec["id"], "why_chosen", _GARBLED)
-        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
-        on_disk = json.loads(
-            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
-        assert on_disk[0]["updated_at"] >= before
-
-    def test_clean_store_is_a_no_op(self, tmp_path):
-        handle_record_decision(decision_params(tmp_path))
-        result = handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
-        assert result["entries_affected"] == 0
-
-    def test_repairs_nested_alternatives(self, tmp_path):
-        rec = handle_record_decision(decision_params(
-            tmp_path,
-            alternatives=[{"option": _GARBLED, "reason_rejected": _GARBLED}]))
-        result = handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
-        assert result["fields_affected"] == 2
-        on_disk = json.loads(
-            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
-        assert on_disk[0]["alternatives"][0]["option"] == _CLEAN
-
-    def test_ids_are_never_rewritten(self, tmp_path):
-        """Rewriting an id would break every related_to pointing at it."""
-        rec = handle_record_decision(decision_params(tmp_path))
-        handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
-        on_disk = json.loads(
-            (context_dir(tmp_path) / "decisions.json").read_text(encoding="utf-8"))
-        assert on_disk[0]["id"] == rec["id"]
-
-    def test_refuses_to_write_over_a_corrupt_store(self, tmp_path):
-        handle_record_decision(decision_params(tmp_path))
-        (context_dir(tmp_path) / "decisions.json").write_text("{ not json",
-                                                              encoding="utf-8")
-        result = handle_repair_mojibake({"project_dir": str(tmp_path), "apply": True})
-        assert "error" in result
-
-    def test_not_in_tools_list(self):
-        from server import HANDLERS, TOOLS
-        assert "repair_mojibake" in HANDLERS
-        assert "repair_mojibake" not in {t["name"] for t in TOOLS}
-
-
-class TestVerifyQualityFlagsMojibake:
-    def test_flagged_with_a_repair_instruction(self, tmp_path):
-        rec = handle_record_constraint(constraint_params(tmp_path))
-        path = context_dir(tmp_path) / "constraints.json"
-        entries = json.loads(path.read_text(encoding="utf-8"))
-        entries[0]["reason"] = _GARBLED
-        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-
-        result = handle_verify_quality({"project_dir": str(tmp_path),
-                                        "check_drift": False})
-        entry = next(f for f in result["flagged"] if f["id"] == rec["id"])
-        issue = next(i for i in entry["issues"] if i["type"] == "mojibake")
-        assert "repair_mojibake" in issue["detail"]
-
-    def test_clean_entries_are_not_flagged(self, tmp_path):
-        handle_record_constraint(constraint_params(tmp_path))
-        result = handle_verify_quality({"project_dir": str(tmp_path),
-                                        "check_drift": False})
-        types = {i["type"] for f in result["flagged"] for i in f["issues"]}
-        assert "mojibake" not in types
-
-
-class TestManifestHasNoEditorialKeys:
-    """The .mcpb manifest is validated against a schema that REJECTS keys it
-    does not recognise, and the packer refuses to build on a validation
-    failure.
-
-    v0.16.0 shipped without its desktop bundle because of this. The manifest
-    carried a `_tools_comment` key -- a maintainer note explaining that
-    `tools` must match `server.TOOLS`. It had been harmless for several
-    releases, then @anthropic-ai/mcpb@2 tightened validation and the pack
-    step started failing. The release itself succeeded (PyPI and the MCP
-    registry both published), so nothing surfaced until someone looked for
-    the .mcpb attachment and found it missing.
-
-    Two lessons, both encoded here. A maintainer note belongs somewhere it
-    cannot break a build -- a test docstring like this one, or a comment in
-    the build script. And the note was restating a rule that
-    TestManifestToolsMatchServer already enforces, which is con-009's
-    complaint exactly: prose duplicating a check will drift from it, and the
-    prose is the copy nothing executes.
-    """
-
-    def test_no_underscore_prefixed_keys(self):
-        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
-        editorial = [k for k in manifest if k.startswith("_")]
-        assert not editorial, (
-            f"mcpb/manifest.json carries non-spec key(s) {editorial}. The mcpb "
-            "packer rejects unrecognised keys and the bundle silently fails to "
-            "build. Put maintainer notes in a test docstring or build script "
-            "comment instead."
-        )
-
-    def test_no_underscore_keys_nested_in_tools_or_config(self):
-        manifest = json.loads(_MANIFEST.read_text(encoding="utf-8"))
-        offenders = []
-
-        def walk(node, path):
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if key.startswith("_"):
-                        offenders.append(f"{path}.{key}".lstrip("."))
-                    walk(value, f"{path}.{key}".lstrip("."))
-            elif isinstance(node, list):
-                for i, item in enumerate(node):
-                    walk(item, f"{path}[{i}]")
-
-        walk(manifest, "")
-        assert not offenders, f"non-spec keys in mcpb/manifest.json: {offenders}"
-
-
-# ===========================================================================
-# Closing the delivery gaps measured after v0.16
-#
-# Measuring real stores turned up two problems that compound: the largest
-# store dropped 116 lines at session start with no trace, and 47% of all
-# constraints were `global`-scoped, meaning their ONLY delivery route was
-# that same truncating summary. Everything path-based built in v0.16 routed
-# around half the rules.
-# ===========================================================================
-
-from server import _scope_to_paths, estimate_tokens
-
-_SUBAGENT_HOOK = str(Path(__file__).parent.parent / "hooks" / "subagent_start.py")
 
 
 class TestTruncationLeavesATrail:
@@ -4971,178 +2847,3 @@ class TestTruncationLeavesATrail:
         r = handle_get_project_summary({"project_dir": str(tmp_path),
                                         "token_budget": 10})
         assert "Absolute Constraints" in r["summary"]
-
-
-class TestGlobalScopeFlag:
-    """47% of real constraints were `global`, which excludes them from the
-    drift check, the .claude/rules/ projection and scope_guard alike. Their
-    only route to the model is the summary -- the thing that truncates."""
-
-    def _issues(self, tmp_path, entry_id):
-        r = handle_verify_quality({"project_dir": str(tmp_path),
-                                   "check_drift": False})
-        entry = next((f for f in r["flagged"] if f["id"] == entry_id), None)
-        return [i["type"] for i in (entry or {}).get("issues", [])]
-
-    def test_flagged_when_enforced_by_names_a_real_file(self, tmp_path):
-        (tmp_path / "tests").mkdir()
-        (tmp_path / "tests" / "test_thing.py").write_text("x = 1", encoding="utf-8")
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="global",
-            enforced_by="tests/test_thing.py::TestThing::test_case"))
-        assert "global_scope" in self._issues(tmp_path, rec["id"])
-
-    def test_traversal_in_enforced_by_is_not_suggested(self, tmp_path):
-        """A `..` component cannot become a repo-relative glob, and it would
-        let a scope reach outside the project. Windows os.path.exists
-        normalizes such a path and reports True even when a component is
-        missing, so this only failed on POSIX -- caught by CI, not locally."""
-        (tmp_path / "server.py").write_text("x = 1", encoding="utf-8")
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="global", enforced_by="tests/../server.py::TestThing"))
-        assert "global_scope" not in self._issues(tmp_path, rec["id"])
-
-    def test_flagged_when_a_tag_names_a_real_directory(self, tmp_path):
-        (tmp_path / "hooks").mkdir()
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="global", tags=["hooks"]))
-        assert "global_scope" in self._issues(tmp_path, rec["id"])
-
-    def test_not_flagged_without_evidence(self, tmp_path):
-        """A bare 'consider adding a scope' on every global constraint is
-        noise the reader learns to skip, and some rules really are global."""
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="global", tags=["philosophy", "process"]))
-        assert "global_scope" not in self._issues(tmp_path, rec["id"])
-
-    def test_scoped_constraints_are_never_flagged(self, tmp_path):
-        (tmp_path / "hooks").mkdir()
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="hooks/", tags=["hooks"]))
-        assert "global_scope" not in self._issues(tmp_path, rec["id"])
-
-    def test_decisions_are_never_flagged(self, tmp_path):
-        (tmp_path / "hooks").mkdir()
-        rec = handle_record_decision(decision_params(tmp_path, tags=["hooks"]))
-        assert "global_scope" not in self._issues(tmp_path, rec["id"])
-
-    def test_suggestion_is_a_projectable_scope(self, tmp_path):
-        """A suggestion that cannot become a rules pattern is not a fix."""
-        (tmp_path / "hooks").mkdir()
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, scope="global", tags=["hooks"]))
-        r = handle_verify_quality({"project_dir": str(tmp_path),
-                                   "check_drift": False})
-        entry = next(f for f in r["flagged"] if f["id"] == rec["id"])
-        issue = next(i for i in entry["issues"] if i["type"] == "global_scope")
-        suggested = issue["detail"].split("scope='")[1].split("'")[0]
-        assert _scope_to_paths(suggested)
-
-
-class TestSubagentStartHook:
-    """SessionStart does not fire for subagents and they do not inherit the
-    parent's injected context, so every subagent started with no project
-    memory -- on a fan-out, a dozen contributors who never read the rules."""
-
-    def _run(self, project, agent_type="general-purpose"):
-        payload = json.dumps({
-            "session_id": "s1",
-            "hook_event_name": "SubagentStart",
-            "agent_type": agent_type,
-            "agent_id": "a1",
-        })
-        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(project))
-        proc = subprocess.run([sys.executable, _SUBAGENT_HOOK], input=payload,
-                              capture_output=True, text=True, env=env, timeout=60)
-        return proc.stdout.strip(), proc.returncode
-
-    def test_injects_the_constraints(self, tmp_path):
-        rec = handle_record_constraint(constraint_params(
-            tmp_path, rule="Hook output must be ASCII only"))
-        out, rc = self._run(tmp_path)
-        assert rc == 0 and out
-        hso = json.loads(out)["hookSpecificOutput"]
-        assert hso["hookEventName"] == "SubagentStart"
-        assert rec["id"] in hso["additionalContext"]
-        assert "Hook output must be ASCII only" in hso["additionalContext"]
-
-    def test_points_at_the_tools_for_everything_else(self, tmp_path):
-        handle_record_constraint(constraint_params(tmp_path))
-        out, _ = self._run(tmp_path)
-        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert "get_context" in ctx and "get_project_summary" in ctx
-
-    def test_silent_when_no_constraints_recorded(self, tmp_path):
-        """A header with nothing under it is worse than saying nothing."""
-        context_dir(tmp_path).mkdir(parents=True, exist_ok=True)
-        out, rc = self._run(tmp_path)
-        assert rc == 0 and out == ""
-
-    def test_silent_on_an_unresolved_project(self, tmp_path):
-        out, rc = self._run(tmp_path / "nowhere")
-        assert rc == 0 and out == ""
-
-    def test_malformed_stdin_never_interferes_with_the_spawn(self, tmp_path):
-        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
-        proc = subprocess.run([sys.executable, _SUBAGENT_HOOK], input="not json",
-                              capture_output=True, text=True, env=env, timeout=60)
-        assert proc.returncode == 0 and proc.stdout.strip() == ""
-
-    def test_caps_the_constraint_count(self, tmp_path):
-        """This fires once per spawned subagent, so a fan-out multiplies it.
-        Absolute rules are kept first when the cap bites."""
-        for i in range(20):
-            handle_record_constraint(constraint_params(
-                tmp_path, rule=f"Advisory rule number {i} about things",
-                hardness="advisory"))
-        keeper = handle_record_constraint(constraint_params(
-            tmp_path, rule="An absolute rule that must survive the cap",
-            hardness="absolute"))
-        out, _ = self._run(tmp_path)
-        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        assert keeper["id"] in ctx
-        assert "not shown" in ctx
-
-    def test_output_is_ascii_only(self, tmp_path):
-        handle_record_constraint(constraint_params(
-            tmp_path, rule="Never use an em-dash — or an arrow → here"))
-        out, _ = self._run(tmp_path)
-        out.encode("ascii")
-
-
-class TestHotPathHooksStayLight:
-    """con-010 generalised. scope_guard runs before every edit;
-    constraint_reinject's matcher is "" so it runs after EVERY tool call;
-    subagent_start runs once per spawned agent and a fan-out multiplies it.
-    None of them may import server."""
-
-    @pytest.mark.parametrize("hook_name", [
-        "scope_guard.py", "constraint_reinject.py", "subagent_start.py"])
-    def test_hook_does_not_import_server(self, hook_name, tmp_path):
-        handle_record_constraint(constraint_params(tmp_path, scope="hooks/"))
-        payload = json.dumps({
-            "session_id": "probe",
-            "tool_name": "Edit",
-            "tool_input": {"file_path": str(tmp_path / "hooks" / "a.py")},
-        })
-        repo = str(Path(__file__).parent.parent)
-        hook = str(Path(repo) / "hooks" / hook_name)
-        probe = (
-            "import sys, io, json, runpy\n"
-            f"sys.path.insert(0, {repo!r})\n"
-            f"sys.stdin = io.StringIO({payload!r})\n"
-            "try:\n"
-            f"    runpy.run_path({hook!r}, run_name='__main__')\n"
-            "except SystemExit:\n    pass\n"
-            "sys.stderr.write('HEAVY' if 'server' in sys.modules else 'LIGHT')\n"
-        )
-        env = dict(os.environ, CONTEXT_KEEPER_PROJECT=str(tmp_path))
-        proc = subprocess.run([sys.executable, "-c", probe], capture_output=True,
-                              text=True, env=env, timeout=60)
-        assert proc.stderr.strip()[-5:] == "LIGHT", (
-            f"hooks/{hook_name} imported server; use store_paths (con-010)")
-
-    def test_constraint_formatting_has_one_implementation(self):
-        import server as srv
-        import store_paths
-        assert srv._constraint_lines is store_paths.constraint_lines

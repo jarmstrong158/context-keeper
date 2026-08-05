@@ -9,10 +9,11 @@ Only the LEXICAL arm is pinned: it is bit-for-bit deterministic run to run and
 needs no network, so it can fail honestly in CI. The embedding arm depends on a
 local embedder and is measured by evals/run_retrieval_eval.py, not asserted here.
 
-These tests read the real project stores next to this repo, which exist on a
-developer machine and not in CI, so they skip when the stores are absent. A skip
-is not a pass -- run the harness locally before claiming a ranking change is
-safe.
+These run against the FROZEN corpus committed under evals/fixtures/corpus, so
+they work on any clone and in CI. They used to read the real stores next to this
+repo and skip when absent, which meant CI never defended the pin at all -- and
+worse, the number moved whenever anybody recorded a decision. The skip below is
+now a genuine "something is missing" guard rather than the normal case.
 """
 
 import importlib.util
@@ -92,17 +93,27 @@ class TestGoldenSetIntegrity:
 
 class TestLexicalRetrievalRegression:
     # Measured 2026-08-05 on the 44 positive cases, lexical arm, token_budget
-    # 4000, include_related off: recall@5 = 0.549 (hit@5 = 0.636, MRR = 0.435).
+    # 4000, include_related off, against the FROZEN corpus in
+    # evals/fixtures/corpus: recall@5 = 0.473 (hit@5 = 0.568, MRR = 0.409).
     # Bit-for-bit reproducible across runs -- nothing in score_entry samples.
     #
-    # Tolerance is +/- 0.03, about two cases' worth on this set. Wide enough to
-    # absorb a golden-set edit or a real store gaining entries underneath the
-    # eval; tight enough that a genuine ranking regression fails here.
+    # The first pin was 0.549 against LIVE stores, and it broke within a day
+    # without a single line of ranking code changing: recording three new
+    # context-keeper entries moved it to 0.473. That is the corpus growing, not
+    # the ranker regressing, and a pin that cannot tell those apart is not a
+    # regression test. Hence the frozen corpus -- the ranker is now the only
+    # variable, and as a bonus this test no longer needs sibling repos that
+    # exist on a dev machine and not in CI. Refresh deliberately with
+    # evals/build_corpus_fixture.py and re-measure here in the same commit.
+    #
+    # Tolerance is +/- 0.03, about two cases' worth on this set: wide enough to
+    # absorb a golden-set edit, tight enough that a real ranking regression
+    # fails here.
     #
     # This test OWNS the number (con-009-6bdc). No constraint and no README
     # restates it -- if the value moves, it moves here, deliberately, with the
     # new measurement recorded above.
-    POSITIVE_RECALL_AT_5 = 0.549
+    POSITIVE_RECALL_AT_5 = 0.473
     TOLERANCE = 0.03
 
     def test_positive_recall_at_5_holds(self, harness, lexical_rows):

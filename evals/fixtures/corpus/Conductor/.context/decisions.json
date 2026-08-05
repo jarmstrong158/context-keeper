@@ -1,0 +1,217 @@
+[
+  {
+    "id": "dec-001",
+    "summary": "MCP server auto-launches Conductor.exe from AppData when not running",
+    "rationale": "Users should never need to manually start Conductor or run it from source. The MCP checks port 5000 before every API call and launches the exe if needed.",
+    "alternatives": [],
+    "constraints_created": [],
+    "tags": [
+      "mcp",
+      "auto-launch",
+      "exe"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-10T02:33:10.297008+00:00",
+    "verified_at": "2026-04-10T02:33:10.297008+00:00",
+    "updated_at": "2026-04-10T02:33:10.297008+00:00"
+  },
+  {
+    "id": "dec-002",
+    "summary": "Deleted old Redis Operator exe and DB to prevent fork bomb from VM monitor worker",
+    "rationale": "The Cowork VM Monitor worker (worker #4) was spawning cascading subprocesses every 30 minutes, exhausting threads/memory. The old Redis Operator.exe in AppData was a separate instance with its own DB causing conflicts.",
+    "alternatives": [],
+    "constraints_created": [],
+    "tags": [
+      "stability",
+      "fork-bomb",
+      "vm-monitor"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-10T02:33:10.302079+00:00",
+    "verified_at": "2026-04-10T02:33:10.302079+00:00",
+    "updated_at": "2026-04-10T02:33:10.302079+00:00"
+  },
+  {
+    "id": "dec-003",
+    "summary": "Removed auto-start registry entry \u2014 Conductor launches on demand via MCP or manual exe click",
+    "rationale": "The HKCU Run registry entry was launching Conductor on every boot, opening extra browser tabs. With MCP auto-launch, the registry entry is unnecessary.",
+    "alternatives": [],
+    "constraints_created": [],
+    "tags": [
+      "startup",
+      "registry",
+      "tabs"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-10T02:33:10.307081+00:00",
+    "verified_at": "2026-04-10T02:33:10.307081+00:00",
+    "updated_at": "2026-04-10T02:33:10.307081+00:00"
+  },
+  {
+    "id": "dec-004",
+    "summary": "Conductor auto-launch uses tasklist process check + O_EXCL file lock to prevent race",
+    "rationale": "First attempt only checked port 5000, which races during the exe's 2-5 second startup window. Multiple MCP tool calls would each see 'not running' and launch duplicate instances. Fix: check tasklist first (catches in-flight launches), then acquire an exclusive file lock (os.O_EXCL) before spawning. Double-check state after lock acquisition.",
+    "alternatives": [
+      {
+        "option": "Port check only",
+        "reason_rejected": "Races during exe startup window"
+      },
+      {
+        "option": "Global mutex (named semaphore)",
+        "reason_rejected": "More complex, requires platform-specific code"
+      },
+      {
+        "option": "systemd/service manager",
+        "reason_rejected": "Windows doesn't have equivalent, and user should not need to configure services"
+      }
+    ],
+    "constraints_created": [
+      "Every api() call in the MCP goes through _ensure_conductor()",
+      "Lock file lives at %TEMP%/conductor_mcp_launch.lock"
+    ],
+    "tags": [
+      "mcp",
+      "auto-launch",
+      "locking",
+      "architecture"
+    ],
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-04-10T22:21:17.380577+00:00",
+    "verified_at": "2026-04-10T22:21:17.380577+00:00",
+    "updated_at": "2026-04-10T22:21:17.380577+00:00"
+  },
+  {
+    "id": "dec-005-a15e",
+    "summary": "Worker/chain subprocesses must resolve a real Python via _resolve_python(), never sys.executable. When frozen by PyInstaller, sys.executable is Conductor.exe, which silently reported success for scripts that never ran.",
+    "problem": "conductor.spec freezes launch.py as the PyInstaller entry point, so in the shipped exe sys.executable == Conductor.exe. app.py built worker commands as [sys.executable, task_path], producing `Conductor.exe user_script.py`. launch.py:main() ignored sys.argv entirely: if Conductor was already on port 5000 it printed a banner, opened a browser tab and sys.exit(0) -> rc 0 -> _task_runner logged \"OK ... completed\" and wrote success=1 to run_history for a script that NEVER RAN. If the port was free it booted a second full Conductor (the \"fork bomb\" recorded in dec-002). No python.exe was bundled, and README claimed \"No Python required\". This affected the product's only sanctioned deployment mode.",
+    "why_chosen": "Verified empirically before changing anything: simulating the frozen entry point produced success=True, error_msg='', and the user's script demonstrably never executed. Resolution order (CONDUCTOR_PYTHON override, bundled python, py launcher, PATH, Windows registry) covers realistic installs without bundling a full CPython, which would have inflated the installer substantially. Every candidate is probed by actually executing it and is rejected if its name contains \"conductor\", so the failure mode cannot recur silently. Raising InterpreterNotFound rather than degrading is deliberate: a loud failure is strictly better than a false success for a scheduler whose entire value is telling you whether your job ran.",
+    "what_we_tried": "Repo's own .context/decisions.json dec-002 recorded a \"fork bomb\" and fixed it by deleting an exe - treating the symptom (a second Conductor booting) without ever identifying sys.executable as the cause. constraints.json con-001 then banned running from source, which was the only mode that actually worked.",
+    "tradeoffs": "Conductor now has a hard runtime dependency on a discoverable system Python for .py workers, so the README's \"No Python required\" claim had to go. Machines with no Python will now see explicit worker failures where they previously saw (false) successes - correct, but it will look like a regression to anyone who trusted the old green ticks.",
+    "alternatives": [
+      {
+        "option": "Bundle a full CPython runtime inside the PyInstaller build",
+        "reason_rejected": "Large installer growth and a second Python to keep patched; system Python is present on virtually all target machines and CONDUCTOR_PYTHON covers the rest. Still compatible - _resolve_python checks for a bundled python first."
+      },
+      {
+        "option": "Make launch.py parse sys.argv and exec the script when given one",
+        "reason_rejected": "Turns the app into an accidental interpreter, inherits none of the venv/site-packages semantics users expect, and keeps the confusing coupling. launch.py now rejects script args with exit 2 instead."
+      },
+      {
+        "option": "Only fix _run_script and leave the guard out",
+        "reason_rejected": "Leaves no defence if any future code path reintroduces sys.executable. _assert_not_self makes the false-success class of bug structurally impossible."
+      }
+    ],
+    "constraints_created": [
+      "Never use sys.executable to run user scripts; always call _resolve_python()"
+    ],
+    "related_to": [],
+    "tags": [
+      "pyinstaller",
+      "frozen",
+      "subprocess",
+      "false-success",
+      "interpreter",
+      "audit"
+    ],
+    "retrieval_hints": [
+      "why does Conductor.exe report success for scripts that never ran",
+      "sys.executable is Conductor.exe when frozen",
+      "_resolve_python interpreter resolution",
+      "fork bomb second Conductor instance root cause"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-24T21:18:52.877405+00:00",
+    "updated_at": "2026-07-24T21:18:52.877405+00:00",
+    "verified_at": "2026-07-24T21:18:52.877405+00:00"
+  },
+  {
+    "id": "dec-006-d1e1",
+    "summary": "Removed Redis entirely (dependency, bundling, build step, README claim, UI badge) and dropped the orphaned SQLAlchemy dependency. Single-sourced the version in _version.py.",
+    "problem": "Redis was advertised in the README as the \"Worker State\" layer, bundled into the installer, downloaded at build time by download_redis.py, started at boot by start_redis(), and surfaced as a dashboard status badge and an MCP tool. It was never used: _redis_client was assigned at two sites and read at none - no .set/.get/.hset/.lpush/.publish call existed anywhere. _redis_running() was a raw TCP connect, not even a PING. All state has always been in SQLite. SQLAlchemy was likewise never imported, orphaned when 08aaff6 swapped APScheduler to the memory jobstore. Separately, three different version strings disagreed (app.py 4.0.0, pyproject 0.1.1, server.py 1.0.0) while the auto-updater compared GitHub releases against them.",
+    "why_chosen": "Both claims were verified by exhaustive grep across the repo before anything was deleted, since removing a genuinely-used dependency would be far worse than leaving dead code. Carrying Redis imposed real cost: a bundled binary in the installer, a build step that could fail the release, a spawned server process at every boot, a CI service container, and a README claim that misrepresented the architecture. The deprecated /api/redis-status route and get_redis_status MCP tool alias are retained deliberately so already-installed MCP clients and any user dashboards do not hard-fail on upgrade; they now report scheduler health. Version is single-sourced through _version.py with setuptools dynamic metadata so the three strings cannot drift apart again.",
+    "what_we_tried": "",
+    "tradeoffs": "Anything outside this repo that parsed the /api/redis-status payload now gets scheduler state under the same key name, which is a semantic change behind a stable field. The sdist version jumps 0.1.1 -> 4.0.0, which is correct but a large apparent leap for anyone tracking the PyPI-style metadata.",
+    "alternatives": [
+      {
+        "option": "Leave Redis in place as future-proofing for distributed workers",
+        "reason_rejected": "Speculative. It cost a bundled binary, a failable build step, a boot-time subprocess and a false README architecture claim, for zero current function. Re-adding it later is cheap if a real need appears."
+      },
+      {
+        "option": "Delete /api/redis-status and get_redis_status outright",
+        "reason_rejected": "Would hard-fail already-installed MCP clients and any user-side dashboard polling it. Kept as deprecated shims reporting scheduler health instead."
+      }
+    ],
+    "constraints_created": [
+      "State belongs in SQLite; do not reintroduce Redis without an actual read path"
+    ],
+    "related_to": [
+      "dec-005-a15e"
+    ],
+    "tags": [
+      "redis",
+      "dead-code",
+      "dependencies",
+      "versioning",
+      "audit"
+    ],
+    "retrieval_hints": [
+      "why was Redis removed from Conductor",
+      "is Redis used for worker state",
+      "version mismatch app.py pyproject server.py",
+      "_version.py single source of truth"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-24T21:22:46.256400+00:00",
+    "updated_at": "2026-07-24T21:22:46.256400+00:00",
+    "verified_at": "2026-07-24T21:22:46.256400+00:00"
+  },
+  {
+    "id": "dec-007-65a9",
+    "summary": "server.py migrated to MCP protocol revision 2026-07-28 on SDK mcp>=2.0,<3, replacing a hand-rolled JSON-RPC loop that advertised 2024-11-05. Uses the SDK low-level Server so the 24 hand-written TOOLS schemas pass through verbatim.",
+    "problem": "The MCP server hand-implemented its own line-delimited JSON-RPC stdio loop pinned to protocol version 2024-11-05. Revision 2026-07-28 removes the initialize handshake and requires server/discover, per-request version negotiation, resultType on every result, and ttlMs/cacheScope on cacheable results.",
+    "why_chosen": "The low-level Server was chosen over MCPServer's decorators because TOOLS is 24 hand-written schemas; re-deriving them from function signatures would risk silent drift in what clients see. TOOLS is handed to the SDK as-is and a test asserts it. handle_tool also moved onto a worker thread, since it does blocking HTTP against the local Conductor API and was previously stalling the event loop for every concurrent request.",
+    "what_we_tried": "",
+    "tradeoffs": "Preserved an existing wart rather than fixing it mid-migration: this server never sets isError, so an unknown tool returns as a successful result carrying an error body. Changing that is a behaviour change to a live orchestrator and does not belong in a transport migration, so it is preserved and pinned by test to make the behaviour explicit.",
+    "alternatives": [
+      {
+        "option": "Migrate the separate conductor-mcp repository instead",
+        "reason_rejected": "Its own README declares it deprecated and unmaintained in favour of this server, so it would have been work on a dead copy. Left untouched."
+      },
+      {
+        "option": "Fix the missing isError handling while migrating",
+        "reason_rejected": "Conflates a transport migration with a behaviour change on a live orchestrator. Flagged separately instead."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "mcp",
+      "protocol-migration",
+      "2026-07-28",
+      "sdk-adoption"
+    ],
+    "retrieval_hints": [
+      "why does Conductor server.py use the low-level MCP Server",
+      "why does an unknown tool not set isError",
+      "where did the hand-rolled JSON-RPC loop go"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-31T16:46:35.734609+00:00",
+    "updated_at": "2026-07-31T16:46:35.734609+00:00",
+    "verified_at": "2026-07-31T16:46:35.734609+00:00",
+    "verified_sha": "ac7651fbdec38102d76db2d805e51029cba6040f"
+  }
+]

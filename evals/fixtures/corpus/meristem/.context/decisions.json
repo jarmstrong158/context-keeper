@@ -1,0 +1,1104 @@
+[
+  {
+    "id": "dec-001-9340",
+    "summary": "Meristem sprites are config over a fixed archetype library. Each archetype (humanoid, blob, ghost, quadruped, flyer, serpent, spider, weapon, consumable, pickup, projectile, chest, tile) is build-parametric over ONE skeleton, built to one construction standard: named materials -> 3-shade hue-shifted ramps (shadow cool / base / highlight warm), top-left light, selective outline, <=15 colours. Adding a variant is a generator edit; a new archetype also needs both schema enum entries.",
+    "problem": "Freeform LLM asset generation drifts and can't be verified, and hand-drawing every named creature/item doesn't scale. A game needs a coherent, ownable sprite set the author controls as real files on disk, produced deterministically from the spec.",
+    "why_chosen": "A fixed archetype library with build knobs makes every creature/item config over a skeleton (mirrors the mechanics 'parameters over archetypes' thesis). The shared construction standard -- not a single locked palette -- is what makes independently-built assets read as one game. Everything is a deterministic projection of one schema-validated manifest, so it is verifiable and the user owns the output.",
+    "what_we_tried": "",
+    "tradeoffs": "Less 'anything goes' flexibility in exchange for coherence, verifiability, and true ownership. Silhouette variety within an archetype is limited to what the build knobs express.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "meristem",
+      "sprites",
+      "architecture",
+      "generators"
+    ],
+    "retrieval_hints": [
+      "how meristem generates sprites",
+      "archetype library build knobs",
+      "sprite construction standard hue-shift ramps"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T01:22:34.310437+00:00",
+    "updated_at": "2026-07-23T01:22:34.310437+00:00",
+    "verified_at": "2026-07-23T01:22:34.310437+00:00"
+  },
+  {
+    "id": "dec-002-1d75",
+    "summary": "Sprite animation is a property of the archetype registry. An Archetype.frames function drives motion (blob squash, ghost float, quadruped breathe, flyer flap, coin spin). Two build mechanisms, chosen by whether the motion deforms the silhouette: a builder PARAM KNOB for non-rigid motion (blob squash, quad head_dy, flyer wing_dy), or a PALETTE-SAFE TRANSFORM of the static sprite when rigid (sprite.translate bob, NEAREST sprite.squeeze_h coin spin). Frame 0 always equals the static build. The compiler emits frames generically (emit_frames/skip0); scenes.py builds SpriteFrames + AnimatedSprite2D (autoplay) for any actor with >1 frame.",
+    "problem": "Only the humanoid animated, via bespoke walk-cycle code wired straight into the character path. Enemies and pickups were static, and there was no general way for an archetype to declare motion or for the compiler to turn frames into a Godot animation.",
+    "why_chosen": "Animation riding the registry means a manifest that picks an archetype gets its motion for free -- proven by adding the flyer afterward with zero compiler changes. Palette-safe transforms keep every frame gate-valid (no new colours or alpha). Frame 0 == static keeps the idle PNG and the animation's first frame identical pixels. Non-rigid motion stays a builder knob because a rigid transform can't express squash.",
+    "what_we_tried": "",
+    "tradeoffs": "Two motion mechanisms to keep in mind instead of one.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "meristem",
+      "animation",
+      "generators",
+      "godot"
+    ],
+    "retrieval_hints": [
+      "how meristem sprites animate",
+      "archetype frames SpriteFrames AnimatedSprite2D",
+      "squash bob spin palette-safe transform"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T01:22:40.970769+00:00",
+    "updated_at": "2026-07-23T01:22:40.970769+00:00",
+    "verified_at": "2026-07-23T01:22:40.970769+00:00"
+  },
+  {
+    "id": "dec-003-b62b",
+    "summary": "The validated authoring boundary sits at the sprite ARCHETYPE, not the variant. archetype is a schema enum kept in registry<->schema lockstep (the enum-sync test enforces it); build/kind/shape are FREE config. So variant validity is checked one layer up: spec-store cross-ref validates each entity/item sprite via meristem_generators.validate_sprite() against sprite_catalog(), and an MCP list_sprite_archetypes tool makes the vocabulary discoverable. A typo'd build (e.g. flyer/dragon) is now a validate_all cross-ref error, not a silent fallback to the default.",
+    "problem": "The generator vocabulary grew deep (13 archetypes, dozens of builds) but the authoring layer couldn't reach it: no way to discover what archetypes/builds exist, and because the schema locks the archetype enum but leaves config a free object, a typo'd variant passed per-domain schema validation then silently rendered the default build at compile time.",
+    "why_chosen": "Keeping the archetype enum generator-agnostic avoids schema churn for every new sword type. Variant validity is a spec<->generator coherence check -- exactly what the cross-reference layer already does (drop-tables<->enemies, control_scheme<->archetypes) -- so it belongs there, not in the schema. The catalog is sourced from the actual build tables so it cannot drift from the builders; the cross-ref soft-imports generators so spec-store still works standalone.",
+    "what_we_tried": "",
+    "tradeoffs": "The cross-ref layer gains a soft dependency on the generators package; if generators aren't installed the variant check silently skips (schema enum still guards the archetype name).",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "meristem",
+      "spec-store",
+      "authoring",
+      "validation",
+      "mcp"
+    ],
+    "retrieval_hints": [
+      "meristem sprite catalog discovery",
+      "validate_sprite cross-ref bogus build",
+      "archetype enum vs free config variant boundary"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T01:22:48.998000+00:00",
+    "updated_at": "2026-07-23T01:22:48.998000+00:00",
+    "verified_at": "2026-07-23T01:22:48.998000+00:00"
+  },
+  {
+    "id": "dec-004-e7c9",
+    "summary": "Sim test vs Vanguard (the RPG whose style guide Meristem's shading was ported from) validated Meristem's design and surfaced concrete gaps. Vanguard's enemy_sprite_generator.gd independently uses ~13 family archetypes recolored by base_color -- the same 'config over a fixed library' pattern (dec-0022) -- and Meristem's bestiary covers 10/12 of those families (wolf/slime/serpent/wisp/bat/stalker/4x humanoid). Crucially Meristem is MORE disciplined than its source: Vanguard's enemy gen uses pure brightness scaling (_darker/_lighter), violating its OWN guide's mandatory hue-shift, whereas Meristem makes hue-shift structural (Ramp is the only shader) and gate-enforced. See docs/reference/vanguard-comparison.md + vanguard-enemy-mapping.png.",
+    "problem": "Needed to test whether Meristem's sprite architecture holds up against a real GBA-style RPG's needs, and whether anything could be learned from Vanguard, the project that originated the hue-shift standard.",
+    "why_chosen": "A cross-project mapping is the cheapest strong evidence: a separate human-authored RPG converging on the same family-archetype structure confirms dec-0022 is a real pattern, not idiosyncratic; and Vanguard's enemy generator drifting from its own hue-shift rule (which Meristem's gate would have caught) confirms the value of making the discipline structural and enforced rather than a doc convention.",
+    "what_we_tried": "",
+    "tradeoffs": "The learnings flowing back to Meristem carry real tension: per-material selective outlining (Vanguard _sel_outline = shadow(c,0.5)) improves quality but costs colours against the 15-budget, so it can only be an opt-in for single-material classes; shade-sharing could relax con-001 but complicates the generative palette.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "meristem",
+      "vanguard",
+      "sim-test",
+      "sprites",
+      "validation"
+    ],
+    "retrieval_hints": [
+      "meristem vs vanguard comparison",
+      "enemy family archetype coverage",
+      "why hue-shift is structural not a doc rule",
+      "raptor beetle archetype gaps"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T01:34:23.603987+00:00",
+    "updated_at": "2026-07-23T01:34:23.603987+00:00",
+    "verified_at": "2026-07-23T01:34:23.603987+00:00"
+  },
+  {
+    "id": "dec-005-7b51",
+    "summary": "Character distinctness is delivered by config-driven prop/accessory layers on the humanoid archetype (held item, garment, feet, arms, hair_accent, plus a hood hat), not by palette swaps. The character colour budget is raised to 24 per-class to pay for the extra prop ramps.",
+    "problem": "Party sprites built only from skin/hair/shirt/pants colour config read as recolours of one identical body \u2014 the user asked that each character be visually distinct and observed that \"most of the changes are hair or color.\" Real distinctness is silhouette (a carried staff, a shield, a scarf, bare feet, stone arms), which needs both new layers AND more than the base 15-colour budget.",
+    "why_chosen": "Props are layers over the shared Pose, so they animate for free and are caught by the single existing outline pass (draw the prop BEFORE cv.outline, never self-outline). Adding the next prop is the same variant recipe as a new sword: one builder function + one dispatch-table entry + one catalog.py line, so the MCP list_sprite_archetypes/check_sprite surface and validate it automatically. A per-class budget (palette.max_colors_by_class.character = 24 via a new contract.budget_for()) keeps SNES/GBA discipline for tiles/items at 15 while giving characters headroom for meaningful prop ramps. User explicitly authorized going over 15 for this work.",
+    "what_we_tried": "",
+    "tradeoffs": "Character sprites can now use up to 24 colours, more than the classic 15; relies on author discipline (ornament with existing ramp shades, share where natural) to avoid palette sprawl. build_frame z-order grew from 8 layers to 12.",
+    "alternatives": [
+      {
+        "option": "Keep the hard 15-colour cap and force props to share existing ramps",
+        "reason_rejected": "A scarf + flamestaff-ember + skin/hair/shirt/pants already blows past 15; forcing shares produced muddy, illegible props. Distinct silhouette was judged worth the extra ramps."
+      },
+      {
+        "option": "Draw props as a post-process on the finished sprite array (as the first scratchpad prototype did)",
+        "reason_rejected": "Requires manual per-prop outlining and does not animate; integrating into build_frame before the shared outline pass is cleaner and animates for free."
+      }
+    ],
+    "constraints_created": [
+      "Character sprites may use up to 24 colours (palette.max_colors_by_class.character); tiles/items stay at the 15-colour default. Prop layers are drawn before the shared cv.outline pass so they are never self-outlined."
+    ],
+    "related_to": [
+      "dec-001-9340",
+      "dec-002-1d75",
+      "dec-003-b62b",
+      "con-001-fb66"
+    ],
+    "tags": [
+      "meristem",
+      "sprites",
+      "humanoid",
+      "props",
+      "budget",
+      "generators",
+      "vanguard"
+    ],
+    "retrieval_hints": [
+      "how to make characters look distinct",
+      "humanoid prop and accessory layers",
+      "character colour budget 24 per class",
+      "held item garment feet arms config"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T02:02:59.147765+00:00",
+    "updated_at": "2026-07-23T02:02:59.147765+00:00",
+    "verified_at": "2026-07-23T02:02:59.147765+00:00"
+  },
+  {
+    "id": "dec-006-0863",
+    "summary": "Meristem is distributed as a self-installing Claude Code plugin: /plugin install delivers skills/commands/MCP config, and a new /meristem-setup command runs a stdlib bootstrap that clones the whole suite to ~/.meristem, builds a venv, pip-installs all 5 packages (spec-store[mcp]), and repoints the plugin .mcp.json at that venv python. The shareable 'link' is the public repo URL.",
+    "problem": "The goal is to hand someone a single link their Claude can install everything from. But a Claude Code plugin ships only plugins/meristem/ (skills/commands/MCP config); the engine \u2014 the 5 meristem_* Python packages, generators, tools, and examples \u2014 lives at the repo root and does NOT travel with the plugin. So /plugin install alone leaves the spec-store MCP (python -m meristem_spec_store.server) and the pixel-art skill (sprite_catalog, asset gate) dead with ModuleNotFoundError. There was no bootstrap to install the Python engine.",
+    "why_chosen": "Self-contained over PyPI (user choice): no external publishing to maintain, and cloning the whole suite to ~/.meristem matches Meristem's 'you own the files on disk' ethos (generators/tools/examples come along, not just importable wheels). The bootstrap is stdlib-only so it runs before anything is installed; idempotent so re-running after a plugin update re-pulls and re-repoints. It installs into an isolated venv (no global pollution) and repoints the plugin's .mcp.json at that venv's absolute python, which fixes both the missing-deps failure and the python-vs-python3 ambiguity. spec-store needs its [mcp] extra (mcp>=1.0) or the server can't import. A doctor (imports + live sprite_catalog smoke test) gives the recipient a green/red signal. Validated end to end over the real GitHub network clone: doctor ALL GREEN on a fresh home.",
+    "what_we_tried": "",
+    "tradeoffs": "Recipient needs Claude Code + git + Python 3.10+ locally; claude.ai web can't run it (documented as needing a separate hosted-MCP effort). Setup patches the INSTALLED plugin's .mcp.json, which a plugin update overwrites \u2014 mitigated by making /meristem-setup idempotent and telling users to re-run it after updates, plus /meristem-doctor to detect drift. After setup the user must reload MCP servers so spec-store restarts under the new interpreter.",
+    "alternatives": [
+      {
+        "option": "Publish the 5 meristem-* packages to PyPI and pip install by name",
+        "reason_rejected": "User chose self-contained; PyPI means maintaining 5 versioned releases and still doesn't put tools/examples on disk."
+      },
+      {
+        "option": "Bundle packages inside plugins/meristem so /plugin install carries them",
+        "reason_rejected": "Bloats the plugin and still needs a pip step to make them importable by the MCP's interpreter; cloning the whole suite is cleaner and gives the full pipeline."
+      },
+      {
+        "option": "Register the MCP via a hosted remote connector so no local install is needed",
+        "reason_rejected": "Meristem is fundamentally local-file/local-Python; a hosted MCP is a much larger separate effort, tracked as a non-goal."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-005-7b51",
+      "dec-001-9340"
+    ],
+    "tags": [
+      "meristem",
+      "distribution",
+      "plugin",
+      "install",
+      "mcp",
+      "claude-code",
+      "packaging"
+    ],
+    "retrieval_hints": [
+      "how do recipients install meristem",
+      "meristem-setup bootstrap venv",
+      "share meristem as a link",
+      "plugin does not ship the python packages"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T11:10:39.248629+00:00",
+    "updated_at": "2026-07-23T11:10:39.248629+00:00",
+    "verified_at": "2026-07-23T11:10:39.248629+00:00"
+  },
+  {
+    "id": "dec-007-c767",
+    "summary": "Filled the two archetype gaps the Vanguard sim test found (dec-004-e7c9) and delivered Vanguard's full bestiary. Added `raptor` (side-view biped beast: raptor/drake/roc) and `beetle` (top-down armored bug: beetle/scorpion/mite) archetypes -- 8 creature archetypes now cover every Vanguard enemy family. tools/vanguard_bestiary.py maps all 43 Vanguard enemy ids -> Meristem (archetype, config) recoloured from base_color/element, and packs each into a 768x256 Puny-layout battle sheet (row 0, idle + walk-cycle, art facing RIGHT for the loader's flip_h). Delivered to BOTH: Meristem (archetypes + script + docs/reference/vanguard-bestiary.png) and Vanguard (43 sheets in sprites/enemies/ + 43 SPRITE_MAP entries in battle_sprite_loader.gd, verified: godot --headless --import generated 43 .import files, no script errors).",
+    "problem": "Vanguard's enemy generator rendered 20 of its 43 creatures as a grey default-slime placeholder, and Meristem lacked the raptor (biped) and beetle (armored bug) families needed to cover the roster. The user asked to build out the sprite database: a sprite for every Vanguard creature, in both projects.",
+    "why_chosen": "The families already line up (wolf->quadruped, slime->blob, wisp->ghost, etc. per dec-004), so adding the two missing archetypes made Meristem's bestiary a superset of Vanguard's families; then a deterministic id->(archetype,config) mapping generates every sheet with hue-shift discipline (an upgrade over Vanguard's brightness-only, half-placeholder art). Packing into the exact 768x256 Puny layout the loader expects, with humanoids held to <=5 materials for the 15-colour budget, let all 43 gate-clean and import into Godot unchanged.",
+    "what_we_tried": "",
+    "tradeoffs": "A few creatures map only approximately to available archetypes (deep_angler/hollow_vine/shadow_creeper/granite_golem have no exact plant/fish/golem archetype). Vanguard changes are made + verified-to-import but left uncommitted in that repo for the user to eyeball in-battle (sprite quality is their call).",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-004-e7c9"
+    ],
+    "tags": [
+      "meristem",
+      "vanguard",
+      "bestiary",
+      "archetypes",
+      "sprites"
+    ],
+    "retrieval_hints": [
+      "raptor and beetle archetypes",
+      "vanguard bestiary 43 creatures sprite sheets",
+      "Puny 768x256 layout SPRITE_MAP delivery"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T12:01:02.650220+00:00",
+    "updated_at": "2026-07-23T12:01:02.650220+00:00",
+    "verified_at": "2026-07-23T12:01:02.650220+00:00"
+  },
+  {
+    "id": "dec-008-dcf2",
+    "summary": "Removed colour-count limits from the asset gate entirely (user directive). Free-palette classes now accept any number of colours \u2014 the gate checks only hard alpha, canvas size, and (for locked-palette classes only) swatch-subset. The 15-colour budget and the per-class max_colors_by_class (character:24) are gone; unique_colors is still reported, but informationally. A tight \u226415 SNES/GBA palette is now a STYLE choice, not an enforced rule.",
+    "problem": "The 15-colour budget (raised to 24 for characters to fit prop layers) kept fighting the growth of the humanoid's prop/accessory layers (held staff/shield, garment, stone arms) \u2014 every new layer risked overflow, and the audit found held:flamestaff at 18 colours. The budget had become friction rather than discipline.",
+    "why_chosen": "The user wants no colour limits. Making the \u226415 look optional (style guidance in the skills) rather than gate-enforced lets sprites carry as many meaningful ramps as their silhouette needs, while the pixel-art skill still encourages ramp discipline and shade-reuse for cohesion. Locked-palette mode (swatch-subset) is retained as a distinct opt-in style feature, since it is a mode, not a count cap.",
+    "what_we_tried": "",
+    "tradeoffs": "Loses the automatic guardrail against palette sprawl \u2014 cohesion now rests on taste + the skill's guidance, not enforcement. Deprecates con-001-fb66 (the material-cap constraint) and supersedes the budget half of dec-0020/0030.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "meristem",
+      "asset-gate",
+      "palette",
+      "sprites"
+    ],
+    "retrieval_hints": [
+      "colour limit removed from gate",
+      "no max_colors budget",
+      "unlimited colours free palette"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T12:35:52.327246+00:00",
+    "updated_at": "2026-07-23T12:35:52.327246+00:00",
+    "verified_at": "2026-07-23T12:35:52.327246+00:00"
+  },
+  {
+    "id": "dec-009-d062",
+    "summary": "Levels are now spec-authored (dec-0034): a new optional `levels` manifest domain -- {id, region, legend (char->tile), rows (character-grid strings), player_spawn, spawns [{id, kind enemy|item, x, y}]}. Cross-ref validates coherence (rectangular rows, legend coverage, known tiles via soft-imported generators, spawns resolve + in-bounds, region/level id links). The compiler projects the authored grid into .ldtk/tileset/runtime-grid (tileset = exactly the tiles used, auto-emitted beyond the contract set), bakes one scene+script per spawned enemy TYPE, and places player/enemies/items at their cells in main.tscn. Scaffold authors a real starter level (2 enemy spawns + item pickup). Fallback to the old synthesized grove for pre-domain manifests.",
+    "problem": "The compiler ignored the manifest for layout: synthesize_grove() emitted one fixed room, only enemies[0] ever appeared, and no items existed in the world. Meristem could describe a game but not its maps -- a sprite pipeline with a demo room, not a game-building tool.",
+    "why_chosen": "A character-grid (legend + rows) is the authoring form humans AND LLMs can write/diff directly in the manifest, keeping the single-source-of-truth (dec-0001); LDtk stays a projection (dec-0008/0014). Validating at the cross-ref layer (like sprites) means a bogus map is a validate_all error before compile. Per-spawned-enemy-type scenes let one level mix bestiary archetypes with distinct stats.",
+    "what_we_tried": "",
+    "tradeoffs": "One level compiles per project (multi-level worlds need level-switching runtime); items place as static Sprite2D pickups with no pickup logic yet. Both are the natural next steps.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "meristem",
+      "levels",
+      "compiler",
+      "spec-store",
+      "authoring"
+    ],
+    "retrieval_hints": [
+      "levels domain legend rows spawns",
+      "spec-authored maps character grid",
+      "multiple enemies placed items compile"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T17:03:52.640956+00:00",
+    "updated_at": "2026-07-23T17:03:52.640956+00:00",
+    "verified_at": "2026-07-23T17:03:52.640956+00:00"
+  },
+  {
+    "id": "dec-010-78cc",
+    "summary": "The compiled game is now a playable loop (dec-0035), all deterministic template code: a `Game` autoload (game_state.gd via project.godot [autoload]) holds player hp (baked from manifest character stats) + collected items with hp_changed/collected signals and death -> reload_current_scene; each placed item compiles to a pickup_<id>.tscn (Area2D, item_id baked, shared pickup.gd) collected on player touch; enemies join the \"enemies\" group and the player controller applies contact damage from the enemy's baked atk with 1s i-frames + hurt flicker; hud.gd binds the signals for a live hp readout + collected count.",
+    "problem": "After spec-authored levels (dec-009-d062) the compiled project was a diorama: items were static Sprite2Ds, enemies harmless scenery, nothing could be won or lost.",
+    "why_chosen": "A minimal loop (collect, get hurt, die, restart) is the smallest thing that makes the output a game, and it establishes the runtime substrate -- global state singleton, signals, node groups -- that attack actions, enemy AI, and win conditions build on next. Slide-collision + groups needs zero extra nodes; per-enemy Area2D hurtboxes rejected as redundant.",
+    "what_we_tried": "",
+    "tradeoffs": "Floor-level loop: no attack action, no enemy pursuit/death, no win condition yet. Verified: compiled slice imports + runs in Godot 4.6 with autoload registered, no script errors; wiring test covers every piece; 137 tests green.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-009-d062"
+    ],
+    "tags": [
+      "meristem",
+      "compiler",
+      "gameplay",
+      "godot",
+      "runtime"
+    ],
+    "retrieval_hints": [
+      "playable loop pickups contact damage",
+      "Game autoload game_state hud signals",
+      "death reload i-frames enemies group"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-23T18:06:49.229501+00:00",
+    "updated_at": "2026-07-23T18:06:49.229501+00:00",
+    "verified_at": "2026-07-23T18:06:49.229501+00:00"
+  },
+  {
+    "id": "dec-011-b5c3",
+    "summary": "Variant distinctness within a sprite archetype is a SILHOUETTE property, not a pixel property. A build must reshape the subject's outline (quadruped torso via back/belly knots, flyer wing shape), and the tests assert on alpha masks rather than byte-inequality.",
+    "problem": "Rendering the library as pure alpha masks showed the archetype variants were not distinguishable: dog/wolf/boar/cat shared one hardcoded body loaf and differed by +/-1px of ear and leg (closest pair 46px, mostly tail), and flyer bird/moth were the same ellipse pair separated only by interior feather lines that are invisible at 32px. Every *_builds_vary test passed throughout, because they assert only that two renders are not byte-equal - which a one-pixel ear satisfies. The same blind spot produced dagger/sword/greatsword as one drawing at three scales.",
+    "why_chosen": "A player names a sprite from its outline before colour or interior detail registers, so outline is the only variation axis that actually delivers distinctness at 16-32px. Making it structural - a build declares back/belly knots that _edge expands into the torso, rather than appending features to a fixed body - means a new variant cannot be added in a way that fails to read. Pairing that with alpha-mask tests calibrated to FAIL against the shipped versions (verified by running them against main: quadruped 46px, flyer 60px, blade widths 8/10/12) turns the property into an enforced invariant rather than an aspiration.",
+    "what_we_tried": "Built a diagnostic that renders each archetype family twice - as drawn and as a pure alpha mask - which is what made the problem visible; thumbnails on the contact sheet had hidden it for the whole life of the library.",
+    "tradeoffs": "Build presets are now heavier - a quadruped build is an outline spec (back/belly knots, leg columns, head box) rather than four scalars, so adding a variant takes more thought. The silhouette thresholds are calibrated floors, not proofs of visual distinctness; they catch a regression to the old failure mode but cannot certify that two shapes read as different animals. Eye review of library.png stays necessary.",
+    "alternatives": [
+      {
+        "option": "Keep the fixed body loaf and push distinctness harder through appendages (bigger ears, longer tails, more props)",
+        "reason_rejected": "This is what the code already did and what docs/research/03-quadruped.md section 6 explicitly claimed was sufficient. Measurement disproved it: appendages decorate a silhouette, they do not create one."
+      },
+      {
+        "option": "Distinguish variants by palette instead of shape",
+        "reason_rejected": "Contradicts dec-005-7b51, which already established prop/silhouette layers over palette swaps for characters, and colour is unavailable as a signal when the same creature family is recoloured per biome."
+      },
+      {
+        "option": "Keep asserting byte-inequality and rely on eye review of the contact sheet",
+        "reason_rejected": "Eye review is exactly what did not happen for the life of the library; the byte test gave false assurance that variants were distinct."
+      }
+    ],
+    "constraints_created": [
+      "A new build/kind within an existing archetype must change the alpha-mask silhouette, not only interior detail or colour.",
+      "Tests for variant distinctness must compare alpha masks; byte-inequality between renders is not evidence of distinctness."
+    ],
+    "related_to": [
+      "dec-001-9340",
+      "dec-005-7b51",
+      "dec-007-c767"
+    ],
+    "tags": [
+      "sprites",
+      "generators",
+      "silhouette",
+      "testing",
+      "readability"
+    ],
+    "retrieval_hints": [
+      "why do the quadruped builds look the same",
+      "sprite variant distinctness rule",
+      "alpha mask silhouette test for archetypes",
+      "back belly knots torso outline"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T00:54:19.894714+00:00",
+    "updated_at": "2026-07-26T00:54:19.894714+00:00",
+    "verified_at": "2026-07-26T00:54:19.894714+00:00",
+    "verified_sha": "d59d7cc768f8b10cc6b3e805345545c8947c7ed3"
+  },
+  {
+    "id": "dec-012-d904",
+    "summary": "Terrain tiles draw on a torus: every tile feature writes through wrap-safe _put/_disc, and band spacing is a named period asserted to divide the tile. Deliberately NO image-level seam metric - it cannot discriminate, so the exact invariants are tested instead.",
+    "problem": "Two real tiling bugs shipped. The crack walk clamped at the edges (min(w-1, max(0, x))) instead of wrapping, so a crack running off an edge piled its remaining pixels against the border - a dark smudge that repeated at every tile boundary, plainly visible in a 3x3 preview of stone. And _wave stepped 3 rows into a 16px tile, putting courses at rows 0,3,6,9,12,15 so the last sat 1px from the next tile's first, banding the water at every seam. Separately, grass/dirt/sand/snow/stone were one white-noise speckle field at five densities, so every soft surface read as the same gravel recoloured.",
+    "why_chosen": "Routing every feature through a wrap-safe primitive makes torus-correctness structural rather than something each new feature has to remember, the same way Ramp made hue-shift structural for shading. Naming the band periods as WAVE_PERIOD/RIPPLE_PERIOD constants turns the divides-the-tile requirement into an assertable invariant instead of a magic number. The omission is the load-bearing part: I built an image-level seam detector (seam difference vs interior mean, and roll-and-compare) and measured it, and it flags brick and water as broken because their own mortar and ripple periods make a correct seam look like a discontinuity. Shipping it would report CANNOT TELL as BROKEN, which is the failure mode the org already learned to avoid in conflict detection. Exact invariants that genuinely discriminate beat a plausible metric that does not.",
+    "what_we_tried": "Rendered every tile as a 3x3 lay-up, which is what exposed both the stone smudge and the water banding; single-tile thumbnails show neither. Then built and empirically disqualified two candidate automated seam/structure metrics before settling on exact invariants.",
+    "tradeoffs": "There is no automated check that a tile actually looks seamless; the tests prove the primitives wrap and the periods divide, which is necessary but not sufficient. A future feature could still be wrap-safe and ugly. 3x3 preview by eye remains the real acceptance step. The wrap-safe _put is also slower than direct numpy indexing, which is irrelevant at 16x16 but would matter if tiles ever got large.",
+    "alternatives": [
+      {
+        "option": "Ship the seam-energy metric (seam boundary difference vs mean interior boundary difference)",
+        "reason_rejected": "Measured false positives on brick (2.14), water (2.14), sand (1.77), lava (1.58) - all of which tile correctly. The metric is dominated by how much flat area a tile has, not by seam quality."
+      },
+      {
+        "option": "Ship an autocorrelation-based structure score to prove each tile has real structure rather than noise",
+        "reason_rejected": "Measured and rejected: new grass scores 0.169 against a 0.145 pure-speckle control, and new dirt scores 0.200 BELOW its own 0.209 control. Max-over-shifts inflates the noise floor. It cannot tell structure from noise at 16x16."
+      },
+      {
+        "option": "Fix the clamp bug only and leave the speckle-only materials alone",
+        "reason_rejected": "Would have left the more visible defect in place - five of eight tiles being the same texture is what a player sees first, before any seam artifact."
+      }
+    ],
+    "constraints_created": [
+      "Every terrain-tile drawing feature must write through the wrap-safe _put/_disc primitives, never index the array directly and never clamp.",
+      "Any periodic tile feature must take its spacing from a named constant that is asserted to divide the tile dimension."
+    ],
+    "related_to": [
+      "dec-011-b5c3",
+      "dec-001-9340"
+    ],
+    "tags": [
+      "sprites",
+      "generators",
+      "tiles",
+      "tileability",
+      "testing",
+      "metrics"
+    ],
+    "retrieval_hints": [
+      "why is there no tile seam test",
+      "tiles must wrap not clamp",
+      "stone tile dark smudge repeating",
+      "water banding at tile boundary",
+      "WAVE_PERIOD RIPPLE_PERIOD"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T00:54:47.074382+00:00",
+    "updated_at": "2026-07-26T00:54:47.074382+00:00",
+    "verified_at": "2026-07-26T00:54:47.074382+00:00",
+    "verified_sha": "d59d7cc768f8b10cc6b3e805345545c8947c7ed3"
+  },
+  {
+    "id": "dec-013-e61a",
+    "summary": "Silhouette-XOR is the DEFAULT sprite distinctness guard, not a universal one. When a fix changes a shape's character rather than its extent, pick a statistic that measures what actually changed and validate it against old-vs-new before trusting it.",
+    "problem": "dec-011-b5c3 established alpha-mask XOR as the distinctness test, and it worked well for quadruped and flyer variants. Then the ghost:specter rewrite moved ghost/specter from 96px apart to 74px while making the two dramatically easier to tell apart - the old specter was a dome on a rectangle that read as a grey pillar, the new one is a pointed hood with a recessed cowl. Gross pixel disagreement went DOWN because both are tall rounded masses; what changed is WHERE the shape narrows. An XOR threshold applied here would have failed a genuine improvement.",
+    "why_chosen": "The general principle is that the metric has to measure the property the fix targets. For extent-type changes (a body loaf becoming four differently proportioned torsos) XOR is exactly right. For character-type changes (blunt top becoming a point) it is blind or actively misleading, and an apex ratio - mean width of the top three rows over the widest row - separates them cleanly: old specter 0.378, new specter 0.175, sheet ghost correctly unchanged at 0.368. The discipline that makes this safe is measuring the candidate statistic on BOTH the old and the new render before writing the assertion, which is the same discipline that got two bad tile metrics rejected in dec-012-d904. A test that passes for the wrong reason, or fails a real improvement, is worse than no test.",
+    "what_we_tried": "Computed the XOR gap first out of habit, noticed it had moved the wrong way, and only then looked for a statistic matching the actual change. Also corrected an eyeball diagnosis in the same pass: the closest projectile pair was arrow/knife at 16px, not the fireball/bolt pair that looked worst by colour.",
+    "tradeoffs": "There is no single distinctness rule to apply mechanically to a new archetype - whoever adds one has to think about which axis their variants vary along and pick or write the matching statistic. That is more work than a uniform threshold and depends on judgement. Mitigated by keeping the shared helpers (_worst_silhouette_gap, _apex_ratio) next to each other in the readability test block with their calibration numbers in the docstrings.",
+    "alternatives": [
+      {
+        "option": "Apply the silhouette-XOR threshold uniformly to every archetype family for consistency",
+        "reason_rejected": "Measured: it would fail the specter improvement, which moved the pair from 96px to 74px apart while clearly improving readability. A uniform rule here punishes the right change."
+      },
+      {
+        "option": "Lower the XOR threshold until the ghost family passes",
+        "reason_rejected": "Tuning a threshold to fit the answer removes its power to catch anything, and it would still not be measuring the property that was fixed."
+      },
+      {
+        "option": "Leave the specter fix unguarded since XOR does not fit",
+        "reason_rejected": "The regression is cheap to encode once the right statistic is found, and the old shape is exactly the kind of thing that creeps back."
+      }
+    ],
+    "constraints_created": [
+      "Before asserting on any sprite-quality statistic, measure it against both the old and the new render and confirm it separates them in the expected direction.",
+      "Do not apply the silhouette-XOR distinctness threshold to a change that alters shape character rather than shape extent; find the statistic that measures the property being fixed."
+    ],
+    "related_to": [
+      "dec-011-b5c3",
+      "dec-012-d904"
+    ],
+    "tags": [
+      "sprites",
+      "generators",
+      "testing",
+      "metrics",
+      "silhouette",
+      "readability"
+    ],
+    "retrieval_hints": [
+      "when is silhouette XOR the wrong test",
+      "apex ratio hood pointed test",
+      "choosing a sprite quality metric",
+      "XOR went down but the sprite got better"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T01:36:38.901342+00:00",
+    "updated_at": "2026-07-26T01:36:38.901342+00:00",
+    "verified_at": "2026-07-26T01:36:38.901342+00:00",
+    "verified_sha": "cfc1f34e4d09fc4c5e429cfd2d2c99fb3518f698"
+  },
+  {
+    "id": "dec-014-8a77",
+    "summary": "The MCP renders sprites (preview_sprite, compare_builds) as real ImageContent, against the MANIFEST's own style_contract, refusing descriptors that would silently fall back. Rendering lives in meristem_generators.preview as pure functions; the MCP layer only resolves the contract and wraps bytes.",
+    "problem": "The pixel-art standard's central loop is render-then-judge-by-eye, because the asset gate checks conformance (canvas, hard alpha, palette subset) and cannot tell whether a sprite reads as the thing it is named. But no part of the authoring path could produce a picture: an agent composing a manifest through the MCP could call list_sprite_archetypes and check_sprite, then had to take on faith that the pick looked right. Every sprite defect fixed in PRs #4 and #5 was found by rendering and looking - the one step the MCP could not perform. Separately, config KEYS were never validated at all: {\"shpae\": \"heart\"} or a British {\"hat_colour\": ...} validated completely clean and then rendered the default.",
+    "why_chosen": "Putting the renderers in meristem_generators as pure (contract, archetype, config) -> bytes functions keeps them unit-testable without an MCP runtime and puts them where sprites and their tests already live; the server then only resolves the contract and wraps bytes in ImageContent. Reading the contract from the manifest's style_contract domain rather than an env var or invented default path is what guarantees a preview cannot show a different game than the compiler will build, since assets.py builds from that exact domain. Returning real ImageContent rather than base64 in text matters because the entire point is that the caller LOOKS. compare_builds defaults to silhouettes because interior detail actively hides outline collisions - flyer bird and moth were the same ellipse pair differing only in interior feather lines. And refusing an invalid descriptor rather than rendering it is required: a typo'd build renders the archetype's default, so a preview would put a dog under the label griffon and read as positive confirmation.",
+    "what_we_tried": "Probed FastMCP first to confirm Image content actually round-trips through call_tool before designing the tool signatures, rather than assuming. Also derived the per-archetype variant key (build/kind/shape/name) from the catalog instead of hardcoding build, which would have rendered one default nine times for weapons, pickups and tiles.",
+    "tradeoffs": "spec-store now declares meristem-asset-gate, so the MCP package pulls the gate in to turn the style_contract domain into a usable contract - the installer already installed it, but the dependency graph is wider. _ANIM_PARAMS is the one hand-maintained piece of the legal-key derivation and could under-report a new per-frame knob, whose only consequence is a spurious warning (never an error); it is guarded behaviourally by a test asserting each declared knob really changes the render. Key warnings are only visible to callers who use check_sprite until the validate_all wiring lands.",
+    "alternatives": [
+      {
+        "option": "Write preview PNGs to disk and return the path",
+        "reason_rejected": "A path is not something a model can look at, and it makes an MCP read tool mutate the filesystem. ImageContent puts the picture in front of the caller, which is the whole point."
+      },
+      {
+        "option": "Resolve the style contract from a MERISTEM_CONTRACT env var or a default file path",
+        "reason_rejected": "The compiler builds assets from domains['style_contract']. Any other source lets the preview and the build disagree, which is the one failure a preview must not have."
+      },
+      {
+        "option": "Render the invalid descriptor anyway and note the problem in the metadata",
+        "reason_rejected": "The picture is the thing that gets believed. Showing the default build under the author's typo'd label is worse than refusing, and it is the same silent-fallback failure dec-0029 exists to prevent."
+      },
+      {
+        "option": "Make unknown config keys hard errors like unknown variant values",
+        "reason_rejected": "The legal-key set is DERIVED (defaults + variant axes + per-frame anim params). A derivation that missed a knob would fail a manifest whose sprites render correctly. A wrong key costs a wrong-looking sprite; a wrong rejection costs a build, so these are warnings."
+      },
+      {
+        "option": "Also surface key warnings through validate_all",
+        "reason_rejected": "Deferred, not rejected: it requires changing cross_reference's (errors, skipped) return shape and its other callers, and reusing the checks_skipped channel would be a lie since a typo'd key is not a skipped check. Flagged as its own follow-up in PR #6."
+      }
+    ],
+    "constraints_created": [
+      "A sprite preview must render against the manifest's own style_contract domain, never an env var or a default contract path.",
+      "A preview must refuse a sprite descriptor that would fall back to a default build rather than render the fallback under the author's label.",
+      "Rendering helpers stay pure functions in meristem_generators; the MCP layer only resolves the contract and wraps bytes."
+    ],
+    "related_to": [
+      "dec-011-b5c3",
+      "dec-012-d904",
+      "dec-013-e61a",
+      "dec-003-b62b",
+      "dec-006-0863"
+    ],
+    "tags": [
+      "mcp",
+      "spec-store",
+      "generators",
+      "preview",
+      "sprites",
+      "authoring",
+      "validation"
+    ],
+    "retrieval_hints": [
+      "how do I look at a sprite from the MCP",
+      "preview_sprite compare_builds tools",
+      "why does preview refuse a bad build",
+      "typo'd config key warning",
+      "where does the preview get its style contract"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T12:48:39.292134+00:00",
+    "updated_at": "2026-07-26T12:48:39.292134+00:00",
+    "verified_at": "2026-07-26T12:48:39.292134+00:00",
+    "verified_sha": "32819d7d7a0c10e757508c7cefbcd278ff3659f6"
+  },
+  {
+    "id": "dec-015-5a5c",
+    "summary": "The compiler refuses any mechanics kind or enemy ai it has no template for, and the top-down slice became a real game: player melee, three AI archetypes, enemy death, and multi-room doors. Behavioural claims are verified by assertion-loop checks in real Godot, not by string assertions on generated code.",
+    "problem": "An audit of everything outside sprite generation found the compiled game was a tech demo with one silently-wrong output path. write_scripts rendered top_down_controller.gd.tmpl UNCONDITIONALLY, so a fully valid platformer manifest (validate_all ok/complete/valid) compiled without error into a top-down game with no gravity and no jump, discarding jump_height and gravity and inventing a FRICTION constant the platformer schema does not permit. Beyond that: the player had no attack at all and enemy hp was exported but never read, so the only interaction was walking into things; enemies were a sine-wave bob; and pick_level compiled ONE level, so every other room in a manifest was silently never built. economy and narrative domains are still authorable and entirely unread, and abilities/inventory/quests do not exist as concepts.",
+    "why_chosen": "Two registries (CONTROLLERS for mechanics kinds, ENEMY_AI for enemy behaviours) are the compiler's honest statement of what it can emit, and refusing an unlisted kind converts a silently-wrong build into an actionable error that says the manifest is valid and this is a compiler gap. Adding a controller or an AI is one entry plus one template. Each controller substitutes only its OWN declared params so defaults cannot leak across kinds. For content, reach and rate belong to the controller archetype while damage comes from the entity's atk stat, and enemy AI tuning comes from the entity's own free-form stats, because how hard a character hits and how fast one slime walks are properties of that actor rather than of the control scheme. Rooms all come off one _room_tscn builder with world.gd taking an exported level_name, so main.tscn stops being a special case and one script serves every room. Crucially, the string assertions ALL passed while the attack did not work: running the verifier's assertion loop in real Godot showed no damage, because the bodies settled 23.9px apart while attack_range was 22.0, so the reach could never hit a touching enemy. That is why behavioural claims now get engine-level assertions (melee_damage, room_transition) - a string check proves code was written, not that it connects.",
+    "what_we_tried": "Proved the platformer bug by authoring a valid platformer manifest and compiling it, rather than only reading the code - the emitted player.gd's own header said it came from the top_down_controller archetype. Then ran the verifier assertion loop in Godot 4.6 for combat, which failed on the first attempt and produced the 23.9px settled separation that explained why. The room_transition check similarly caught a harness bug where String() as a constructor call on an already-String Variant returned an empty result dict instead of an error.",
+    "tradeoffs": "Combat has no attack animation, because the humanoid archetype has no attack frames yet - the swing is instantaneous and the only feedback is the enemy flashing and dying. turn_based_combat remains inert when present as a second archetype that control_scheme does not point at (it emits nothing rather than something wrong, so it is an unimplemented feature and not the silent-fallback bug). economy and narrative are still entirely unread by the compiler, and abilities, inventory, equipping, quests and roguelite run structure still do not exist. The engine-level assertions only run when MERISTEM_GODOT points at a Godot binary, so CI validates generated code by string and structure and not by behaviour.",
+    "alternatives": [
+      {
+        "option": "Make validate_all reject a manifest whose mechanics kind the compiler cannot emit",
+        "reason_rejected": "The spec is not wrong. The mechanics schema legitimately offers platformer_controller and turn_based_combat, and a spec may reasonably describe a platformer before the compiler can build one. Refusal belongs at the point of consumption."
+      },
+      {
+        "option": "Use a physics hitbox (Area2D) for the melee swing",
+        "reason_rejected": "Needs extra collision nodes and layers in every generated scene, and the humanoid archetype has no attack ANIMATION to sync frames to. A range plus facing-arc test is deterministic and adds nothing to the scene."
+      },
+      {
+        "option": "Put attack range and damage both on the mechanics archetype",
+        "reason_rejected": "Conflates the character with the control scheme. Damage is the entity's atk stat; only reach and cadence describe how this control scheme swings."
+      },
+      {
+        "option": "Reuse world.connections for room transitions",
+        "reason_rejected": "It joins REGIONS, which are too coarse to say which room a particular doorway leads to. Level-scoped `exits` say exactly that."
+      },
+      {
+        "option": "Have the room_transition check actually call change_scene_to_file",
+        "reason_rejected": "That replaces the verifier harness mid-run and discards results.json. The swap is engine behaviour; what is ours is the baked res:// path and the arrival handoff, and those are what the check exercises."
+      }
+    ],
+    "constraints_created": [
+      "The compiler must refuse any mechanics kind or enemy ai it has no template for, naming what is implemented and stating that the manifest itself is valid.",
+      "A controller template may only substitute parameters it declares, so one kind's defaults cannot leak into another's script.",
+      "A behavioural claim about generated gameplay needs an assertion-loop check in a real engine; a string assertion on generated code proves only that the code was written."
+    ],
+    "related_to": [
+      "dec-009-d062",
+      "dec-010-78cc",
+      "dec-003-b62b",
+      "dec-012-d904"
+    ],
+    "tags": [
+      "compiler",
+      "mechanics",
+      "combat",
+      "levels",
+      "godot",
+      "verification",
+      "silent-fallback"
+    ],
+    "retrieval_hints": [
+      "why does the compiler refuse platformer_controller",
+      "how do I add an enemy AI archetype",
+      "player attack range and damage source",
+      "room transitions and exits",
+      "melee_damage room_transition assertions",
+      "attack range vs collision separation"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T14:33:52.822277+00:00",
+    "updated_at": "2026-07-26T14:33:52.822277+00:00",
+    "verified_at": "2026-07-26T14:33:52.822277+00:00",
+    "verified_sha": "7d806ee5bc72d6f288d80446b8b16c8439b39586"
+  },
+  {
+    "id": "dec-016-9f56",
+    "summary": "Abilities are a new `abilities` domain: parameters over a FIXED kind library (projectile, melee_arc, heal, dash), referenced by entity id, order-bound to ability_1..3 input slots. The runner is a child node on the player rather than code in the controller template, so abilities are not coupled to a control scheme.",
+    "problem": "The compiled player had exactly one verb - the basic melee swing added in dec-015-5a5c - and nothing in the manifest could add another. Abilities are the foundation that combat depth, gear effects and roguelite upgrades all depend on, so their absence blocked all three. No concept of an activatable action, a cooldown, or a ranged attack existed anywhere in the schemas.",
+    "why_chosen": "A fixed kind library keeps abilities inside the project's core rule (parameters, never freeform code) and reuses the refusal discipline already proven for controllers and enemy ai: an unimplemented kind is refused rather than bound to a key that silently does nothing. Putting the runner on a child NODE of the player instead of inside the controller template is what stops abilities being duplicated per control scheme - the controller only forwards input, so a future platformer controller inherits abilities for free. All kinds live in ONE script rather than one template each because a character holds several kinds at once and dispatches per slot at runtime, which is the opposite of a controller where exactly one applies. Projectiles are added to the SCENE rather than to the caster so a shot outlives the caster's transform and keeps flying if the player moves or dies, and their sprites come from the existing `projectile` archetype so the sprite library already covers them. Slot count is capped at what the input map binds, because an ability past the last bound slot is unreachable - a spec that does not do what it says.",
+    "what_we_tried": "Verified the projectile end to end in Godot 4.6 (firebolt takes the slime 8 -> 4 through the real input binding). That work exposed an order-dependent bug in the verifier harness itself: the ability check passed in a full run and failed alone, because Input.action_press lands mid-frame and a single-frame press-then-release can close the just_pressed window before the listener's _physics_process sees it. Fixed with a shared _tap helper holding the action two frames, then confirmed by running the assertion in isolation. Also found several docs already stale at \"8 domains\" (missing `levels` before this change added `abilities`).",
+    "tradeoffs": "Three input slots is a hard cap until the input map grows; a character cannot carry a fourth ability at all rather than carrying it unbound. Abilities have no cost resource - no mana or stamina exists, only cooldowns - and no HUD icons, so a player cannot see what is on cooldown. The ability runner contains implementations for all four kinds regardless of which the game uses, which is harmless dead code but means the script does not shrink for a simple game. Enemies can hold `abilities` in the schema but only the player's are wired, so an enemy ability list validates and does nothing.",
+    "alternatives": [
+      {
+        "option": "Put the ability code in the controller template alongside movement and the basic swing",
+        "reason_rejected": "Couples abilities to a control scheme. A second controller would need its own copy of every ability implementation, which is the duplication the archetype approach exists to avoid."
+      },
+      {
+        "option": "One template per ability kind, mirroring CONTROLLERS and ENEMY_AI",
+        "reason_rejected": "Those registries pick exactly ONE template per game. A character holds several ability kinds simultaneously and dispatches per slot at runtime, so a single script with a baked slot table is the right shape."
+      },
+      {
+        "option": "Add the projectile as a child of the casting player",
+        "reason_rejected": "The shot would inherit the caster's transform and be freed when the caster dies. It belongs to the scene."
+      },
+      {
+        "option": "Silently ignore abilities beyond the bound input slots",
+        "reason_rejected": "Same silent-fallback failure the project has now removed five times. An unreachable ability is refused with a message naming the slot limit."
+      },
+      {
+        "option": "Let a projectile default its speed and range when omitted",
+        "reason_rejected": "It would ship an ability that looks authored and does not behave as specified. Cross-ref requires the numbers that make a projectile a projectile."
+      }
+    ],
+    "constraints_created": [
+      "An ability kind the runner cannot execute, or an ability past the bound input slots, must be refused at compile time rather than compiled into an inert slot.",
+      "Ability behaviour must be proven by an engine-level assertion (ability_damage), not by string checks on the generated runner.",
+      "Input-driven assertions in the verifier harness must hold an action across at least two physics frames; a single frame can miss the is_action_just_pressed window."
+    ],
+    "related_to": [
+      "dec-015-5a5c",
+      "dec-003-b62b",
+      "dec-010-78cc"
+    ],
+    "tags": [
+      "compiler",
+      "abilities",
+      "combat",
+      "godot",
+      "verification",
+      "schema",
+      "silent-fallback"
+    ],
+    "retrieval_hints": [
+      "how do I add an ability",
+      "ability kinds projectile melee_arc heal dash",
+      "why is the ability runner a child node",
+      "ability input slots ability_1",
+      "verifier tap two physics frames just_pressed"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T15:27:12.484851+00:00",
+    "updated_at": "2026-07-26T15:27:12.484851+00:00",
+    "verified_at": "2026-07-26T15:27:12.484851+00:00",
+    "verified_sha": "1e7dcfe9c736bcf57d870f12e842a29dee023193"
+  },
+  {
+    "id": "dec-017-ce0f",
+    "summary": "Effective player stats live in the Game autoload, not as baked constants: gear equips on pickup (worn slots only) and moves Game.atk()/Game.defense(), and abilities spend an optional `cost` from the caster's `mp` stat. A cast that cannot be paid for neither fires nor burns its cooldown.",
+    "problem": "Item `slot` and `stats` had been authorable since the items schema was written and compiled to nothing but a sprite and a placement - the slice example's Training Sword declared +2 atk and did not touch a single hit. Separately, abilities (dec-016-9f56) had cooldowns and nothing else, so a heal was free and the only tradeoff was waiting. Both gaps meet at the same place: the player's attack damage was a constant baked into the controller script, and a constant cannot respond to equipping a sword.",
+    "why_chosen": "Moving effective stats into the Game autoload is what makes gear possible at all - the swing asks Game.atk() per hit instead of carrying a frozen number, so any runtime source of bonuses (gear now, buffs later) flows through one accessor. Equipping is driven by the item's `slot` rather than \"anything with stats\" because the slot enum already distinguishes worn gear (weapon/armor/accessory) from carried things (consumable/key_item), so the schema already had the right signal. Defence subtracts with a floor of 1 because enough armour would otherwise make the player invulnerable and the game unlosable. For cost, refusing to burn the cooldown on an unaffordable cast matters more than it looks: a failed cast that still started a cooldown reads to a player as the game eating inputs. Cross-ref refuses a cost larger than the caster's whole mp pool, since that ability could never be used once - the same \"spec that does not do what it says\" rule already applied to unreachable ability slots.",
+    "what_we_tried": "Wrote two engine assertions before trusting either feature. `gear_bonus` collects the item through the real path and confirmed atk 4 -> 6 with the sword equipped as weapon. `ability_cost` FAILED on the first run - fired true, pool unchanged at 10 - because `cost` was in the schema and read by the runner but `_player_abilities` never copied it into the baked slot, so every ability defaulted to free. Added a shape test asserting every baked slot carries a cost key so the same omission fails without an engine run. This is the third time an engine-level assertion caught something every string check was green on (melee reach, harness frame timing, now this).",
+    "tradeoffs": "Picking up a second weapon silently replaces the first - there is no inventory, no swapping and no way to unequip. Nothing drops on kill yet (items.drop_tables is still unread), so gear must be hand-placed in a level to ever be found. Only atk and def bonuses are consumed; an item granting hp or spd validates and does nothing. mp is a single undifferentiated resource with no per-ability resource types. The HUD ability readout polls every frame, which is cheap here but is work proportional to slots.",
+    "alternatives": [
+      {
+        "option": "Keep ATTACK_DAMAGE baked in the controller and add gear bonuses on top at spawn",
+        "reason_rejected": "A constant cannot change when the player picks something up mid-run, which is the entire point of gear. Recomputing it would mean the controller reaching into the item table anyway."
+      },
+      {
+        "option": "Equip anything that has a stats block, regardless of slot",
+        "reason_rejected": "A health potion with {hp: 5} would become permanent +5 max hp on pickup. The slot enum already separates worn from carried; using it keeps the rule obvious."
+      },
+      {
+        "option": "Let defence reduce damage to zero",
+        "reason_rejected": "Enough armour makes the player invulnerable and the game unlosable. A hit always lands for at least 1."
+      },
+      {
+        "option": "Burn the cooldown even when the cost cannot be paid",
+        "reason_rejected": "Reads as the game swallowing inputs. Pay first; on failure change nothing."
+      },
+      {
+        "option": "Signal the HUD on every cooldown tick",
+        "reason_rejected": "A cooldown changes continuously, so that is a signal per frame per slot. The ability readout polls instead."
+      }
+    ],
+    "constraints_created": [
+      "Effective combat stats (atk, defence) must be read from the Game autoload at use time, never baked as constants into a controller template, so runtime sources of bonuses can apply.",
+      "An ability whose cost cannot be paid must change nothing: it does not fire and does not advance its cooldown.",
+      "Every baked ability slot must carry a `cost` key; a missing key silently means free."
+    ],
+    "related_to": [
+      "dec-016-9f56",
+      "dec-015-5a5c",
+      "dec-010-78cc"
+    ],
+    "tags": [
+      "compiler",
+      "gear",
+      "abilities",
+      "stats",
+      "godot",
+      "verification",
+      "silent-fallback"
+    ],
+    "retrieval_hints": [
+      "do item stats do anything",
+      "how does equipping work",
+      "ability mp cost",
+      "why is atk not baked into player.gd",
+      "gear_bonus ability_cost assertions"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T18:08:43.038285+00:00",
+    "updated_at": "2026-07-26T18:08:43.038285+00:00",
+    "verified_at": "2026-07-26T18:08:43.038285+00:00",
+    "verified_sha": "350d281db09c52062fdc5ae1e91a9f02c09e1282"
+  },
+  {
+    "id": "dec-018-57b3",
+    "summary": "items.drop_tables are live: an enemy's death rolls its table and spawns the winning item where it fell, parented to the current scene. A new optional nothing_weight sits in the same weighted pool as the drops, and droppable items get a pickup scene even when no level places them.",
+    "problem": "drop_tables had been authorable since the items schema was written and compiled to nothing - killing an enemy produced no loot at all, so gear (made functional in dec-017-ce0f) could only ever be found by hand-placing it in a level. With enemies dying, items equipping on pickup, and pickup scenes already generated per item type, the loot roll was the one missing link in the fight-loot-equip loop.",
+    "why_chosen": "Rolling in the Game autoload rather than in each enemy script keeps one implementation and one place the drop table lives; the enemy only supplies its baked ENEMY_ID and position. Parenting the spawned pickup to get_tree().current_scene rather than to the dying enemy is required, not stylistic - the enemy is about to be freed and would take its own loot with it - and the roll must happen before queue_free because a freed node has no position to drop at. nothing_weight sits in the SAME weighted pool as the drops rather than being a separate pre-roll probability, so a single set of numbers describes the whole distribution and an author can read the odds directly off the table instead of composing two independent rolls. Generating a pickup scene for droppable-but-never-placed items closes a real hole: drop_loot loads pickup_<id>.tscn by name at runtime, and only placed items used to get a scene, so a loot-only item would have silently spawned nothing. Refusing a droppable item with no sprite at compile time moves that failure from an unnoticed nothing on some later kill to a build error.",
+    "what_we_tried": "Verified with a new loot_drop assertion that kills the enemy through take_damage rather than calling drop_loot directly, so the death path itself is proven: the slime dropped a sword at exactly (48,48) in Godot 4.6. Also added a test asserting all three AI templates call drop_loot, because the death block is duplicated per template and is exactly the kind of thing that gets updated in one and forgotten in the others.",
+    "tradeoffs": "The loot roll uses randf(), so a compiled game's drops are not reproducible run to run - correct for a game but it means the verifier can only assert the guaranteed-drop case. Dropped items land exactly where the enemy died, which can be inside a wall or on water since there is no placement validity check. There is still no inventory: picking up a second weapon silently replaces the first with no way to unequip or compare. rarity_tiers remain unread, so rarity has no effect on drop odds despite looking like it should.",
+    "alternatives": [
+      {
+        "option": "Roll the drop table inside each enemy script",
+        "reason_rejected": "Three AI templates would each carry a copy of the weighting logic, and the drop data would have to be baked per enemy script instead of once."
+      },
+      {
+        "option": "Add the pickup as a child of the dying enemy",
+        "reason_rejected": "queue_free on the enemy takes the loot with it. The scene has to own it."
+      },
+      {
+        "option": "Treat nothing_weight as a separate drop-chance rolled before the item roll",
+        "reason_rejected": "Two independent rolls make the effective odds of any single item non-obvious. One pool means the numbers on the table ARE the distribution."
+      },
+      {
+        "option": "Only generate pickup scenes for placed items and load lazily on first drop",
+        "reason_rejected": "The scene file would not exist at all, so the load returns null and the drop silently produces nothing - visible only on a kill of that specific enemy."
+      },
+      {
+        "option": "Assert loot in the verifier for any drop table",
+        "reason_rejected": "A weighted roll is not deterministic. An assertion that passes most of the time is worse than none, so only a single guaranteed drop (no nothing_weight, one entry) is asserted on."
+      }
+    ],
+    "constraints_created": [
+      "A dropped pickup must be parented to the current scene, and the drop roll must happen before the dying enemy is freed.",
+      "Any item reachable as loot must have a sprite and a generated pickup scene, checked at compile time rather than discovered on a kill.",
+      "Only a drop table with a single guaranteed drop may be asserted on in the verifier; weighted tables are non-deterministic."
+    ],
+    "related_to": [
+      "dec-017-ce0f",
+      "dec-016-9f56",
+      "dec-015-5a5c"
+    ],
+    "tags": [
+      "compiler",
+      "items",
+      "loot",
+      "gear",
+      "godot",
+      "verification"
+    ],
+    "retrieval_hints": [
+      "do enemies drop loot",
+      "drop_tables nothing_weight",
+      "why is the pickup parented to the scene",
+      "loot only item pickup scene",
+      "loot_drop assertion"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T18:23:33.424520+00:00",
+    "updated_at": "2026-07-26T18:23:33.424520+00:00",
+    "verified_at": "2026-07-26T18:23:33.424520+00:00",
+    "verified_sha": "35f3bb8ce87efc839724d543c7cc62c6a28f731d"
+  },
+  {
+    "id": "dec-019-a72b",
+    "summary": "CI runs the Godot engine assertion loop on Linux (pinned + cached binary, MERISTEM_GODOT exported), so behavioural checks guard every push. The visual capture loop is gated separately on having a real display, because it runs Godot windowed and --headless cannot render.",
+    "problem": "CI validated generated code by string and structure and never by behaviour, so the checks that actually catch broken gameplay only ran when someone remembered to set MERISTEM_GODOT locally. Three real bugs in one session were invisible to CI and green: a melee attack_range (22px) shorter than the ~24px two colliding 16px bodies settle at, so the swing could never hit a touching enemy; an input-timing flake in the verifier harness where a single-frame press-then-release could miss the is_action_just_pressed window; and an ability `cost` that was in the schema and read by the runner but never copied into the baked slot, so every ability was free. Every string assertion passed in all three cases.",
+    "why_chosen": "Downloading a pinned Godot on the Linux job is cheap (cached, ~50MB) and turns seven behavioural assertions plus the compile/import/run smoke test into push-time guards. One OS is enough because these assert game logic rather than platform behaviour, and the suite already runs on both. Ending the install step with `--headless --version` means a bad download or a missing shared library fails under that step's own name instead of surfacing as a confusing test error later. The load-bearing discovery was that MERISTEM_GODOT alone gated TWO capabilities with different requirements: the assertion loop runs under true --headless and needs only the binary, while the visual loop runs Godot WINDOWED on purpose because --headless uses dummy drivers that do not render (dec-0007), so it also needs a display. Enabling the assertions in CI would therefore have enabled a capture that cannot possibly work on a display-less runner. Gating the visual test on a display (DISPLAY on POSIX, always true on Windows) rather than inventing a new opt-in flag keeps it running automatically on a real desktop while skipping in CI, with no extra knob for anyone to remember.",
+    "what_we_tried": "Verified the release asset name through the GitHub API rather than guessing the URL. Checked the visual-capture code before pushing and found it deliberately runs windowed, which is what surfaced the shared-flag bug. Tested the new display gate both ways locally (Windows with Godot runs all 14 verifier tests including the capture; the predicate returns false for POSIX-without-DISPLAY). Then confirmed from the CI log that the assertions genuinely RAN rather than the job merely passing: ubuntu went from 198 passed / 13 skipped to 203 passed / 8 skipped, five more tests, with the only Godot-related skip being the visual capture and its intended reason.",
+    "tradeoffs": "The Linux job is slower (about 20s to 50s) and depends on a GitHub release download, so a Godot release being unavailable breaks CI for a reason unrelated to the code; the cache limits how often that matters. The engine assertions still do not run on Windows, so a Windows-only regression in the generated project would be caught only by the local suite. The visual capture remains unguarded by CI entirely. GODOT_VERSION in the workflow must be bumped in step with the engine the templates target, and nothing enforces that pairing automatically.",
+    "alternatives": [
+      {
+        "option": "Install xvfb plus software GL so the visual capture also runs in CI",
+        "reason_rejected": "Adds a virtual display, a software rasteriser and real flakiness risk to make one screenshot test run, when the screenshot is only useful as input to a vision critique a human reads. The assertion loop is what guards correctness."
+      },
+      {
+        "option": "Introduce a separate opt-in env var for the visual loop",
+        "reason_rejected": "Another knob to remember, and it would silently stop the visual test running on the developer's own machine. A display check is the actual precondition, so test for that."
+      },
+      {
+        "option": "Run the engine assertions on both Linux and Windows",
+        "reason_rejected": "Doubles the download and runtime to re-prove game logic that is not platform-dependent. The rest of the suite already covers both OSes."
+      },
+      {
+        "option": "Leave CI as it was and rely on local runs",
+        "reason_rejected": "That is the status quo that let three behavioural bugs through green CI in a single session."
+      }
+    ],
+    "constraints_created": [
+      "A behavioural check must not be gated on the same flag as a check with different environmental requirements; gate on the actual precondition (a binary vs a display).",
+      "The CI coverage report must state per job which behavioural checks ran and which did not, so a green check is never read as more coverage than it had."
+    ],
+    "related_to": [
+      "dec-015-5a5c",
+      "dec-016-9f56",
+      "dec-017-ce0f",
+      "dec-018-57b3"
+    ],
+    "tags": [
+      "ci",
+      "verification",
+      "godot",
+      "testing",
+      "skipped-checks"
+    ],
+    "retrieval_hints": [
+      "does CI run the godot tests",
+      "MERISTEM_GODOT in CI",
+      "why does the visual capture skip in CI",
+      "GODOT_VERSION workflow pin",
+      "engine assertions push guard"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T19:48:23.035407+00:00",
+    "updated_at": "2026-07-26T19:48:23.035407+00:00",
+    "verified_at": "2026-07-26T19:48:23.035407+00:00",
+    "verified_sha": "ead07f803817431457034c41c00702379ac5263f"
+  },
+  {
+    "id": "dec-020-65e9",
+    "summary": "Terrain passability is a property of the tile vocabulary (water/stone/brick/lava block movement), the ground builder gives solid cells collision on one shared StaticBody2D, and cross-ref refuses any spawn, door or arrival cell placed on impassable terrain.",
+    "problem": "Set out to add a placement check so dropped loot could not land in a wall, and found there was no wall to land in. The generated ground builder created Sprite2D nodes and nothing else, so the compiled game had NO collision anywhere: the player walked across water and stone, the patrol AI's is_on_wall() could never be true, and level geometry was purely decorative. The loot-placement problem did not exist because the thing it depended on did not either. Nothing in the schemas or generators expressed passability at all.",
+    "why_chosen": "Passability belongs with the tile vocabulary in meristem_generators because whether you can walk on water is a fact about water, not about one map - re-declaring it per level would let two maps disagree about the same material. It is exposed through public accessors (solid_tiles / tile_is_solid) for exactly the reason known_tiles is public: the compiler bakes the set into the ground builder and cross-reference validation resolves spawn cells against it, so a rename must break an import rather than silently turn either consumer into a no-op (the ProceduralGenerator._TILES lesson). lava is solid rather than passable-and-damaging because no terrain damage system exists to be the other half of that, and a wall is the honest reading of what the runtime can express today. One StaticBody2D carrying every wall shape rather than a body per cell means the physics server sees one collider instead of a few hundred. And once solid tiles carry collision, a spawn on one is an actor stuck inside a wall, so cross-ref has to refuse it - that is the follow-up the visual loop earned when it caught an enemy standing on the water pond, a placement bug no physics assertion sees.",
+    "what_we_tried": "Checked the ground builder before writing the loot placement check, which is what revealed there was no collision at all and redirected the work. New tile_collision assertion verified in Godot 4.6: the player starts at x=200 in the grass beside the pond, holds right for 60 physics frames and stops at x=202.99 against a boundary of 208 - exactly its 5px collision half-width, where with no collision it would have reached about x=480. The new cross-ref check immediately caught a bad fixture of my own: the two-room test manifest laid the entire cave floor in stone, so the room was all wall and both its player_spawn and its door were inside it, wrong since the room-transition work and unnoticed because nothing could notice. Confirmed in the CI log that the seven engine assertions ran (209 passed / 8 skipped on ubuntu), not merely that the job was green.",
+    "tradeoffs": "Solid is binary: there is no one-way ledge, no jump-over, no damaging-but-walkable terrain, and no per-level override for a material. Collision is rebuilt at runtime from the grid JSON on every room load rather than baked into the scene, which is simple but means the .tscn does not describe the walls. Water being solid means no swimming or water traversal is expressible. The engine assertion only checks the rightward direction, so a bug that let the player through walls only when moving up would pass.",
+    "alternatives": [
+      {
+        "option": "Add the runtime loot-placement nudge I originally planned",
+        "reason_rejected": "Solved a symptom of a missing feature. With collision plus spawn validation, a dying enemy is always on a passable cell, so the nudge is unnecessary - making the geometry real removes the situation instead of handling it."
+      },
+      {
+        "option": "Declare passability per level in the levels domain",
+        "reason_rejected": "Two maps could then disagree about whether water is walkable. It is a material fact, so it belongs with the material."
+      },
+      {
+        "option": "A StaticBody2D per solid cell",
+        "reason_rejected": "Hundreds of colliders for a 20x12 room. One body with many shapes is the same geometry at a fraction of the cost."
+      },
+      {
+        "option": "Make lava passable and damaging",
+        "reason_rejected": "There is no terrain damage system, so it would be passable and harmless - a worse lie than treating it as a wall."
+      },
+      {
+        "option": "Hardcode the wall cell in the tile_collision assertion",
+        "reason_rejected": "It would silently stop testing anything if the example map changed. The assertion scans the start level for the first passable cell with a solid right neighbour, and derives nothing when the map has no walls."
+      }
+    ],
+    "constraints_created": [
+      "Tile passability is declared once in the generators' tile vocabulary and consumed through public accessors; no consumer may hardcode which tiles are solid.",
+      "A player_spawn, entity/item spawn, door or door arrival cell on impassable terrain is a cross-reference error, because the actor would be stuck inside a wall."
+    ],
+    "related_to": [
+      "dec-009-d062",
+      "dec-018-57b3",
+      "dec-019-a72b",
+      "dec-012-d904"
+    ],
+    "tags": [
+      "compiler",
+      "levels",
+      "collision",
+      "tiles",
+      "godot",
+      "verification",
+      "placement"
+    ],
+    "retrieval_hints": [
+      "which tiles are solid",
+      "does the ground have collision",
+      "spawn on water refused",
+      "tile_collision assertion",
+      "why is lava a wall"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-26T21:15:51.427065+00:00",
+    "updated_at": "2026-07-26T21:15:51.427065+00:00",
+    "verified_at": "2026-07-26T21:15:51.427065+00:00",
+    "verified_sha": "30a31775650d68add654ca7b95a8abb50f0a4b10"
+  },
+  {
+    "id": "dec-021-11f0",
+    "summary": "The humanoid archetype has four facings (south/north/east/west) via a `facing` config knob, and the compiler emits all four. `west` is never drawn -- it is `east` mirrored. `south` renders byte-identical whether the config names it or not.",
+    "problem": "A top-down game moves in four directions and every Meristem archetype drew ONE front view, so a character walking north showed you its face and one walking left was the same drawing mirrored via flip_h. This affected Meristem's own compiled games as much as Vanguard, whose Godot overworld could not consume Meristem art at all for exactly this reason and kept using its own PartyOverworldSpriteGenerator.",
+    "why_chosen": "Two hard rules bound the design and are asserted by tests rather than left to convention. `west` is east mirrored: half the work, and a guarantee the two profiles cannot drift apart when one is next edited. `south` is frozen byte-for-byte because every sprite that already existed is a south sprite -- adding a direction must not silently redraw the whole cast. `facing` is a catalog variant axis so a typo is a validation error, not a quiet render of the default direction (consistent with dec-0029). The key craft finding: what makes a profile legible at 32px is the SILHOUETTE, not the shading. A first cut that only narrowed the torso scored 76px of outline difference against the front view and read as a smudge; adding a nose on the leading edge, the hair mass behind, and the near arm clear of the trunk reached 149px.",
+    "what_we_tried": "First attempt narrowed the east torso and moved the eye, keeping front-facing sideburns and a square head -- 76px silhouette gap, unreadable at 1x. Rendering and looking at it (rather than trusting the code read correctly) is what caught it, the same discipline that caught three unusable metrics earlier in the project.",
+    "tradeoffs": "A humanoid character now costs 5x the walk frames on disk (four facings plus the undirected set). At 32x32 that is noise, and keeping the undirected `walk_*` set is what makes pre-facing manifests byte-stable and lets single-view archetypes compile unchanged.",
+    "alternatives": [
+      {
+        "option": "Draw west separately from east",
+        "reason_rejected": "Two profiles that will drift apart the first time one is edited; twice the pixels for zero information"
+      },
+      {
+        "option": "An 8-direction set",
+        "reason_rejected": "Four is what the input map and every downstream consumer actually expresses"
+      },
+      {
+        "option": "Re-author every hat, garment and weapon in profile",
+        "reason_rejected": "A lot of pixels for a 1x view when a per-layer column shift is exact and cannot drift from the front-view art"
+      },
+      {
+        "option": "Keep flip_h mirroring in the controller",
+        "reason_rejected": "With directional art it is wrong as well as unnecessary -- west is already a mirror of east, so flipping again turns the character back around"
+      }
+    ],
+    "constraints_created": [
+      "humanoid `south` must render byte-identical with and without an explicit facing key -- enforced by test_south_is_unchanged_by_the_facing_knob",
+      "`west` must equal `east` mirrored horizontally -- enforced by test_west_is_exactly_east_mirrored",
+      "front and profile silhouettes must differ by >=85px -- enforced by test_profile_differs_from_front_in_silhouette"
+    ],
+    "related_to": [],
+    "tags": [
+      "sprites",
+      "humanoid",
+      "compiler",
+      "godot",
+      "vanguard"
+    ],
+    "retrieval_hints": [
+      "how do Meristem characters face different directions",
+      "why is west not drawn separately",
+      "directional overworld sprites four facings",
+      "profile silhouette nose hair mass 32px"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-27T00:47:49.724452+00:00",
+    "updated_at": "2026-07-27T00:47:49.724452+00:00",
+    "verified_at": "2026-07-27T00:47:49.724452+00:00",
+    "verified_sha": "0e882ee1839435b95d80298a04c9c0874d947a44"
+  },
+  {
+    "id": "dec-022-4f59",
+    "summary": "Every declared entity stat reaches the runtime via BASE_STATS + a generic Game.stat(name), not a hand-picked atk/def. Abilities gain an optional `scaling` stat added to power, read at cast time so gear moves it. A scaling reference to a stat the caster lacks is refused at both cross-ref and compile time.",
+    "problem": "entities.stats is an open map in the schema (additionalProperties: number), so an author could always write `mag: 6` -- and the compiler consumed hp/atk/def/mp/mp_regen only. Every other stat validated clean and compiled to nothing. Worse, Game.stat_bonus(name) was ALREADY generic over the stat name, so an item granting +4 mag faithfully accumulated a bonus that nothing in the runtime could ever read. The Vanguard sim-test fit report ranked this the cheapest fix with the widest reach: Maren is a MAG-based support whose rod grants +MAG, and the rod had to be authored as +4 atk, which changes what the item means.",
+    "why_chosen": "stat_bonus was already generic, so the whole gap was the OTHER half: baking every declared stat instead of two, and adding one `scaling` field. atk()/defense() keep named accessors because they carry real floors (an attack lands for at least 1, defense never goes negative) that are runtime rules, not properties of stats in general. hp/mp/mp_regen stay as their own Game fields and are excluded from BASE_STATS so no stat has two homes that can disagree. Scaling is read at CAST time, never baked: gear moves stats mid-run, so a power resolved at compile time would ignore the staff the player is holding, which is the entire point. All four ability kinds go through one _effective_power, including dash where the stat scales distance -- one rule instead of two.",
+    "what_we_tried": "Deriving the new stat_scaling assertion exposed that the EXISTING ability_damage assertion computed its expectation from raw `power`. It failed the moment scaling started working, which is how the omission was found -- the assertion loop catching a gap in its own derivation.",
+    "tradeoffs": "`power` alone no longer tells you what an ability hits for -- you have to know the caster's stat too. That is inherent to scaling; the HUD readout (scaling stats shown next to atk/def) and the stat_scaling engine assertion are what make it legible.",
+    "alternatives": [
+      {
+        "option": "A fixed second stat named `mag`",
+        "reason_rejected": "Vanguard's five stats are not every game's; the open map was already right, only the consumption was wrong"
+      },
+      {
+        "option": "Resolve scaling at compile time into the baked power",
+        "reason_rejected": "Ignores gear equipped mid-run, which is the whole feature"
+      },
+      {
+        "option": "Scaling as a multiplier rather than an addend",
+        "reason_rejected": "An author reading `power: 5, scaling: mag` expects addition, and multiplication makes a 0-stat ability do nothing at all"
+      },
+      {
+        "option": "Let an unknown scaling stat silently add 0",
+        "reason_rejected": "Same silent-fallback shape as a typo'd sprite build -- the spec asks for more damage and nothing anywhere says it did not get it"
+      }
+    ],
+    "constraints_created": [
+      "A scaling stat the caster does not declare must be a cross-ref error AND a CompileError, never a silent +0",
+      "hp/mp/mp_regen must stay out of BASE_STATS -- they are Game's own fields and two homes could disagree",
+      "Ability scaling must be read at cast time (Game.stat), never resolved into a baked power"
+    ],
+    "related_to": [],
+    "tags": [
+      "stats",
+      "abilities",
+      "compiler",
+      "godot",
+      "vanguard",
+      "verifier"
+    ],
+    "retrieval_hints": [
+      "why does my mag stat do nothing",
+      "ability scaling off a stat",
+      "arbitrary stats reaching the runtime",
+      "BASE_STATS Game.stat accessor"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-27T21:43:38.272640+00:00",
+    "updated_at": "2026-07-27T21:43:38.272640+00:00",
+    "verified_at": "2026-07-27T21:43:38.272640+00:00",
+    "verified_sha": "cdf09b07a4d6ecab84998c63e01d622fda46947e"
+  },
+  {
+    "id": "dec-023-7643",
+    "summary": "NPC overworld art is generated one sheet per PLACED NPC (keyed {map}_{node}), not per sprite_id, and each NPC's palette is read out of the running game rather than re-derived. Added `headband` and `wide_brim` hats to the humanoid archetype.",
+    "problem": "Meristem generated 18 generic NPC sheets keyed on Vanguard's sprite_id and the overworld could not use them. A placed NPC carries hand-authored shirt/pants/hair/skin colours, so a sheet keyed on sprite_id would have made every \"worker_cyan\" in the game the same person -- which is exactly why the sprite ladder had deliberately kept Vanguard's own procedural generator ABOVE the generated sheets. The art was better and still unusable.",
+    "why_chosen": "Keying on the placed NPC dissolves the tradeoff instead of managing it: the variety is authored, not random, and there are only fifteen NPCs in the whole game. Map + node rather than npc_name because a JRPG has several NPCs called \"Traveler\". Crucially the palette is DUMPED from the running game (dump_npc_palettes.gd loads each map, lets _ready run, reads the resolved colours off the live node) rather than parsed from .tscn: half of what an NPC looks like is not in the scene file at all, because colours the author left unset are derived at runtime from npc_color plus a hash of the node name. Re-implementing that rule in the Python generator would be a second copy free to drift, and the drift would be invisible -- the sprite would simply be the wrong colour.",
+    "what_we_tried": "",
+    "tradeoffs": "Sheets go stale if an NPC is renamed or recoloured, and a rename would silently fall back to the old procedural look. Mitigated by the verifier walking every map, asserting each placed NPC resolves to its own sheet, and flagging orphaned sheets that match no placed NPC.",
+    "alternatives": [
+      {
+        "option": "An exported overworld_sheet path on each NPC node",
+        "reason_rejected": "A third place to keep in sync; deriving the lookup from where the node lives means adding an NPC and re-running the generator is enough"
+      },
+      {
+        "option": "Re-derive Vanguard's palette rules in the Python generator",
+        "reason_rejected": "A second implementation of one rule, free to drift, and the drift is invisible -- the sprite is just the wrong colour"
+      },
+      {
+        "option": "Key sheets on npc_name",
+        "reason_rejected": "Collides -- several NPCs share display names"
+      },
+      {
+        "option": "Keep the sprite_id-keyed sheets and accept identical villagers",
+        "reason_rejected": "Flattens per-NPC variety the project deliberately hand-authored"
+      }
+    ],
+    "constraints_created": [
+      "Placed-NPC sheets must be generated from a Godot-side palette dump, never from parsing .tscn",
+      "verify_overworld_sprites.gd must report the COUNT of NPCs it checked and fail a sweep that found none -- a check over an empty list passes in silence",
+      "New hats are tested as silhouette claims (headband must NOT reshape the head; a brim must overhang more than a cap), not as 'the function was called'"
+    ],
+    "related_to": [],
+    "tags": [
+      "sprites",
+      "npcs",
+      "vanguard",
+      "godot",
+      "humanoid"
+    ],
+    "retrieval_hints": [
+      "why are all my NPCs identical",
+      "per-placed-NPC sprite sheets",
+      "dump NPC palettes from Godot",
+      "headband and wide_brim hats"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-28T01:23:40.520229+00:00",
+    "updated_at": "2026-07-28T01:23:40.520229+00:00",
+    "verified_at": "2026-07-28T01:23:40.520229+00:00",
+    "verified_sha": "60c1cf318e34873117ac0de9c0575c292532e288"
+  }
+]
