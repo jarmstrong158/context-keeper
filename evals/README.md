@@ -49,7 +49,78 @@ and still slip through — a lexical signal cannot separate them; the opt-in
 semantic blend is what helps there, and even dense retrieval struggles on
 this (a known-hard problem across the field).
 
-## Retrieval quality
+## Retrieval quality (v2: `run_retrieval_eval.py`, 2026-08-05)
+
+Self-contained successor to the llm-evals-based harness below. No sibling repo,
+no network in the lexical arm, and it runs against **copies** of every store —
+the semantic path writes an `embeddings.json` cache next to the entries it
+embeds, so pointing it at real stores would mutate 23 project stores as a side
+effect of measuring them.
+
+```bash
+python evals/run_retrieval_eval.py                 # lexical + embedding
+python evals/run_retrieval_eval.py --arm lexical   # no network at all
+python evals/run_retrieval_eval.py --all-arms      # adds embedding-heavy (w=400)
+```
+
+**Golden set:** `retrieval_golden.json` — 59 cases across 9 stores (44 positive,
+9 negative, 6 history). Every question is written from the **problem the entry
+solves** — the symptom you'd be staring at before you knew the entry existed —
+never by paraphrasing its summary. That rule is the whole point: a query derived
+from the summary shares surface tokens with its target, so lexical scoring hits
+it for free and recall comes out inflated.
+
+Cases may only be drawn from stores whose project repo is **public** — a case
+quotes the entry it targets, and this repo is public (`con-015-12da`).
+
+**Results (2026-08-05, 59 cases, `include_related=False`):**
+
+| arm | recall@1 | recall@3 | recall@5 | hit@5 | MRR | FPR |
+|---|---|---|---|---|---|---|
+| lexical | 0.220 | 0.370 | 0.483 | 0.560 | 0.383 | 0.667 |
+| embedding (w=150) | **0.390** | **0.554** | **0.691** | **0.760** | **0.565** | 0.667 |
+
+`recall@k` is strict — `|gold ∩ top-k| / |gold|`, so a case with 5 gold entries
+cannot exceed 0.2 at k=1. `hit@5` (any gold in top 5) is carried for
+comparability with the 2026-06-17 numbers below.
+
+**The embedding path earns its complexity.** +21 points recall@5 and +18 points
+MRR over lexical, on a set specifically built to deny lexical its free tokens.
+The margin is wider here than in the 2026-06-17 measurement precisely because
+that older set was partly paraphrase-derived.
+
+Per-project, the gap is entirely in the two big, prose-heavy stores: Clark
+0.333 → 0.744 and context-keeper 0.398 → 0.741 recall@5. Small stores
+(agentsync, meristem) are already at 1.000 lexically and embeddings add nothing
+— which is the honest shape of the result. The blend earns its keep as a store
+grows, not from the first entry.
+
+Three findings the number surfaced:
+
+1. **History is unreachable: recall@5 = 0.000 in *both* arms.** All six history
+   cases ask explicitly for a prior state ("what was the original sync design
+   before the newest-wins merge") and no superseded entry is returned in the top
+   5 — usually not in the returned set at all. `score_entry` demotes superseded
+   by 15 points *and* those entries are old, so recency compounds the demotion.
+   Supersession is now first-class at write time and read time (`dec-022-730e`),
+   and retrieval still cannot find the predecessor when you ask for it directly.
+2. **Abstention misses in-domain negatives: 7 of 10** plausible-but-unanswerable
+   questions come back with no `no_confident_match` flag, in both arms. Consistent
+   with `abstention.py`'s TNR of 38% at the 0.20 floor — the honest limit noted
+   there (hard negatives sharing real topic vocabulary) is what these are.
+3. **The embedding arm can fail silently.** `query_cosines` returns `None` on any
+   error and the caller drops to lexical, so a cold Ollama made the arm report
+   the *lexical* number under a different name. The harness now probes with
+   retries and refuses to run an arm it cannot prove is live.
+
+`tests/test_retrieval_eval.py` pins the lexical arm's positive-case recall@5 so a
+ranking change cannot quietly regress it, and pins the history gap at zero so a
+fix to it cannot land unnoticed either. **That test owns those thresholds and
+this README deliberately does not repeat them** (`con-009-6bdc`) — the table
+above is a dated measurement, not the enforced value. Lexical is bit-for-bit
+deterministic run to run; the test asserts that too.
+
+## Retrieval quality (v1, llm-evals based)
 
 Measures the one thing the test suite doesn't: **given a natural-language query a
 future session would actually ask, does `get_context` surface the entry that

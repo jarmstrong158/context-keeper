@@ -1,5 +1,11 @@
 __pycache__/
 .context/
+# ...except the retrieval eval's committed fixtures, which ARE stores by design
+# (real entries, synthesized supersedes edges) and have to travel with the repo
+# or the history cases cannot run on a fresh clone. The `.context/` rule above
+# is unanchored, so it matches at any depth and silently swallowed these.
+!evals/fixtures/**/.context/
+!evals/fixtures/**/.context/**
 # Derived from the gitignored .context/ store, so it is per-machine too --
 # committing it would let a fresh clone's first constraint write reap every
 # file as belonging to a store it does not have. Regenerate with

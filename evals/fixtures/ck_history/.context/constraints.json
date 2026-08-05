@@ -1,0 +1,388 @@
+[
+  {
+    "id": "con-001",
+    "rule": "Hook scripts must use ASCII-only in print() output -- no Unicode arrows, em-dashes, or special characters",
+    "reason": "Windows cp1252 encoding raises UnicodeEncodeError on characters like U+2192 (arrow) and U+2014 (em-dash). Claude Code captures hook stdout through the system shell, which uses cp1252 on Windows.",
+    "scope": "hooks/",
+    "hardness": "absolute",
+    "tags": [
+      "hooks",
+      "windows",
+      "encoding"
+    ],
+    "status": "active",
+    "created_at": "2026-04-12T02:18:03.006414+00:00",
+    "verified_at": "2026-07-03T01:42:00.414167+00:00",
+    "retrieval_hints": [
+      "em-dashes and arrow characters in hook output",
+      "UnicodeEncodeError charmap codec cp1252",
+      "hook crashes printing special characters on Windows",
+      "ASCII-only hook stdout"
+    ],
+    "updated_at": "2026-07-03T01:42:00.414167+00:00"
+  },
+  {
+    "id": "con-002",
+    "rule": "Model-visible hook output must go through a surface that is actually injected: SessionStart / UserPromptSubmit / Setup / SubagentStart stdout, or the hookSpecificOutput.additionalContext field on PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch, Stop or SubagentStop. Never rely on PreCompact or Stop hook stdout/stderr to prompt Claude - that stream is shown to the user only. Verify the surface against the hooks reference before building on it.",
+    "reason": "Claude Code injects hook output into model context only for specific event/field combinations. Output printed from PreCompact or Stop appears in the transcript for the user but the model never sees it, so any capture prompt or nudge placed there is a silent no-op. The failure mode is invisible: the hook runs, the output is right there in the transcript, and nothing indicates the model never received it.",
+    "triggering_incident": "v0.4's pre_compact.py printed a 'COMPACTION IMMINENT - record anything important' capture prompt with a comment claiming the message 'becomes part of the context that gets compacted'. It never reached the model. Found during the v0.5 review; the model-visible quality nudge now lives in session_start.py instead.",
+    "scope": "hooks/",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "hooks",
+      "claude-code",
+      "context-injection"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-02T22:33:43.413693+00:00",
+    "verified_at": "2026-08-01T03:10:11.757249+00:00",
+    "updated_at": "2026-08-01T03:10:11.796931+00:00",
+    "verified_sha": "25857be93e5fd1803b5386cfc62974394e7f5f3b"
+  },
+  {
+    "id": "con-003",
+    "rule": "Keep server.json's top-level description at 100 characters or fewer - the MCP registry rejects longer ones at publish time.",
+    "reason": "The official MCP registry (registry.modelcontextprotocol.io) validates body.description with expected length <= 100 and returns HTTP 422, so a longer description blocks the entire version publish.",
+    "triggering_incident": "Publishing v0.5.0 on 2026-07-02: the first publish attempt failed with 422 'expected length <= 100' because the description was 193 chars. The 0.2.0-era registry accepted it, so the limit was added between April and July 2026.",
+    "scope": "server.json",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "mcp-registry",
+      "release",
+      "publishing"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-02T23:58:21.312952+00:00",
+    "verified_at": "2026-07-02T23:58:21.312952+00:00",
+    "updated_at": "2026-07-02T23:58:21.312952+00:00"
+  },
+  {
+    "id": "con-004",
+    "rule": "Keep the tools/list schema payload within the budget asserted by TestToolSchemaBudget in tests/test_server.py (3150 estimated tokens as of 2026-07-25). The test is the authority, not this sentence: raising the budget must be a deliberate edit there with the cost acknowledged in its docstring. Rich guidance goes in _FIELD_GUIDANCE rejection messages and CLAUDE.md, not in schema descriptions.",
+    "reason": "Every connected MCP client loads all tool descriptions into model context at every session start, so schema verbosity is a per-session token tax on every user. Guidance in rejection messages is lazy-loaded - it only costs tokens when a thin entry actually gets rejected. The rule points at the test rather than restating its number because the two drifted apart: this rule read '2500 tokens' while the test asserted 3150 and the real payload was 2927, so anyone reading the rule alone would have concluded it was being violated. A constraint that duplicates a number its enforcing test owns will always eventually disagree with it.",
+    "triggering_incident": "v0.7 feature work grew the payload to ~2800 tokens (record_decision alone was 738) before anyone measured it. v0.7.1 trimmed to ~2370 and added the budget test so growth is a conscious choice, not drift. Re-verified 2026-07-25 after the new code_drift check flagged 20 commits to server.py since the last verification: measured ~2927 tokens against the 3150 budget, 223 tokens (7%) of headroom, 14 tools, TestToolSchemaBudget green. The constraint held across all 20 commits because the test defends it - the budget was consciously raised to 4350 during the record_entry transition and then tightened back to 3150 once the three deprecated record_* aliases were retired from tools/list. Note the headroom is now thin and record_entry alone is 772 tokens (26% of the payload), so the next new tool or field will hit the ceiling.",
+    "scope": "server.py",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "token-budget",
+      "mcp",
+      "schemas"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-03T01:55:11.998881+00:00",
+    "verified_at": "2026-07-25T20:32:32.663961+00:00",
+    "updated_at": "2026-07-25T20:32:32.663961+00:00"
+  },
+  {
+    "id": "con-005",
+    "rule": "Never bulk-edit repo text files with PowerShell Get-Content/Set-Content. Use the Edit tool or a Python script for text transformations.",
+    "reason": "Windows PowerShell 5.1 reads BOM-less UTF-8 files as cp1252 and Set-Content -Encoding utf8 writes a BOM, so a simple find-replace bakes mojibake into every non-ASCII character (em-dash becomes a-circumflex euro quote) and the BOM breaks json.load on data files.",
+    "triggering_incident": "v0.7.1 version bump via Get-Content -Raw / -replace / Set-Content corrupted every em-dash in server.py and added BOMs to server.json and pyproject.toml. Recovered by inverting the encoding (text.encode cp1252 then decode utf-8) and stripping BOMs - the corruption is exactly invertible if caught before further edits.",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "windows",
+      "encoding",
+      "powershell",
+      "tooling"
+    ],
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-03T01:55:17.190587+00:00",
+    "verified_at": "2026-07-03T01:55:17.190587+00:00",
+    "updated_at": "2026-07-03T01:55:17.190587+00:00"
+  },
+  {
+    "id": "con-006",
+    "rule": "Mirror must fail soft (never block or fail a local write), never delete, and contain no secrets in code. The merge is timestamp-based newest-wins (was additive-only): an overwrite is allowed only when the incoming updated_at is strictly newer, and the losing version of any substantive overwrite is preserved to .context/.mirror_conflicts.json.",
+    "reason": "The local store is canonical and must keep working offline. If a mirror push could raise, a remote outage would break record_*/update_entry/deprecate_entry \u2014 the exact operations that must always succeed, so push failures queue and log but never propagate. The old rule forbade overwriting a local id at all, which guaranteed no data loss but also froze edits/deprecations out of the mirror (see dec-013). It is replaced by newest-wins: a stale or malicious remote still cannot clobber a newer local entry (its older updated_at loses), and any overwrite that changes substance is logged to .mirror_conflicts.json so nothing is silently lost. The mirror never deletes (deprecation is a status change). Remote URL and token come from env vars only, so publishing the repo leaks nothing.",
+    "triggering_incident": "Building the two-way mirror (dec-012): the whole point of local-canonical is defeated if the remote can affect local integrity or availability, so these three properties are the load-bearing invariants of the feature, enforced in mirror.py (try/except + queue on push, id-guarded additive merge on pull, mirror_config reading env only).",
+    "scope": "mirror.py",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-012",
+      "dec-013-4eb5"
+    ],
+    "tags": [
+      "mirror",
+      "sync",
+      "security",
+      "reliability"
+    ],
+    "retrieval_hints": [
+      "mirror fail soft never block local",
+      "newest wins timestamp overwrite conflict log",
+      "mirror never deletes deprecation status change",
+      "no secrets env vars remote url token",
+      "mirror invariants"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-10T11:11:10.116056+00:00",
+    "verified_at": "2026-07-10T13:13:06.726940+00:00",
+    "updated_at": "2026-08-01T11:55:21.465902+00:00"
+  },
+  {
+    "id": "con-007",
+    "rule": "Mirror HTTP requests to the remote Worker must send an explicit User-Agent header (never urllib's default)",
+    "reason": "Cloudflare fronts the context-keeper-remote Worker and its bot-fight rules block urllib's default User-Agent (Python-urllib/x.y) with HTTP 403 \"error 1010\" (browser/bot signature ban). Without an explicit User-Agent, every mirror request \u2014 import_entries, query_entries, backfill \u2014 fails, so mirroring silently degrades to queue-only and no data ever reaches the remote. Setting any normal-looking User-Agent on the single _rpc_call request path fixes it.",
+    "triggering_incident": "First live backfill of all 8 local projects failed with Cloudflare error 1010 until a User-Agent header (context-keeper-mirror/0.15) was added to _rpc_call in mirror.py. After the fix, the backfill succeeded with zero skips and balatron verified at 82 entries (62 dec / 18 con / 2 pipe) matching local.",
+    "scope": "mirror.py",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-012",
+      "con-006"
+    ],
+    "tags": [
+      "mirror",
+      "cloudflare",
+      "http",
+      "gotcha"
+    ],
+    "retrieval_hints": [
+      "cloudflare error 1010 mirror",
+      "urllib user-agent blocked 403",
+      "remote backfill fails bot ban",
+      "why mirror requests rejected"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-10T12:43:40.654107+00:00",
+    "verified_at": "2026-07-10T12:43:40.654107+00:00",
+    "updated_at": "2026-08-01T11:55:21.465902+00:00"
+  },
+  {
+    "id": "con-008-dc30",
+    "rule": "Force UTF-8 on the MCP stdio transport (reconfigure stdin/stdout) at server startup; never rely on the interpreter's default stdio codec.",
+    "reason": "On Windows, stdin defaults to cp1252. A JS MCP client's JSON.stringify emits non-ASCII (em-dash, arrow, checkmark) as RAW UTF-8 bytes on the wire, not backslash-u escapes. cp1252 stdin mis-decodes those bytes BEFORE json.loads runs, so an em-dash is persisted as 3-char mojibake. The on-disk json.dump is fine (ensure_ascii) -- the corruption is purely at the INPUT boundary. This was the upstream source of mojibake that corrupted the knowledge base.",
+    "triggering_incident": "Audit reproduced live: record_entry with an em-dash stored mojibake in decisions.json. Fixed by _force_utf8_stdio() at the top of _serve_stdio(). Regression-test gotcha: Python's json.dumps ASCII-escapes by default and HIDES the bug -- the test must send raw UTF-8 wire bytes (ensure_ascii=False) under a cp1252 stdin (PYTHONIOENCODING=cp1252) to reproduce it.",
+    "scope": "server.py",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "encoding",
+      "windows",
+      "stdio",
+      "mcp"
+    ],
+    "retrieval_hints": [
+      "mojibake em-dash cp1252",
+      "non-ASCII corrupted on record",
+      "stdin utf-8 decode",
+      "JSON.stringify raw bytes"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-12T16:23:36.915939+00:00",
+    "updated_at": "2026-07-12T16:23:36.915939+00:00",
+    "verified_at": "2026-07-12T16:23:36.915939+00:00"
+  },
+  {
+    "id": "con-009-6bdc",
+    "rule": "A constraint must not restate a number that an enforcing test already owns. Name the test as the authority and carry the value only as a dated snapshot. Two places holding the same threshold will drift, and the prose is the copy that drifts silently because nothing executes it.",
+    "reason": "con-004 read \"at or under 2500 estimated tokens\" while TestToolSchemaBudget asserted 3150 and the real payload was 2927. Anyone reading the rule alone would have concluded the constraint was being violated; anyone reading the test would have concluded it was fine. Both were reading the same constraint. The test had been deliberately and correctly adjusted several times - raised to 4350 during the record_entry transition, tightened back to 3150 after retiring the deprecated aliases - and the rule text was never updated alongside, because nothing fails when prose goes stale.",
+    "triggering_incident": "Found on 2026-07-25 while verifying con-004 after the new code_drift check flagged 20 commits to server.py since its last verification. The drift flag was correct to make someone look: the budget itself held (2927 of 3150, test green), but the rule describing it had been wrong for weeks. The same session then found the drift feature itself had the identical class of bug - scan() counted every commit in a store-wide window against every entry instead of re-filtering per entry, so con-008 reported 20 commits where the true figure was 3. Fixed in c42c408.",
+    "scope": "tests/test_server.py",
+    "hardness": "absolute",
+    "related_to": [
+      "con-004",
+      "dec-016-1bf6"
+    ],
+    "tags": [
+      "constraints",
+      "drift",
+      "testing",
+      "documentation",
+      "single-source-of-truth"
+    ],
+    "retrieval_hints": [
+      "rule text disagrees with the test",
+      "constraint says one number the test says another",
+      "where should a threshold live",
+      "why did the budget look violated when it was fine"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-25T20:35:52.177640+00:00",
+    "updated_at": "2026-07-25T20:36:01.988329+00:00",
+    "verified_at": "2026-07-25T20:36:01.988329+00:00"
+  },
+  {
+    "id": "con-010-acde",
+    "rule": "A hook on a hot path must import store_paths, never server, and store_paths itself must import nothing beyond json and os. Hot paths are: PreToolUse/PostToolUse on Edit|Write (every edit), PostToolUse with matcher \"\" (every tool call), and SubagentStart (every spawned agent, multiplied by fan-out). Wire hot-path hooks with an explicit timeout.",
+    "reason": "These hooks run before or alongside the work, so their cost is paid on the critical path every time - and the multiplier differs per event: once per edit, once per TOOL CALL, or once per agent in a fan-out. Importing server pulls mirror -> urllib.request -> http.client -> email.parser plus secrets, usage and code_drift, none of which any of them touches. That is the difference between a hook costing roughly the interpreter's own startup and one costing double it, forever. Nothing bounds a hook that hangs except an explicit timeout.",
+    "triggering_incident": "Moving scope_guard from PostToolUse to PreToolUse in v0.16 made its cost user-visible for the first time. Measured on Windows: 142ms per hook run, of which 73ms was `import server` and only ~9ms was the actual work; the no-match case (most edits) paid exactly the same as a hit. Extracting store_paths.py and dropping `import server` took it to 69ms against a 62ms bare-interpreter floor. The regression was then reproduced deliberately - re-adding `import server` - to confirm the new test fails on it rather than merely passing today.",
+    "enforced_by": "tests/test_server.py::TestEditPathHookCost",
+    "scope": "hooks/",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-019-9c32",
+      "con-002",
+      "con-009-6bdc"
+    ],
+    "tags": [
+      "hooks",
+      "performance",
+      "claude-code",
+      "latency"
+    ],
+    "retrieval_hints": [
+      "why is every edit slow",
+      "hook latency on the edit path",
+      "should the hook import server",
+      "PreToolUse blocks the tool call",
+      "store_paths vs server import cost"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-01T10:52:57.302080+00:00",
+    "updated_at": "2026-08-01T14:33:28.516421+00:00",
+    "verified_at": "2026-08-01T14:33:28.483889+00:00",
+    "verified_sha": "b59aa900cec7c877a75475c3cb547daad14ca17f"
+  },
+  {
+    "id": "con-011-76f8",
+    "rule": "Constraint scope matching must compare whole path COMPONENTS, never raw substrings. Every surface that decides \"does this scope cover this file\" (the scope_guard hook, the .claude/rules/ projection's glob patterns, work_focus) must agree on the answer.",
+    "reason": "A substring test silently over-matches: `src/` matches `mysrc/main.py`, `hooks/` matches `webhooks/send.py`, `server.py` matches `test_server.py`. The damage is not the stray message. scope_guard injects each constraint at most once per session, so a false positive MARKS THAT CONSTRAINT DELIVERED - and the file it actually governs then never receives it for the rest of the session. An over-eager match therefore causes a silent under-delivery, which is the opposite of what the loose match looks like it is doing. Surfaces that disagree about coverage are worse still: one of them is claiming protection the other does not provide.",
+    "triggering_incident": "Observed live on 2026-08-01: a vanguard constraint scoped to `hooks/` fired on a scratchpad file whose absolute path merely contained the substring. A 7-case probe then showed 3 false positives. The bug dated from v0.6 and was tolerable while scope_guard ran on PostToolUse (a stray rule after the fact is noise); moving it to PreToolUse in v0.16 turned it into a rule stated before an unrelated edit, spending the constraint. Fixed in b6cdc6c by matching components, with a file scope matching the path tail exactly and a directory scope requiring at least one component after it.",
+    "enforced_by": "tests/test_server.py::TestScopeCovers",
+    "scope": "hooks/",
+    "hardness": "absolute",
+    "related_to": [
+      "con-010-acde",
+      "dec-018-c8aa",
+      "dec-019-9c32",
+      "dec-005"
+    ],
+    "tags": [
+      "hooks",
+      "constraints",
+      "scope",
+      "claude-code"
+    ],
+    "retrieval_hints": [
+      "constraint fired on the wrong file",
+      "scope matches a sibling directory",
+      "webhooks matched hooks",
+      "why didn't my scoped constraint appear",
+      "substring vs component path matching"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-01T11:16:42.346377+00:00",
+    "updated_at": "2026-08-01T11:16:42.346377+00:00",
+    "verified_at": "2026-08-01T11:16:42.346377+00:00",
+    "verified_sha": "b6cdc6cfd715567a1f70fda1cc6ffcde610f8165"
+  },
+  {
+    "id": "con-012-e6c4",
+    "rule": "A derived projection that DELETES files must resolve its output directory inside the project root and refuse otherwise, and must never fail the canonical write when its own path is misconfigured. Every scope must pass through _scope_to_paths, which rejects anything that cannot become a firing repo-relative pattern - glob metacharacters, a double quote or control char (breaks the YAML frontmatter), or a `..` component - and every rejection must be reported to the caller.",
+    "reason": "The rules projection reaps: every marker-carrying .md file in its output directory is a deletion candidate on each regeneration. That makes the configured path a deletion target, so a '../../..' or an absolute path would point it at a directory the user never associated with context-keeper. Containment is also semantically correct - Claude Code only discovers .claude/rules/ inside the working tree, so an outside directory could never load. Separately, patterns are emitted as double-quoted YAML scalars: a scope containing a quote closes the scalar early and breaks the ENTIRE frontmatter block, so the harness loads no rule from that file at all - not even the patterns that were fine. Both failures are silent and both present as coverage, which is the worst property a guardrail can have.",
+    "triggering_incident": "Found on 2026-08-01 by adversarially probing the v0.16 projection rather than re-reading it - the first pass had shipped all of it. A scope of 'we\"ird/' emitted `- \"we\"ird/**/*\"` (unparseable frontmatter, rule silently dead); rules_export.path of '../../ESCAPED' and of an absolute path outside the project both wrote and reaped outside the project root. The same probe also caught that import_snapshot and mirror pull wrote constraints without regenerating the projection. Containment uses os.path.commonpath, not startswith, so a sibling directory named '<project>-evil' is not read as inside '<project>'. A later CI run added the `..` case: os.path.exists NORMALIZES 'tests/../server.py' on Windows and returns True even when tests/ is absent, while POSIX requires every component to exist - so a scope-suggestion test passed on Windows and failed on both Ubuntu runners. Rejecting `..` at the _scope_to_paths chokepoint means the projection, the scope suggestion and the hook all inherit it.",
+    "enforced_by": "tests/test_server.py::TestRulesPathContainment and ::TestScopeYamlSafety",
+    "scope": "server.py",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-018-c8aa",
+      "con-011-76f8",
+      "con-010-acde"
+    ],
+    "tags": [
+      "projection",
+      "safety",
+      "constraints",
+      "claude-code"
+    ],
+    "retrieval_hints": [
+      "rules projection deleted files outside the project",
+      "path traversal in rules_export path",
+      "frontmatter does not parse",
+      "scope with a quote breaks the rule file",
+      "projection must not fail the write"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-01T11:33:06.632055+00:00",
+    "updated_at": "2026-08-01T14:41:16.504717+00:00",
+    "verified_at": "2026-08-01T14:41:16.474267+00:00",
+    "verified_sha": "d61e028e4c3839b08a7361a636e3a8f88f3eaca7"
+  },
+  {
+    "id": "con-013-4b25",
+    "rule": "mcpb/manifest.json must contain only spec keys - no underscore-prefixed editorial keys at any depth. Maintainer notes about the manifest go in a test docstring or a build-script comment, never in the manifest itself.",
+    "reason": "The mcpb packer validates the manifest against a schema that REJECTS unrecognised keys, and refuses to pack on failure. The resulting breakage is silent at the release level: the publish workflow (PyPI + MCP registry) succeeds independently, only the separate bundle workflow fails, and a release missing an asset looks exactly like a release that never had one. Nobody is notified that the one-click Claude Desktop install path is gone.",
+    "triggering_incident": "v0.16.0 published to PyPI and the MCP registry on 2026-08-01 with NO .mcpb bundle attached. mcpb/manifest.json carried a `_tools_comment` key - a note saying the tools array must match server.TOOLS - which had been harmless for several releases until @anthropic-ai/mcpb@2 tightened validation: 'Unrecognized key(s) in object: _tools_comment' -> 'Cannot pack extension with invalid manifest'. The note was also restating a rule TestManifestToolsMatchServer already enforces, which is con-009's failure mode: prose duplicating a check drifts from it and nothing executes the prose. Fixed in d096eec; guard test verified by reintroducing a key and watching it fail.",
+    "enforced_by": "tests/test_server.py::TestManifestHasNoEditorialKeys",
+    "scope": "mcpb/manifest.json",
+    "hardness": "absolute",
+    "related_to": [
+      "con-009-6bdc",
+      "con-003",
+      "con-012-e6c4"
+    ],
+    "tags": [
+      "packaging",
+      "mcpb",
+      "release",
+      "claude-desktop"
+    ],
+    "retrieval_hints": [
+      "mcpb pack failed invalid manifest",
+      "release has no .mcpb attached",
+      "Unrecognized key in object manifest",
+      "desktop bundle missing from release",
+      "where do maintainer notes about the manifest go"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-01T13:53:36.082943+00:00",
+    "updated_at": "2026-08-01T13:53:36.082943+00:00",
+    "verified_at": "2026-08-01T13:53:36.082943+00:00",
+    "verified_sha": "d096eec46ead2e8dacdf9555e420d4e7a742bd7f"
+  },
+  {
+    "id": "con-014-34a5",
+    "rule": "Never test a git command's success by piping it into a conditional, e.g. `if git merge ... | head -2; then`. The pipeline's exit status is the LAST command's, so the guard reports success no matter what git did. Test git directly, or verify the end state afterwards with `git merge-base --is-ancestor` and a local-vs-origin SHA comparison.",
+    "reason": "A merge or push that silently fails while the script prints success is worse than one that fails loudly: the operator believes the work landed and stops checking. The failure mode is invisible precisely when it matters most, on a multi-repo sweep where nobody re-reads eleven repositories by hand.",
+    "triggering_incident": "During the 2026-07-28 MCP migration, a loop merging the migration branch across eleven repositories used `if git merge --no-ff -q -m \"...\" \"$M\" 2>&1 | head -2; then echo merged; else echo FAILED; fi`. That tests head's exit status, not git's, so every repository reported \"merged->BASE pushed\" unconditionally. It happened to be true for ten of them. context-keeper genuinely failed -- main had advanced four commits (v0.16, v0.17) and server.py conflicted -- and a separate `git push ... && echo pushed` in the same iteration printed \"pushed\" for a merge that had never been committed. The conflict was only caught because the merge output happened to print. Ground truth was re-established afterwards with `git merge-base --is-ancestor <migration> HEAD` plus comparing HEAD against origin/<base> per repo.",
+    "enforced_by": "",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "git",
+      "tooling",
+      "verification",
+      "release",
+      "false-success"
+    ],
+    "retrieval_hints": [
+      "why did my merge script say merged when it did not merge",
+      "git command in if statement always succeeds",
+      "how to verify a merge actually landed across many repos",
+      "pipeline exit status masks git failure"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-02T04:17:54.439774+00:00",
+    "updated_at": "2026-08-02T04:17:54.439774+00:00",
+    "verified_at": "2026-08-02T04:17:54.439774+00:00",
+    "verified_sha": "887c91f9fbcb4adb4cf1e657286a1e578a7dd745"
+  }
+]

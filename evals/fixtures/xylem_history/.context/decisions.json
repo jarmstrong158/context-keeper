@@ -1,0 +1,506 @@
+[
+  {
+    "id": "dec-001-28a4",
+    "summary": "Version signals: manifest.json \"version\" (int) is the single source of truth for the deployed fence stamp; installer stamps the CLAUDE.md begin fence as `<!-- XYLEM:BEGIN vN -->` from that value, and version_check.py (SessionStart hook) compares the installed block's stamp against the template, fetching origin first so the nudge fires on upstream release.",
+    "problem": "The habit-layer block gets deployed into global + repo CLAUDE.md files with no version marker, so there is no way for a session to know its installed discipline block is stale relative to the xylem template. Need detection that costs zero model tokens on match and never auto-rewrites a block.",
+    "why_chosen": "Making manifest.json the single source of truth (installer re-stamps the block's begin fence from the manifest int, not from whatever literal is in the block file) keeps stamp and template version from drifting. version_check reads the template version preferring `git show origin/<ref>:manifest.json` after a fail-soft fetch, falling back to the working-tree manifest, so the \"vN available\" nudge fires as soon as origin publishes a new version \u2014 before the local pull \u2014 which is exactly what the one-word `xylem update` (git pull + re-apply) then resolves. Detection informs; only the explicit update verb rewrites a block.",
+    "what_we_tried": "",
+    "tradeoffs": "version_check depends on git being present and the clone having an origin remote; both are handled fail-soft (fall back to working-tree manifest, output nothing on any error, exit 0).",
+    "alternatives": [
+      {
+        "option": "Read only the working-tree manifest.json (no fetch/origin read)",
+        "reason_rejected": "Nudge would only fire after a manual git pull, defeating the point of announcing an available upstream version"
+      },
+      {
+        "option": "Put literal v2 in the block file and trust it",
+        "reason_rejected": "Stamp would drift from manifest version on future bumps; manifest-driven stamping is idempotent and single-source"
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "version-signals",
+      "habit-layer",
+      "installer",
+      "hooks"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-10T20:44:10.023701+00:00",
+    "updated_at": "2026-08-01T11:55:22.843101+00:00",
+    "verified_at": "2026-07-10T20:44:10.023701+00:00"
+  },
+  {
+    "id": "dec-002-b762",
+    "summary": "Version signals SHIPPED to origin/main (PR #10, merge 565c5b2). Deployed template version is v2. Also: .context/ is now gitignored \u2014 context-keeper's local memory store must never be committed into the public xylem repo.",
+    "problem": "Closing out the version-signals build session: need to record the shipped state and the fact that the local memory store was almost committed (git add -A staged .context/decisions.json) and was deliberately excluded.",
+    "why_chosen": "The build landed on main and this machine's global block was re-stamped to v2, so version_check is silent locally (loop verified closed). .context/ was added to .gitignore because it is machine-local session memory, is not tracked upstream, and committing it would leak local decisions into the public repo \u2014 future `git add -A` runs in this repo must not resurrect it.",
+    "what_we_tried": "",
+    "tradeoffs": "",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-001-28a4"
+    ],
+    "tags": [
+      "version-signals",
+      "shipped",
+      "gitignore",
+      "context-keeper"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-10T20:50:50.027946+00:00",
+    "updated_at": "2026-08-01T11:55:22.843101+00:00",
+    "verified_at": "2026-07-10T20:50:50.027946+00:00"
+  },
+  {
+    "id": "dec-003-42ba",
+    "summary": "Landing page (docs/index.html) repositioned around \"one install \u00e2\u2020\u2019 habit by default\": new hero + install command, a \"A week of real use\" section with 4 commit/PR-linked items, two new numbers groups (Mirror, Schema reclaim), grid xylem cell now describes onboarding, meta/OG synced. Shipped to origin/main (44f13a5).",
+    "problem": "The landing page led with \"agents that CAN remember/coordinate/ask\", which undersold the differentiator: the installer's habit layer that makes those behaviors happen BY DEFAULT. It also had no concrete, clickable evidence of real use.",
+    "why_chosen": "The habit layer is the actual product wedge (per README tagline), so the hero now leads with \"one install \u2014 by default\" and shows ./install.sh up top. Evidence section uses only verified commits/PRs a skeptic can click (Balatron dec-058/061 LR fix, agentsync two-peer CAS test 8cd14ed, knowledge harvest 132\u21929 via reviewed PRs, agentsync-remote handshake hardening 2a40c92) to keep the page falsifiable. New numbers reuse the existing reveal/count-up mechanism and keep honest-label styling; caveats block left untouched.",
+    "what_we_tried": "",
+    "tradeoffs": "",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-001-28a4",
+      "dec-002-b762"
+    ],
+    "tags": [
+      "landing-page",
+      "docs",
+      "habit-layer",
+      "positioning",
+      "marketing"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-11T10:06:19.062256+00:00",
+    "updated_at": "2026-08-01T11:55:22.843101+00:00",
+    "verified_at": "2026-07-11T10:06:19.062256+00:00"
+  },
+  {
+    "id": "dec-004-21df",
+    "summary": "Flipped context-keeper-remote to available:true in manifest.json and gave it a Bearer Authorization header (env_key CONTEXT_KEEPER_REMOTE_TOKEN), matching agentsync-remote.",
+    "problem": "context-keeper-remote was marked available:false in manifest.json with a note calling it a not-yet-built placeholder. But the remote CK Worker (Cloudflare + D1) is built and deployed and backs the memory mirror. enabled_servers() filters out available:false servers, so the installer never registered CK-remote \u2014 the mirror could never register on any machine. This was a live bug, not a cosmetic doc issue.",
+    "why_chosen": "CK-remote is deployed and is the remote half of the dual-write memory mirror, so it must be registrable. Flipping available:true puts it into enabled_servers; build_http_entry still skips it gracefully (warn + omit) when CONTEXT_KEEPER_REMOTE_URL is unset, so local-first behavior is preserved. Added the Authorization header because the suite uses fail-closed auth (agentsync-remote has the identical shape) \u2014 without it the http entry would register with no auth and fail against a fail-closed Worker.",
+    "what_we_tried": "Confirmed the bug by reading enabled_servers()/build_http_entry() in installer.py and running installer.py --dry-run before and after the flip.",
+    "tradeoffs": "Introduced an assumption that the remote token env var is named CONTEXT_KEEPER_REMOTE_TOKEN (chosen by analogy with AGENTSYNC_REMOTE_TOKEN). If the deployed Worker expects a different header/token scheme, this needs reconciling. Verified via installer.py --dry-run with dummy env vars that CK-remote now registers as an http server with the Bearer header.",
+    "alternatives": [
+      {
+        "option": "Just remove the available:false line",
+        "reason_rejected": "available defaults to true so it would work, but leaving headers:{} would register CK-remote with no auth against a fail-closed Worker; explicit available:true + auth header is clearer and correct."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "manifest",
+      "context-keeper-remote",
+      "mirror",
+      "installer",
+      "bugfix"
+    ],
+    "retrieval_hints": [
+      "why is context-keeper-remote available true",
+      "CK-remote auth header token env var",
+      "manifest available flag bug"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "superseded",
+    "superseded_by": "dec-006-723c",
+    "created_at": "2026-07-11T10:23:56.392274+00:00",
+    "updated_at": "2026-08-01T11:55:22.843101+00:00",
+    "verified_at": "2026-07-11T10:23:56.392274+00:00",
+    "deprecated_reason": "The Workers had moved to path-token auth; the Authorization: Bearer header dec-004 added is not used and was removed from the manifest."
+  },
+  {
+    "id": "dec-005-d68f",
+    "summary": "Every duplicated artifact in the repo now has a single source and a generator, with tests/test_generated_sync.py failing CI if a committed copy drifts. plugin/.mcp.json is generated from manifest.json; the three habit-prose copies are generated from artifacts/discipline.source.json.",
+    "problem": "An external audit found three separate shipped bugs that were all the same root cause: hand-maintained copies that drifted from their source. plugin/.mcp.json had drifted from manifest.json on the server name (agent-sync-remote vs agentsync-remote), which silently broke every mcp__agentsync-remote__* tool reference in the habit prose on a plugin install, and on the auth scheme (an inert Bearer header). The habit prose existed in three hand-maintained copies, and the plugin's copy had lost the update_status cadence rule, the mailbox escalation rule, and the \"done means pushed to origin\" rule \u2014 so plugin users got a weaker discipline with no signal anything was missing.",
+    "why_chosen": "Vigilance does not scale and code review demonstrably did not catch this \u2014 the drift shipped and survived multiple releases. Generating the copies makes the entire class of defect structurally impossible rather than merely discouraged: a PR that edits one destination and forgets the others cannot merge, because the drift test fails. This was verified adversarially by reintroducing both original bugs and confirming CI goes red. It also fits the repo's existing idiom of plain human-editable JSON as data plus a small stdlib interpreter.",
+    "what_we_tried": "",
+    "tradeoffs": "Editing the habit prose now requires editing a JSON source and running a generator rather than editing markdown directly, which is a small friction tax on every prose change. Accepted, because the alternative is silently shipping three different disciplines.",
+    "alternatives": [
+      {
+        "option": "Document the coupling in comments and rely on review",
+        "reason_rejected": "This is effectively what existed; the drift shipped anyway and persisted across several releases."
+      },
+      {
+        "option": "Symlink the duplicated files",
+        "reason_rejected": "Windows support is a first-class goal here and symlinks are unreliable on it; the three prose destinations also need genuinely different shapes (fenced block, slash command with $ARGUMENTS, ASCII-only console primer), not identical bytes."
+      }
+    ],
+    "constraints_created": [
+      "Never hand-edit artifacts/claude_md_block.md, artifacts/xylem_discipline.md, plugin/artifacts/discipline.md, or plugin/.mcp.json \u2014 they are generated. Edit the source and run python scripts/render_discipline.py --write."
+    ],
+    "related_to": [],
+    "tags": [
+      "architecture",
+      "invariants",
+      "plugin",
+      "testing",
+      "drift"
+    ],
+    "retrieval_hints": [
+      "why is plugin/.mcp.json generated",
+      "how do I edit the habit block prose",
+      "what stops the discipline copies from drifting",
+      "render_discipline.py"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-18T17:15:38.473512+00:00",
+    "updated_at": "2026-07-18T17:15:38.473512+00:00",
+    "verified_at": "2026-07-18T17:15:38.473512+00:00"
+  },
+  {
+    "id": "dec-006-723c",
+    "summary": "The remote Workers authenticate on the URL path only (/mcp/&lt;token&gt;). The Authorization: Bearer header added in dec-004 is gone from the plugin; the whole connector URL is the credential and there is no separate token env var.",
+    "problem": "dec-004 added an Authorization: Bearer header to the remote servers, and dec-008 explicitly carried \"the header convention from dec-004\" into plugin/.mcp.json. But the Workers had since moved to path-token auth, and manifest.json, install/README.md, docs/design-principles.md and an assertion in tests/test_manifest.py all documented that. That reversal was never recorded as a decision, so the stale record kept propagating: the plugin shipped a header no Worker reads and documented CONTEXT_KEEPER_REMOTE_TOKEN and AGENTSYNC_REMOTE_TOKEN as required, misleading users into believing they had configured auth when those variables did nothing.",
+    "why_chosen": "Path-token auth is what actually works across both transports, because claude.ai connectors do not reliably forward custom headers \u2014 that is the original reason the Workers moved. Making it canonical everywhere removes a live contradiction between the plugin and four other files in the same repo, and removes two documented env vars that were pure noise. The header can no longer be reintroduced by hand because plugin/.mcp.json is now generated from manifest.json and a test asserts no http server declares headers.",
+    "what_we_tried": "",
+    "tradeoffs": "A credential in a URL is easier to leak by copy-paste than a header \u2014 it lands in shell history and any pasted config. Mitigated by redacting URL path tokens in all installer diff and warning output, and by documenting plainly that the URL is a password and rotation invalidates every prior URL.",
+    "alternatives": [
+      {
+        "option": "Make the Workers read the Bearer header so dec-004 becomes true again",
+        "reason_rejected": "It would not help: claude.ai connectors do not reliably send the header, which is why path-token auth exists. It would also mean two auth paths to maintain and test."
+      }
+    ],
+    "constraints_created": [
+      "Remote Xylem Workers authenticate on the URL path only. Never add an Authorization header to an http server entry, and never document a *_REMOTE_TOKEN env var as required."
+    ],
+    "related_to": [],
+    "tags": [
+      "auth",
+      "security",
+      "plugin",
+      "remote",
+      "supersedes-dec-004"
+    ],
+    "retrieval_hints": [
+      "do the workers use a bearer token",
+      "why was the Authorization header removed",
+      "what env vars does the plugin need",
+      "path token auth"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-18T17:15:54.115164+00:00",
+    "updated_at": "2026-07-18T17:15:54.115164+00:00",
+    "verified_at": "2026-07-18T17:15:54.115164+00:00"
+  },
+  {
+    "id": "dec-007-cc30",
+    "summary": "The installer now fetches the three stdio server repos (context-keeper, agentsync, cambium) on a clean machine, and a new `doctor` subcommand verifies each registered server can actually start.",
+    "problem": "installer.py registered the stdio MCP servers at $XYLEM_PARENT/<repo>/server.py \u2014 sibling directories that only exist on the author's machine. Anyone who cloned only Xylem (or installed via /plugin) got the servers registered pointing at non-existent paths, so they silently failed to start with no diagnostic. This made real-world adoption structurally impossible.",
+    "why_chosen": "Fetching to the exact path the manifest resolves ($XYLEM_PARENT/<dir>) guarantees fetch and registration can never drift. Keeping fetch OUT of plan()/Planner preserves dry-run purity and test isolation (no network in the pure planner). Storing sources as owner/repo slugs (not full URLs) keeps the existing no-hardcoded-URLs manifest test green and stays consistent with the suite's no-literal-URLs discipline. doctor checks existence+parse+mcp-import without launching servers, so it never hangs on the stdio loop.",
+    "what_we_tried": "",
+    "tradeoffs": "Fetch clones into the parent directory (writes outside the repo), matching the design's sibling-repo assumption. The plugin/ distribution path does not run installer.py, so it is not fixed by this change \u2014 tracked separately.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "installer",
+      "adoption",
+      "fetch",
+      "doctor",
+      "manifest"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "superseded",
+    "superseded_by": "dec-008-7319",
+    "created_at": "2026-07-21T10:45:49.023231+00:00",
+    "updated_at": "2026-07-21T10:45:49.023231+00:00",
+    "verified_at": "2026-07-21T10:45:49.023231+00:00",
+    "deprecated_reason": "source.ref was left null by the fetch work, so a fresh install tracked each server's moving main mid-refactor. Now pinned to release tags."
+  },
+  {
+    "id": "dec-008-7319",
+    "summary": "Pinned each stdio server's source.ref to its latest release tag (context-keeper v0.15.0, agentsync/cambium v0.1.0) for reproducible fresh installs, and made the plugin path self-diagnose via primer.py instead of installing local servers.",
+    "problem": "Two follow-ups remained after the fetch+doctor work (dec-007-cc30): the source.ref fields were null (fresh installs would track each server's moving main mid-refactor), and the plugin install path failed silently when no Worker backend was configured \u2014 its remote-only MCP tools resolved to empty URLs with zero feedback.",
+    "why_chosen": "Pinning to the latest tags is safe because main is only 1-3 commits ahead, so a fresh install gets a reproducible, essentially-current, tested-together snapshot rather than an in-progress main. The plugin structurally cannot clone Python stdio servers into sibling dirs and its generated .mcp.json is already correct, so the honest fix is self-diagnosis (a primer notice when neither Worker URL is set), not pretending to install local servers. The notice goes quiet the moment either URL is set to avoid nagging mid-setup or local-install users.",
+    "what_we_tried": "",
+    "tradeoffs": "Pinned refs must be bumped manually when servers cut releases (a test enforces they stay version-pinned). The primer notice can theoretically show for a local-installer user who also installed the plugin, but it is accurate \u2014 the plugin's own remote tools are in fact inert without the URLs.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-007-cc30"
+    ],
+    "tags": [
+      "installer",
+      "adoption",
+      "pinning",
+      "plugin",
+      "primer",
+      "doctor"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T11:05:38.365019+00:00",
+    "updated_at": "2026-07-21T11:05:38.365019+00:00",
+    "verified_at": "2026-07-21T11:05:38.365019+00:00"
+  },
+  {
+    "id": "dec-009-de12",
+    "summary": "Added a SessionStart primer hook (artifacts/session_primer_hook.py) that injects cambium's session_primer() digest and points cambium at the session's real project via its config file; unpinned CAMBIUM_REPO in the manifest so cambium follows the session instead of the frozen install-time project.",
+    "problem": "Audit found the automatic loop was half-open: distill() (capture) ran from the SessionEnd hook, but recall was advisory prose only, so cambium got ignored at session start. Separately, the installer baked $PROJECT_DIR into CAMBIUM_REPO, freezing cambium to the install-time project so recall/capture hit the wrong store for every other project.",
+    "why_chosen": "A SessionStart hook mirroring session_end_hook is the natural recall leg. It resolves the session project from the payload cwd (not the hook's own cwd, which is the launch dir) and writes CAMBIUM_REPO into cambium's config file, which the per-call-resolving cambium server re-reads \u2014 the only reliable way to make a persistent stdio server follow the session, since context-keeper/agentsync resolve their project once at startup. Unpinning cambium in the manifest lets that config value win. The primer is installer-path only (the plugin is remote-only and cambium has no remote).",
+    "what_we_tried": "",
+    "tradeoffs": "The hook mutates ~/.cambium/config.json each session start (one key, preserving others); concurrent sessions in different projects would race on it. context-keeper and agentsync remain pinned (startup-resolved; a separate per-call fix is needed) \u2014 deliberately out of scope for this change.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "xylem",
+      "hook",
+      "primer",
+      "cambium",
+      "installer",
+      "manifest",
+      "automation"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T13:59:21.782502+00:00",
+    "updated_at": "2026-07-21T13:59:21.783503+00:00",
+    "verified_at": "2026-07-21T13:59:21.783503+00:00"
+  },
+  {
+    "id": "dec-010-0de6",
+    "summary": "The SessionStart primer hook now writes a shared session pointer (~/.xylem/active_project.json) recording the session's project, and the manifest unpins CONTEXT_KEEPER_PROJECT and AGENTSYNC_REPO so context-keeper and agentsync follow the session via that pointer \u2014 completing 1b (all three servers now follow the session's project).",
+    "problem": "Fix 1 made only cambium follow the session (via its own config file). context-keeper and agentsync were still pinned to the frozen install-time $PROJECT_DIR, so they targeted the wrong project for every non-xylem session. 1b needed a mechanism the two startup/env-resolved servers could read per call.",
+    "why_chosen": "A single shared pointer file the hook writes and both servers read per call is the minimal cross-repo mechanism (they can't share a Python module). The write happens first in the hook, before the cambium-specific logic, so context-keeper/agentsync get the pointer even when cambium is absent. Unpinning the two servers in the manifest lets the pointer/cwd resolution take over; each keeps an explicit-env override for a forced fixed project.",
+    "what_we_tried": "",
+    "tradeoffs": "The pointer is global (~/.xylem), so concurrent sessions in different projects race on it \u2014 acceptable for a solo operator. cambium keeps its own config-file mechanism from fix 1 rather than being migrated to the shared pointer, a minor inconsistency left to avoid re-touching merged code.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "xylem",
+      "hook",
+      "session-pointer",
+      "manifest",
+      "context-keeper",
+      "agentsync",
+      "1b"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T14:32:39.542458+00:00",
+    "updated_at": "2026-07-21T14:32:39.542458+00:00",
+    "verified_at": "2026-07-21T14:32:39.542458+00:00"
+  },
+  {
+    "id": "dec-011-7cbf",
+    "summary": "Thread 3 Tier A (honesty): the discipline's recall and distill rules now say cambium is local-only and unavailable on claude.ai/mobile (lean on context-keeper's summary/get_context/record_* there), mirroring the mailbox rule's conditional pattern, so a remote agent is no longer told to call cambium tools that do not exist remotely.",
+    "problem": "Audit Thread 3: cambium has no remote Worker, but the shared discipline (rendered to CLAUDE.md AND the plugin/remote discipline.md) unconditionally told every agent to recall()/distill()/promote() from cambium. On claude.ai/mobile those tools do not exist, so the discipline was instructing remote agents to call nothing.",
+    "why_chosen": "The discipline is one canonical source rendered to both the desktop block and the plugin discipline, so it cannot be silently right for both paths unless the cambium rules are made conditional. Copying the mailbox rule's established 'if that Worker is configured, otherwise...' pattern keeps the text honest on both paths without a separate remote variant. Chose honesty-first (Tier A) before config work (Tier B) or building a cambium Worker (Tier C, deferred).",
+    "what_we_tried": "",
+    "tradeoffs": "The discipline is slightly longer (a per-session token cost). cambium remains genuinely absent on mobile - this makes the gap honest rather than closing it; closing it is the deferred Tier C Worker build.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "xylem",
+      "discipline",
+      "remote",
+      "cambium",
+      "honesty",
+      "thread-3"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "superseded",
+    "superseded_by": "dec-013-001d",
+    "created_at": "2026-07-21T15:53:29.794162+00:00",
+    "updated_at": "2026-07-21T15:53:29.794162+00:00",
+    "verified_at": "2026-07-21T15:53:29.794162+00:00",
+    "deprecated_reason": "cambium-remote is now deployed and connected on claude.ai, so the discipline's 'cambium is local-only, unavailable on mobile' is no longer true."
+  },
+  {
+    "id": "dec-012-845b",
+    "summary": "Fixed build_stdio_entry to resolve $PYTHON in the server command, not just args/env \u2014 it was writing a literal \"$PYTHON\" launch command that Claude Code can't expand, so a fresh `xylem update` broke all three stdio servers until repaired.",
+    "problem": "build_stdio_entry applied the placeholder mapping to args and env but passed server[\"command\"] through unresolved. The manifest command is \"$PYTHON\"; Claude Code does not expand it, so the written settings.json had command=\"$PYTHON\" and the server failed to launch. Latent because the live settings.json carried hand-written \"python3\" commands the installer had never overwritten \u2014 running `xylem update` during the remote-config work rewrote the entries from the manifest and surfaced the bug live.",
+    "why_chosen": "Resolving the command through the same resolve_placeholders(mapping) call as args/env is the minimal, obviously-correct fix; $PYTHON is already in build_mapping as resolve_python() (sys.executable). Repaired the live settings.json by re-running the corrected update, then added a regression test asserting the command resolves. A test had codified the raw manifest command as \"$PYTHON\" but nothing asserted the BUILT entry, which is why it slipped through.",
+    "what_we_tried": "",
+    "tradeoffs": "",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "xylem",
+      "installer",
+      "bug",
+      "gotcha",
+      "mcp",
+      "settings"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T16:31:54.166858+00:00",
+    "updated_at": "2026-07-21T16:31:54.166858+00:00",
+    "verified_at": "2026-07-21T16:31:54.166858+00:00"
+  },
+  {
+    "id": "dec-013-001d",
+    "summary": "Revised the discipline's recall/distill rules to reflect that cambium recall is now available on claude.ai/mobile via the deployed cambium-remote Worker (team + org scope) \u2014 only local scope and capture/promote writes remain desktop-only. Supersedes the Tier-A \"cambium is local-only\" wording (dec-011-7cbf) now that the remote exists.",
+    "problem": "Thread 3 Tier A made the discipline say cambium was local-only and unavailable on mobile, which was true then. cambium-remote is now deployed and connected on claude.ai, serving read-only recall over team + org knowledge, so the discipline was telling a mobile agent recall is unavailable when it now works \u2014 the opposite honesty problem.",
+    "why_chosen": "The recall rule now states recall works on claude.ai/mobile via the cambium-remote connector (team + org), with only local (personal, unpromoted) knowledge desktop-only. The distill rule keeps capture/promote as desktop-only writes (the Worker is read-only by design). This tracks the actual deployed capability. Regenerated the three rendered outputs via render_discipline.py; drift + ascii tests pass. Deploys to the global CLAUDE.md via xylem update after merge.",
+    "what_we_tried": "",
+    "tradeoffs": "Ties the discipline wording to the cambium-remote deployment staying up; if the connector is removed, the wording would over-promise until reverted. Acceptable \u2014 same coupling the mailbox rule already has to agentsync-remote.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "xylem",
+      "discipline",
+      "cambium-remote",
+      "remote",
+      "recall",
+      "thread-3"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T20:38:04.552701+00:00",
+    "updated_at": "2026-07-21T20:38:04.552701+00:00",
+    "verified_at": "2026-07-21T20:38:04.552701+00:00"
+  },
+  {
+    "id": "dec-014-58b3",
+    "summary": "Verification must exercise the thing it verifies: doctor completes a real MCP initialize handshake, the plugin distill hook calls cambium_server.distill() instead of a CLI that never existed, and the documented version-check rate limiter was implemented rather than the doc weakened.",
+    "problem": "An audit sweep found the same failure repeated across the codebase: checks and docs that describe a behaviour the code does not have, each one presenting as a clean, well-handled success. `doctor` reported \"all servers healthy\" for servers it had never launched (it checked file-exists + compile() + `import mcp`). plugin/scripts/distill.py shelled `subprocess.run([\"cambium\", \"distill\"])` behind a `shutil.which(\"cambium\")` guard, but cambium ships only `cambium-mcp` (an MCP stdio server, no argparse) \u2014 so the guard never passed and the capture leg of the compound-growth loop was a permanent no-op, printing a tidy skip line every session. Three of the seven shipped plugin skills documented that same imaginary CLI. docs/versioning.md described a fetch rate limiter (off by default, once per 24h, 3s timeout) that did not exist: the fetch defaulted ON with a 10s timeout and no cache, doing unbounded network I/O on every SessionStart inside a 10s hook budget.",
+    "why_chosen": "In every case the documented/claimed behaviour was the correct design and the code was the bug, so the code moved. doctor now spawns each stdio server and completes a real MCP `initialize` handshake over the stdio transport, reporting the name and version the SERVER announced \u2014 verified against the three live servers (context-keeper v0.15.0, agentsync v1.27.0, cambium v1.27.0). The initialize request and notifications/initialized are written in one go and stdin closed, so a single communicate() carries a hard timeout with no reader thread and no deadlock risk; a server that starts and hangs is killed at 20s rather than hanging CI. distill.py calls cambium_server.distill() in a CHILD interpreter, because a SessionEnd hook has a timeout budget and importing a third-party server module gives someone else's import-time code an unbounded chance to hang \u2014 a child process can be killed, an import cannot. The rate limiter stamps BEFORE the fetch, since an attempt that hangs to its timeout is exactly the one worth suppressing and stamping only on success would retry the worst case every session. Tests use the real handshake against genuine child processes rather than a mock, because a mocked handshake would be the same verification-that-doesn't-verify the change exists to remove.",
+    "what_we_tried": "The previous run of this sweep was interrupted by a session limit after batching all work to the end and losing it; this run committed and pushed after each sub-task. A sibling agent's partial work on another repo had looked complete but shipped 5 failing tests, so the inherited on-disk state here (installer.py, install/xylem_install.py, manifest.json, new xylem_interpreter.py) was test-verified before being built on \u2014 it passed all 243.",
+    "tradeoffs": "doctor is slower and can now fail for environmental reasons (a server that genuinely cannot start), which is the point but does make it a harder gate. The handshake spawns real processes, so the test suite grew ~2s. The plugin distill hook pays one extra process spawn per session. The fetch rate limiter means a brand-new upstream version is learned about on the next pull rather than instantly \u2014 the local-clone comparison still runs every session, so a stale block is still caught immediately.",
+    "alternatives": [
+      {
+        "option": "Weaken docs/versioning.md to describe the eager, unlimited fetch that actually shipped",
+        "reason_rejected": "The doc was the better design. A cosmetic staleness notice should not cost an unbounded network round-trip inside a 10-second SessionStart budget on every session."
+      },
+      {
+        "option": "Add a `cambium` console script to the cambium package so the existing distill.py would work",
+        "reason_rejected": "cambium is owned by a concurrently-active agent and out of scope for this branch; and xylem should not depend on a CLI surface that does not exist today when the function is directly importable."
+      },
+      {
+        "option": "Keep doctor's cheap checks and just soften the wording from 'healthy' to 'installed'",
+        "reason_rejected": "The user's question is whether the servers work. Renaming a check that cannot answer it leaves the same gap with better manners."
+      },
+      {
+        "option": "Mock the handshake in tests to keep the suite fast",
+        "reason_rejected": "Exactly the pattern being removed. diagnose() takes an injectable handshake so row logic stays drivable, but the handshake itself is tested against real child processes."
+      }
+    ],
+    "constraints_created": [
+      "A check that reports health must exercise the thing it reports on: for a server, that means starting it and completing a protocol handshake, not confirming its file parses.",
+      "When a doc and the code disagree about a safety or performance property, implement the doc before weakening it \u2014 the doc is usually the considered design and the code the accident."
+    ],
+    "related_to": [],
+    "tags": [
+      "verification",
+      "mcp",
+      "hooks",
+      "doctor",
+      "cambium",
+      "audit"
+    ],
+    "retrieval_hints": [
+      "doctor says healthy but the server never started",
+      "cambium CLI does not exist, distill hook is a no-op",
+      "version check fetches on every session start",
+      "MCP initialize handshake from Python stdlib"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-24T21:31:51.594046+00:00",
+    "updated_at": "2026-07-24T21:31:51.594046+00:00",
+    "verified_at": "2026-07-24T21:31:51.594046+00:00"
+  },
+  {
+    "id": "dec-015-1263",
+    "summary": "install/servers.json and plugin/hooks/hooks.json are now generated outputs (5th and 6th) of the drift guard, and xylem_interpreter.py is the single interpreter-resolution policy both installers call. Extends dec-016 and dec-013 to the files they missed.",
+    "problem": "dec-016 claimed hand-copy drift was \"structurally impossible\" because four artifacts became generated. install/servers.json was a THIRD hand-maintained copy of the server declarations sitting outside those four, and it had drifted exactly as predicted: long after both were fixed everywhere else it still declared \"command\": \"python3\" (the Microsoft Store shim on Windows, dec-013) and still pinned CONTEXT_KEEPER_PROJECT / AGENTSYNC_REPO / CAMBIUM_REPO, freezing each server to the install-time project that every manifest note explains it must not be frozen to. Separately, plugin/hooks/hooks.json launched both hook scripts with a bare `python` \u2014 the exact dec-013 bug reintroduced on the plugin path, where it is silent (a SessionStart hook that never launches produces no primer and no error). And installer.py and install/xylem_install.py resolved the Python interpreter by OPPOSITE strategies (sys.executable vs shutil.which(\"python3\") first), so dec-013's fix could only ever be half-applied.",
+    "why_chosen": "A guard only guards what it renders, so the answer to a hand-copy outside the guard is to bring it inside rather than to fix its contents. servers.json is derived from manifest.json by a fully mechanical mapping \u2014 the config key holding a server's entry script comes from its manifest name (context-keeper -> ${CONTEXT_KEEPER_SERVER}), an $AGENT_ID-valued env key becomes a required config key, each key in a new per-server `config_env` becomes an optional passthrough knob, and a literal-valued manifest env key is an installer.py-path default that is not copied. The *_PROJECT/*_REPO pins cannot return through that mapping because they are neither $AGENT_ID-valued nor in any config_env. hooks.json gets its launch commands from xylem_interpreter.launch_command(): the plugin has no install step, so the command cannot carry a resolved path, and no single bare name is safe (python3 is the Store shim on Windows; python is absent on most Linux/macOS) \u2014 so it emits a fallback chain `A || B`, which means the same thing in cmd.exe and POSIX sh and works precisely because the failure modes are non-zero exits. That is only safe because both hook scripts exit 0 on every path, which is now asserted. The interpreter policy lives in one module because two implementations of one policy means the policy can only ever be half-fixed.",
+    "what_we_tried": "",
+    "tradeoffs": "See above.",
+    "alternatives": [
+      {
+        "option": "Delete install/servers.json as redundant",
+        "reason_rejected": "It is not redundant. install/xylem_install.py is the multi-agent install path and addresses server scripts by user-configured absolute paths (${CONTEXT_KEEPER_SERVER}) where installer.py uses $XYLEM_PARENT-relative paths. Two legitimate conventions, one declaration."
+      },
+      {
+        "option": "Hand-fix servers.json's python3 and pins and add a test asserting they stay fixed",
+        "reason_rejected": "That is the dec-016 lesson unlearned. A test on a hand-maintained copy catches the two bugs you thought of; generation removes the class."
+      },
+      {
+        "option": "Keep a bare `python` in hooks.json and document that Windows users must have it",
+        "reason_rejected": "Silently produces no primer and no error on every non-Windows machine where only python3 exists. The failure is invisible, which is the worst property a hook can have."
+      },
+      {
+        "option": "Have hooks.json call a launcher shell script",
+        "reason_rejected": "The repo already rejected a bash-dependent hook (the previous distill.sh) on the grounds that bash is not a given on a stock Windows box; reintroducing one for the launcher would repeat that."
+      }
+    ],
+    "constraints_created": [
+      "Any file that duplicates a fact from manifest.json or artifacts/discipline.source.json must be a rendered output of scripts/render_discipline.py, not a hand-maintained copy \u2014 and must be listed in outputs(), because the drift guard only guards what it renders.",
+      "A launch command must never be a bare interpreter name. Resolve a real path where there is an install step (xylem_interpreter.resolve_python), or emit a fallback chain where there is not (xylem_interpreter.launch_command)."
+    ],
+    "related_to": [],
+    "tags": [
+      "drift",
+      "generation",
+      "interpreter",
+      "windows",
+      "plugin",
+      "audit"
+    ],
+    "retrieval_hints": [
+      "servers.json drifted with python3 and pinned project vars",
+      "plugin hooks.json launches bare python",
+      "one interpreter resolution policy for both installers",
+      "drift guard only guards what it renders"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-24T21:32:19.924104+00:00",
+    "updated_at": "2026-07-24T21:32:19.924104+00:00",
+    "verified_at": "2026-07-24T21:32:19.924104+00:00"
+  }
+]
