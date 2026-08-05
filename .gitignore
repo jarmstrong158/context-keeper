@@ -22,7 +22,11 @@ dist/
 .supersession_proposal.md
 
 # retrieval-eval artifacts
-evals/runs/
+evals/runs/*
+# ...except the run the published page is built from. It has to travel with the
+# repo or docs/index.html cannot be rebuilt or verified, and tests/test_page_data.py
+# would skip in CI -- which is where a stale published number needs to be caught.
+!evals/runs/page_data.json
 evals/.emb_cache.json
 # Store COPIES the retrieval eval runs against, so it never writes to a real
 # .context (the embedding path caches embeddings.json next to the entries it

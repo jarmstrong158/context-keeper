@@ -82,18 +82,18 @@ it for free and recall comes out inflated.
 Cases may only be drawn from stores whose project repo is **public** — a case
 quotes the entry it targets, and this repo is public (`con-015-12da`).
 
-**Results (2026-08-05, 59 cases, `include_related=False`):**
+**Results (2026-08-05, 59 cases, frozen corpus, `include_related=False`):**
 
 | arm | recall@1 | recall@3 | recall@5 | hit@5 | MRR | FPR |
 |---|---|---|---|---|---|---|
-| lexical | 0.220 | 0.370 | 0.483 | 0.560 | 0.383 | 0.667 |
-| embedding (w=150) | **0.390** | **0.554** | **0.691** | **0.760** | **0.565** | 0.667 |
+| lexical | 0.200 | 0.380 | 0.417 | 0.500 | 0.370 | 0.667 |
+| embedding (w=150) | **0.380** | **0.554** | **0.644** | **0.700** | **0.553** | 0.667 |
 
 `recall@k` is strict — `|gold ∩ top-k| / |gold|`, so a case with 5 gold entries
 cannot exceed 0.2 at k=1. `hit@5` (any gold in top 5) is carried for
 comparability with the 2026-06-17 numbers below.
 
-**The embedding path earns its complexity.** +21 points recall@5 and +18 points
+**The embedding path earns its complexity.** +23 points recall@5 and +18 points
 MRR over lexical, on a set specifically built to deny lexical its free tokens.
 The margin is wider here than in the 2026-06-17 measurement precisely because
 that older set was partly paraphrase-derived.
