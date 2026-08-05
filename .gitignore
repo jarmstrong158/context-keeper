@@ -10,6 +10,15 @@ __pycache__/
 dist/
 *.egg-info/
 
+# scripts/survey_supersessions.py output. Gitignored deliberately: the survey
+# reads every .context store on the machine, so its proposals quote projects
+# that are private or have no remote at all. This repo is public.
+.supersession_proposal.md
+
 # retrieval-eval artifacts
 evals/runs/
 evals/.emb_cache.json
+# Store COPIES the retrieval eval runs against, so it never writes to a real
+# .context (the embedding path caches embeddings.json next to the entries it
+# embeds). Rebuilt on demand; the warm embedding cache lives here too.
+evals/.snapshots/

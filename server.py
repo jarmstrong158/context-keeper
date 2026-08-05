@@ -1173,6 +1173,20 @@ _FIELD_GUIDANCE = {
     "purpose": "Explain why this pipeline exists. What does it accomplish that ad-hoc steps couldn't?",
     "rule": "State the rule in clear imperative language ('Always X', 'Never Y').",
     "name": "A short pipeline name.",
+    # Not a min-length field: this is the lazy-loaded home for the write-time
+    # supersession advisory's wording, per con-004 (schema descriptions are a
+    # per-session token tax on every connected client; a rejection message or
+    # an advisory only costs tokens when it actually fires).
+    "supersedes": (
+        "Only you can tell whether this entry REPLACES the one(s) named above or "
+        "stands beside them. If it replaces one: record it again with "
+        "supersedes=[<id>] (decisions), or deprecate_entry the old one with "
+        "superseded_by pointing here. If it does not, link them with related_to "
+        "and move on. Nothing was linked or changed for you -- an auto-link fired "
+        "from a tag/scope heuristic would rewrite history on a guess. Leaving a "
+        "real replacement unlinked is how a store ends up able to say what is "
+        "true now but not what changed, or why."
+    ),
 }
 
 
@@ -1365,6 +1379,260 @@ def _attach_similar(result, entry, base_dir):
         if any(m.get("relation") == "likely_contradiction" for m in similar):
             result["contradiction_note"] = _CONTRADICTION_NOTE
     return result
+
+
+# ============================================================
+# Supersession advisory (write time)
+#
+# Reversals were landing as in-place EDITS, so the store could answer what is
+# true now but not what changed or why: its own dogfood store held 36 active
+# entries, 0 deprecated and 0 supersedes links while two of those entries
+# carried their history inline instead ("replacing the old additive-only
+# sync"; "(was additive-only)"). deprecate_entry has supported superseded_by
+# the whole time. Nobody used it, because nothing ASKED at the one moment the
+# answer was known -- while the replacement was being written.
+#
+# So this asks, and only asks. It never links, never blocks the write, and
+# never touches the older entry. An auto-link fired from a tag/scope heuristic
+# would rewrite history on a guess, which is a worse failure than the missing
+# link it set out to fix: a wrong supersedes edge silently demotes a rule that
+# is still in force.
+#
+# The signal is deliberately NOT the text overlap _find_similar_entries
+# already computes. Restatement and supersession look different in the text:
+# a replacement often shares little wording with what it replaces ("the merge
+# is additive-only" vs "the merge is timestamp-based newest-wins") while
+# addressing exactly the same subject. What survives a rewrite is the SUBJECT
+# -- the tags and the scope -- so that is what gets scored.
+# ============================================================
+
+# Mean of the available subject signals at or above this flags a candidate.
+# Overridable per store via config "supersession_threshold".
+DEFAULT_SUPERSESSION_THRESHOLD = 0.50
+
+# How many candidates an advisory names, and how much of a summary it quotes.
+_MAX_SUPERSESSION_CANDIDATES = 3
+_ADVISORY_SUMMARY_CHARS = 140
+
+
+def _compact(text, limit):
+    """Collapse text to a single line of at most `limit` chars, ASCII-safe."""
+    s = " ".join(str(text or "").split())
+    if len(s) <= limit:
+        return s
+    return s[:limit - 3].rstrip() + "..."
+
+
+def _scope_components(scope):
+    """A scope's whole path COMPONENTS, normalized. Empty for a domain scope.
+
+    The component split is the rule con-011-76f8 fixed everywhere else: `hooks/`
+    is the single component "hooks", so it can never partially match
+    "webhooks". This is not a second scope matcher -- `_scope_covers` in
+    hooks/scope_guard.py answers scope-vs-FILE and stays the only surface that
+    decides coverage. The question here is a different one, scope-vs-SCOPE
+    overlap for ranking, and it is held to the same component rule by
+    TestSupersessionAdvisory::test_scope_overlap_agrees_with_scope_covers.
+    """
+    s = str(scope or "").replace("\\", "/").strip().strip("/").lower()
+    if not s or s in ("global", "all", "*"):
+        return ()
+    return tuple(p for p in s.split("/") if p and p != ".")
+
+
+def _scope_overlap(a, b):
+    """Shared leading components / longest scope, or None if either is unscoped.
+
+    Anchored at the front because a scope is a repo-relative path: `hooks/` and
+    `hooks/scope_guard.py` describe the same area (0.5), `hooks/` and
+    `webhooks/` share no component at all (0.0). None means "no signal here",
+    which is different from 0.0 ("a signal, and it says unrelated") -- a
+    globally scoped entry must not drag the mean down.
+    """
+    ca, cb = _scope_components(a), _scope_components(b)
+    if not ca or not cb:
+        return None
+    shared = 0
+    for x, y in zip(ca, cb):
+        if x != y:
+            break
+        shared += 1
+    return shared / max(len(ca), len(cb))
+
+
+def _tag_overlap(a, b):
+    """Jaccard over lowercased tag sets, or None if either side is untagged."""
+    ta = {str(t).strip().lower() for t in (a or []) if str(t).strip()}
+    tb = {str(t).strip().lower() for t in (b or []) if str(t).strip()}
+    if not ta or not tb:
+        return None
+    return len(ta & tb) / len(ta | tb)
+
+
+def _supersession_score(new_entry, other):
+    """0.0-1.0 subject overlap between two entries of the same kind.
+
+    The mean of whichever signals exist. An entry with neither tags nor a real
+    scope carries no subject signal, and scores 0 rather than guessing from
+    nothing -- an advisory nobody can act on is worse than silence, because it
+    trains the reader to skip the next one.
+    """
+    signals = [s for s in (
+        _tag_overlap(new_entry.get("tags"), other.get("tags")),
+        _scope_overlap(new_entry.get("scope"), other.get("scope")),
+    ) if s is not None]
+    if not signals:
+        return 0.0
+    return sum(signals) / len(signals)
+
+
+def _supersession_candidates(new_entry, type_name, base_dir,
+                             exclude_ids=(), threshold=None):
+    """Active same-kind entries whose subject this new entry may be replacing.
+
+    Same kind only: a decision never supersedes a constraint, and offering one
+    as a candidate would invite a link the schema cannot hold.
+    """
+    if threshold is None:
+        threshold = read_config(base_dir).get(
+            "supersession_threshold", DEFAULT_SUPERSESSION_THRESHOLD)
+    paths = _resolve_paths(base_dir)
+    if paths is None or type_name not in paths:
+        return []
+    # Already-linked ids are not news: `supersedes` IS the explicit form of
+    # this advisory, and related_to is an acknowledged relation.
+    exclude = set(exclude_ids or [])
+    exclude.update(new_entry.get("related_to") or [])
+
+    matches = []
+    for e in read_json_file(paths[type_name]):
+        eid = e.get("id")
+        if not eid or eid in exclude or eid == new_entry.get("id"):
+            continue
+        if e.get("status", "active") != "active":
+            continue
+        score = _supersession_score(new_entry, e)
+        if score >= threshold:
+            matches.append({
+                "id": eid,
+                "summary": e.get("summary") or e.get("rule") or e.get("name") or "?",
+                "score": round(score, 2),
+            })
+    matches.sort(key=lambda m: (-m["score"], m["id"]))
+    return matches[:_MAX_SUPERSESSION_CANDIDATES]
+
+
+def _attach_supersession_advisory(result, entry, type_name, base_dir,
+                                  exclude_ids=()):
+    """Name possible supersession targets on a successful record_* result.
+
+    Advisory only, and fail-soft for the same reason _attach_similar is: the
+    write has already landed, so nothing this function discovers is worth
+    turning a successful record into an error.
+    """
+    try:
+        candidates = _supersession_candidates(
+            entry, type_name, base_dir, exclude_ids=exclude_ids)
+    except Exception:
+        return result
+    if candidates:
+        result["supersession_advisory"] = [
+            "possible supersession of {}: {}".format(
+                c["id"], _compact(c["summary"], _ADVISORY_SUMMARY_CHARS))
+            for c in candidates
+        ]
+        result["supersession_note"] = _FIELD_GUIDANCE["supersedes"]
+    return result
+
+
+# ============================================================
+# Predecessor line (read time)
+#
+# The other half of the same problem. A supersedes link is only worth making
+# if retrieval spends it: the predecessor is superseded, so every retrieval
+# filter has already dropped it by the time an agent reads the replacement,
+# and "what changed, and why" costs a second deliberate lookup that nobody
+# makes. One line, carried with the entry that replaced it, is what turns the
+# link from bookkeeping into an answer.
+#
+# ONE level deep, deliberately. A chain rendered in full grows without bound
+# in a token budget that is already the scarce resource, and the immediate
+# predecessor is what explains the current entry -- the one before that
+# explains the predecessor, and can be read from ITS own entry.
+# ============================================================
+
+_PREDECESSOR_TEXT_CHARS = 140
+
+
+def _predecessor_sort_key(entry):
+    return (entry.get("updated_at") or "", entry.get("id") or "")
+
+
+def _predecessor_map(base_dir):
+    """{replacement_id: predecessor_entry} for every recorded supersession.
+
+    Read from ALL entries including superseded and deprecated ones: a
+    predecessor is by definition no longer active, so the retrieval filters
+    have already excluded it by the time this is needed.
+    """
+    paths = _resolve_paths(base_dir)
+    if paths is None:
+        return {}
+    out = {}
+    for tpath in paths.values():
+        for e in read_json_file(tpath):
+            newer = e.get("superseded_by")
+            if not newer or not e.get("id"):
+                continue
+            # Several entries can point at one replacement. Keep the most
+            # recently changed: that is the IMMEDIATE predecessor.
+            prior = out.get(newer)
+            if prior is None or _predecessor_sort_key(e) > _predecessor_sort_key(prior):
+                out[newer] = e
+    return out
+
+
+def _predecessor_line(prior, successor):
+    """One compact ASCII line: what the prior entry said, and why it changed."""
+    was = _compact(
+        prior.get("summary") or prior.get("rule") or prior.get("name") or "?",
+        _PREDECESSOR_TEXT_CHARS)
+    # deprecate_entry(superseded_by=...) records an explicit reason. The
+    # record_entry(supersedes=[...]) path has no such field, so fall back to
+    # what forced the replacement -- the closest thing the store actually
+    # holds. Never invent one: no reason at all is honest, a guessed one is not.
+    why = _compact(
+        prior.get("deprecated_reason") or successor.get("problem") or "",
+        _PREDECESSOR_TEXT_CHARS)
+    line = 'supersedes {}: was "{}"'.format(prior.get("id"), was)
+    if why:
+        line += " -- changed because: {}".format(why)
+    return line
+
+
+def _attach_predecessor(item, entry, pred_map, remaining):
+    """Prepend the predecessor line to a result item if it fits `remaining`.
+
+    Returns the tokens spent (0 when there is no predecessor, or when neither
+    form fits). Budget discipline follows dec-021-b607: when the full line
+    does not fit, what gets dropped is the LINE -- never the entry -- and an
+    id trail is left behind so the history stays discoverable with one
+    targeted get_context call.
+    """
+    prior = pred_map.get(entry.get("id"))
+    if prior is None:
+        return 0
+    line = _predecessor_line(prior, entry)
+    cost = estimate_tokens(line)
+    if cost <= remaining:
+        item["predecessor"] = line
+        return cost
+    trail = prior.get("id") or ""
+    trail_cost = estimate_tokens(trail) if trail else 0
+    if trail and trail_cost <= remaining:
+        item["predecessor_id"] = trail
+        return trail_cost
+    return 0
 
 
 # ============================================================
@@ -1871,7 +2139,11 @@ def _record_decision_impl(params):
     result = {"success": True, "id": entry["id"], "entry": entry}
     if superseded:
         result["superseded"] = superseded
-    return _attach_similar(result, entry, base_dir)
+    result = _attach_similar(result, entry, base_dir)
+    # Ids just linked via `supersedes` are excluded -- the caller already
+    # answered this question for them.
+    return _attach_supersession_advisory(
+        result, entry, "decisions", base_dir, exclude_ids=superseded)
 
 
 def _record_pipeline_impl(params):
@@ -1916,7 +2188,9 @@ def _record_pipeline_impl(params):
     entries.append(entry)
     write_json_file(pipe_path, entries)
     _mirror_out(entry, "pipelines", base_dir)
-    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+    result = _attach_similar(
+        {"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+    return _attach_supersession_advisory(result, entry, "pipelines", base_dir)
 
 
 def _record_constraint_impl(params):
@@ -1959,7 +2233,9 @@ def _record_constraint_impl(params):
     write_json_file(con_path, entries)
     _maybe_export_projections(base_dir, "constraints")
     _mirror_out(entry, "constraints", base_dir)
-    return _attach_similar({"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+    result = _attach_similar(
+        {"success": True, "id": entry["id"], "entry": entry}, entry, base_dir)
+    return _attach_supersession_advisory(result, entry, "constraints", base_dir)
 
 
 # Kind -> the per-kind implementation. record_entry is the canonical write tool;
@@ -2019,7 +2295,16 @@ def handle_get_context(params):
         entry, type_name, _, _ = _find_entry_by_id(entry_id, base_dir)
         if entry is None:
             return {"error": f"No entry found with id '{entry_id}'"}
-        return {"type": type_name, "entry": entry}
+        out = {"type": type_name}
+        # No budget on this path, so the line always fits; it is attached the
+        # same way and in the same position as in the ranked results below, so
+        # an entry does not gain or lose its history depending on how it was
+        # asked for.
+        prior = _predecessor_map(base_dir).get(entry_id)
+        if prior is not None:
+            out["predecessor"] = _predecessor_line(prior, entry)
+        out["entry"] = entry
+        return out
 
     if base_dir is None:
         return UNRESOLVED_PROJECT_ERROR
@@ -2107,6 +2392,8 @@ def handle_get_context(params):
     results = []
     used_tokens = 0
     seen_ids = set()
+    # Supersession history, one level deep, for whatever survives the budget.
+    pred_map = _predecessor_map(base_dir)
     for sc, entry_type, entry in scored:
         clean = entry
 
@@ -2124,7 +2411,13 @@ def handle_get_context(params):
             # mid-ranked entry must not block smaller entries behind it.
             continue
 
-        results.append({"score": round(sc, 1), "type": entry_type, "entry": clean})
+        item = {"score": round(sc, 1), "type": entry_type}
+        # The entry is paid for first, so the predecessor line is only ever
+        # spent out of what is left over after it.
+        used_tokens += _attach_predecessor(
+            item, entry, pred_map, budget - used_tokens - cost)
+        item["entry"] = clean
+        results.append(item)
         seen_ids.add(entry.get("id"))
         used_tokens += cost
 
@@ -2157,12 +2450,11 @@ def handle_get_context(params):
             if used_tokens + cost > budget:
                 continue
             r_label = type_labels.get(r_type, r_type)
-            results.append({
-                "score": 0.0,
-                "type": r_label,
-                "entry": clean,
-                "via": "related_to",
-            })
+            item = {"score": 0.0, "type": r_label, "via": "related_to"}
+            used_tokens += _attach_predecessor(
+                item, r_entry, pred_map, budget - used_tokens - cost)
+            item["entry"] = clean
+            results.append(item)
             seen_ids.add(rid)
             used_tokens += cost
             related_added += 1

@@ -25,6 +25,7 @@ from server import (  # noqa: E402
     _leading_int,
     handle_backfill_remote,
     handle_deprecate_entry,
+    handle_get_context,
     handle_pull_remote,
     handle_record_constraint,
     handle_record_decision,
@@ -361,6 +362,41 @@ class TestPullRoundTrip:
         assert got["summary"] == "rich entry"
         assert got["tags"] == ["a", "b"]
         assert got["status"] == "active"
+
+    def test_supersession_survives_the_full_round_trip(self, tmp_path, remote):
+        """A superseded entry has to arrive on the far side still superseded.
+
+        Both halves of the link matter and they are carried separately: the
+        `superseded_by` id lives in a dedicated column while `status` is what
+        demotes the entry in ranking. Preserving one without the other leaves
+        the second store showing a replaced decision as current while still
+        naming its replacement -- worse than either failure alone, because it
+        reads as an answer.
+        """
+        src = _project(tmp_path / "src", "supersync")
+        old = handle_record_decision({
+            "project_dir": src, "summary": "additive-only sync",
+            "problem": _LONG, "why_chosen": _LONG, "tags": ["mirror"]})
+        new = handle_record_decision({
+            "project_dir": src, "summary": "newest-wins sync",
+            "problem": _LONG, "why_chosen": _LONG, "tags": ["mirror"],
+            "supersedes": [old["id"]]})
+
+        # The demotion reached the remote in the same write as the new entry.
+        assert remote.rows[("supersync", old["id"])]["status"] == "superseded"
+        assert remote.rows[("supersync", old["id"])]["superseded_by"] == new["id"]
+
+        dst = _project(tmp_path / "dst", "supersync")
+        handle_pull_remote({"project_dir": dst})
+        pulled = {e["id"]: e for e in read_json_file(
+            str(tmp_path / "dst" / ".context" / "decisions.json"))}
+        assert pulled[old["id"]]["status"] == "superseded"
+        assert pulled[old["id"]]["superseded_by"] == new["id"]
+
+        # ...and the pulled store can still answer "what changed", which is the
+        # whole point of carrying the link across.
+        ctx = handle_get_context({"project_dir": dst, "id": new["id"]})
+        assert "additive-only sync" in ctx["predecessor"]
 
     def test_pull_keeps_newer_local_over_older_remote(self, tmp_path, remote):
         # Local copy is NEWER than the remote row -> pull keeps local (it will

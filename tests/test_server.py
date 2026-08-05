@@ -2605,6 +2605,336 @@ class TestSupersession:
 
 
 # ===========================================================================
+# Write-time supersession advisory
+#
+# The store held 36 active entries, 0 deprecated and 0 supersedes links while
+# two of them narrated their own history inline instead ("replacing the old
+# additive-only sync"). deprecate_entry's superseded_by had been available the
+# whole time and was never used, because nothing asked at the moment the
+# answer was known. These tests pin the three properties that make asking
+# safe: it fires on SUBJECT overlap (not wording), it is advisory only, and it
+# never touches the older entry.
+# ===========================================================================
+
+
+class TestSupersessionAdvisory:
+    def test_advisory_names_the_overlapping_entry(self, tmp_path):
+        old = handle_record_constraint(constraint_params(
+            tmp_path, rule="The mirror merge is additive-only",
+            scope="mirror.py", tags=["mirror", "sync"]))
+        new = handle_record_constraint(constraint_params(
+            tmp_path, rule="The mirror merge is timestamp-based newest-wins",
+            scope="mirror.py", tags=["mirror", "sync"]))
+        advisory = new["supersession_advisory"]
+        assert any(a.startswith(f"possible supersession of {old['id']}: ")
+                   for a in advisory), advisory
+        assert "additive-only" in " ".join(advisory)
+
+    def test_advisory_fires_when_the_wording_does_not_overlap(self, tmp_path):
+        """The reason this is not _find_similar_entries. A replacement often
+        shares almost no words with what it replaces while addressing exactly
+        the same subject -- which is the case Jaccard-over-text misses."""
+        old = handle_record_constraint(constraint_params(
+            tmp_path, rule="Push every entry, skip none",
+            reason="Additive sync keeps the remote complete without edits.",
+            scope="mirror.py", tags=["mirror"]))
+        new = handle_record_constraint(constraint_params(
+            tmp_path, rule="Overwrite only on a strictly newer timestamp",
+            reason="Newest-wins lets a deprecation reach the other store.",
+            scope="mirror.py", tags=["mirror"]))
+        # Text overlap alone would not have connected these two...
+        assert not any(m["id"] == old["id"]
+                       for m in new.get("similar_entries", []))
+        # ...but they are plainly about the same subject.
+        assert any(old["id"] in a for a in new["supersession_advisory"])
+
+    def test_advisory_never_mutates_the_older_entry(self, tmp_path):
+        old = handle_record_constraint(constraint_params(
+            tmp_path, rule="An older rule about the mirror",
+            scope="mirror.py", tags=["mirror"]))
+        before = handle_get_context({"project_dir": str(tmp_path), "id": old["id"]})["entry"]
+        new = handle_record_constraint(constraint_params(
+            tmp_path, rule="A newer rule about the mirror",
+            scope="mirror.py", tags=["mirror"]))
+        assert new["supersession_advisory"]  # it did fire
+        after = handle_get_context({"project_dir": str(tmp_path), "id": old["id"]})["entry"]
+        assert after == before
+        assert after["status"] == "active"
+        # superseded_by is a decisions-only field; the advisory must not have
+        # introduced one on a constraint either.
+        assert after.get("superseded_by") is None
+
+    def test_advisory_never_blocks_the_write(self, tmp_path):
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="First rule here", scope="mirror.py", tags=["mirror"]))
+        new = handle_record_constraint(constraint_params(
+            tmp_path, rule="Second rule here", scope="mirror.py", tags=["mirror"]))
+        assert new["success"] is True
+        assert new["entry"]["status"] == "active"
+        stored = read_json_file(str(context_dir(tmp_path) / "constraints.json"))
+        assert new["id"] in [e["id"] for e in stored]
+
+    def test_no_advisory_across_kinds(self, tmp_path):
+        """A decision cannot supersede a constraint, so offering one as a
+        candidate would invite a link the schema cannot hold."""
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="A constraint about hooks", scope="hooks/", tags=["hooks"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="A decision about hooks", tags=["hooks"]))
+        assert "supersession_advisory" not in new
+
+    def test_no_advisory_for_ids_already_linked(self, tmp_path):
+        """`supersedes` IS the explicit form of this advisory; re-offering an
+        id the caller just linked is noise."""
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="Storage by flat file", tags=["storage"]))
+        other = handle_record_decision(decision_params(
+            tmp_path, summary="Storage by memory cache", tags=["storage"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="Storage by JSON documents", tags=["storage"],
+            supersedes=[old["id"]]))
+        joined = " ".join(new.get("supersession_advisory", []))
+        assert old["id"] not in joined
+        assert other["id"] in joined
+
+    def test_no_advisory_for_related_entries(self, tmp_path):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="A decision about caching", tags=["cache"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="Another decision about caching", tags=["cache"],
+            related_to=[old["id"]]))
+        assert "supersession_advisory" not in new
+
+    def test_no_advisory_for_superseded_or_deprecated_entries(self, tmp_path):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="The original storage decision", tags=["storage"]))
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": old["id"],
+            "reason": "This decision was wrong from the start."})
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="A fresh storage decision", tags=["storage"]))
+        assert "supersession_advisory" not in new
+
+    def test_untagged_unscoped_entries_produce_no_advisory(self, tmp_path):
+        """No subject signal at all is silence, not a guess. An advisory
+        nobody can act on trains the reader to skip the next one."""
+        handle_record_decision(decision_params(tmp_path, summary="Some decision one"))
+        new = handle_record_decision(decision_params(tmp_path, summary="Some decision two"))
+        assert "supersession_advisory" not in new
+
+    def test_global_scope_does_not_manufacture_overlap(self, tmp_path):
+        """Two unrelated global constraints share a 'scope' string but no
+        subject. `global` is the absence of a scope, not a shared one."""
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="Never bulk-edit files with PowerShell", tags=["tooling"]))
+        new = handle_record_constraint(constraint_params(
+            tmp_path, rule="Never pipe git into a conditional", tags=["git"]))
+        assert "supersession_advisory" not in new
+
+    @pytest.mark.parametrize("a,b,expected", [
+        ("hooks/", "hooks/", 1.0),
+        ("hooks/", "hooks/scope_guard.py", 0.5),
+        ("hooks/", "webhooks/", 0.0),
+        ("server.py", "test_server.py", 0.0),
+        ("src/api/", "src/api/routes.py", 2 / 3),
+        ("global", "hooks/", None),
+        ("", "hooks/", None),
+    ])
+    def test_scope_overlap_scores(self, a, b, expected):
+        from server import _scope_overlap
+        assert _scope_overlap(a, b) == expected
+
+    def test_scope_overlap_agrees_with_scope_covers(self):
+        """con-011-76f8: every surface answering "is this the same area"
+        compares whole COMPONENTS. This one scores scope-vs-scope rather than
+        deciding scope-vs-file coverage, but a sibling directory merely ENDING
+        in another scope's name must read as unrelated to both, or one surface
+        is claiming a relationship the other denies."""
+        import importlib.util
+        from server import _scope_overlap
+        path = Path(__file__).parent.parent / "hooks" / "scope_guard.py"
+        spec = importlib.util.spec_from_file_location("_sg_probe_sup", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for scope in ("src/", "hooks/", "tests/"):
+            sibling = f"my{scope.strip('/')}/"
+            assert mod._scope_covers(scope, f"C:/proj/{sibling}file.py") is False
+            assert _scope_overlap(scope, sibling) == 0.0
+        assert mod._scope_covers("server.py", "C:/proj/test_server.py") is False
+        assert _scope_overlap("server.py", "test_server.py") == 0.0
+
+    def test_threshold_is_configurable_per_store(self, tmp_path):
+        cdir = context_dir(tmp_path)
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "config.json").write_text(
+            json.dumps({"supersession_threshold": 0.99}), encoding="utf-8")
+        handle_record_decision(decision_params(
+            tmp_path, summary="Decision one about caching", tags=["cache", "perf"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="Decision two about caching", tags=["cache"]))
+        # Jaccard of {cache,perf} vs {cache} is 0.5 -- under a 0.99 threshold.
+        assert "supersession_advisory" not in new
+
+    def test_advisory_carries_actionable_guidance(self, tmp_path):
+        """con-004: the wording lives in _FIELD_GUIDANCE (lazy, only costs
+        tokens when it fires), never in a schema description."""
+        from server import TOOLS, _FIELD_GUIDANCE
+        handle_record_constraint(constraint_params(
+            tmp_path, rule="An earlier rule", scope="mirror.py", tags=["mirror"]))
+        new = handle_record_constraint(constraint_params(
+            tmp_path, rule="A later rule", scope="mirror.py", tags=["mirror"]))
+        assert new["supersession_note"] == _FIELD_GUIDANCE["supersedes"]
+        assert "supersedes=[<id>]" in new["supersession_note"]
+        assert "supersession" not in json.dumps(TOOLS).lower()
+
+
+# ===========================================================================
+# Predecessor line in get_context
+#
+# A supersedes link only pays for itself if retrieval spends it. The
+# predecessor is superseded, so every retrieval filter has already dropped it
+# by the time an agent reads the replacement -- "what changed, and why" cost a
+# second deliberate lookup that nobody made.
+# ===========================================================================
+
+
+class TestPredecessorLine:
+    def _supersede(self, tmp_path, old_summary, new_summary, **kw):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary=old_summary, tags=["storage"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary=new_summary, tags=["storage"],
+            supersedes=[old["id"]], **kw))
+        return old, new
+
+    def test_replacement_carries_its_predecessor(self, tmp_path):
+        old, new = self._supersede(
+            tmp_path, "Sync is additive-only", "Sync is newest-wins",
+            problem="Additive sync froze deprecations out of the mirror entirely.")
+        r = handle_get_context({
+            "project_dir": str(tmp_path), "query": "sync", "include_related": False})
+        item = next(x for x in r["results"] if x["entry"]["id"] == new["id"])
+        assert "Sync is additive-only" in item["predecessor"]
+        assert old["id"] in item["predecessor"]
+        assert "froze deprecations" in item["predecessor"]
+
+    def test_line_is_prepended_before_the_entry(self, tmp_path):
+        _, new = self._supersede(tmp_path, "The old way", "The new way")
+        r = handle_get_context({
+            "project_dir": str(tmp_path), "query": "way", "include_related": False})
+        item = next(x for x in r["results"] if x["entry"]["id"] == new["id"])
+        keys = list(item.keys())
+        assert keys.index("predecessor") < keys.index("entry")
+
+    def test_entries_without_history_gain_nothing(self, tmp_path):
+        handle_record_decision(decision_params(tmp_path, summary="A lone decision"))
+        r = handle_get_context({"project_dir": str(tmp_path), "query": "lone"})
+        assert all("predecessor" not in x for x in r["results"])
+
+    def test_direct_id_lookup_carries_the_same_line(self, tmp_path):
+        """Same entry, two ways of asking. If only one carries the history,
+        'what changed' depends on how you happened to look it up."""
+        _, new = self._supersede(tmp_path, "Old storage plan", "New storage plan")
+        ranked = handle_get_context({
+            "project_dir": str(tmp_path), "query": "storage plan",
+            "include_related": False})
+        item = next(x for x in ranked["results"] if x["entry"]["id"] == new["id"])
+        direct = handle_get_context({"project_dir": str(tmp_path), "id": new["id"]})
+        assert direct["predecessor"] == item["predecessor"]
+
+    def test_deprecation_reason_wins_over_the_successor_problem(self, tmp_path):
+        old = handle_record_decision(decision_params(
+            tmp_path, summary="The original plan", tags=["plan"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="The revised plan", tags=["plan"],
+            problem="A fallback problem statement that should not be used here."))
+        handle_deprecate_entry({
+            "project_dir": str(tmp_path), "id": old["id"],
+            "reason": "Superseded once the vendor changed the API contract.",
+            "superseded_by": new["id"]})
+        direct = handle_get_context({"project_dir": str(tmp_path), "id": new["id"]})
+        assert "vendor changed the API contract" in direct["predecessor"]
+        assert "fallback problem statement" not in direct["predecessor"]
+
+    def test_only_one_level_deep(self, tmp_path):
+        """A chain rendered in full grows without bound inside a budget that
+        is already the scarce resource."""
+        a = handle_record_decision(decision_params(
+            tmp_path, summary="Generation one of the plan", tags=["chain"]))
+        b = handle_record_decision(decision_params(
+            tmp_path, summary="Generation two of the plan", tags=["chain"],
+            supersedes=[a["id"]]))
+        c = handle_record_decision(decision_params(
+            tmp_path, summary="Generation three of the plan", tags=["chain"],
+            supersedes=[b["id"]]))
+        direct = handle_get_context({"project_dir": str(tmp_path), "id": c["id"]})
+        assert b["id"] in direct["predecessor"]
+        assert a["id"] not in direct["predecessor"]
+        assert "Generation one" not in direct["predecessor"]
+
+    def test_most_recent_predecessor_wins_when_several_point_here(self, tmp_path):
+        old_a = handle_record_decision(decision_params(
+            tmp_path, summary="First merged-away plan", tags=["merge"]))
+        old_b = handle_record_decision(decision_params(
+            tmp_path, summary="Second merged-away plan", tags=["merge"]))
+        new = handle_record_decision(decision_params(
+            tmp_path, summary="The consolidated plan", tags=["merge"],
+            supersedes=[old_a["id"], old_b["id"]]))
+        # Make old_b unambiguously the later of the two.
+        path = context_dir(tmp_path) / "decisions.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        for e in entries:
+            if e["id"] == old_a["id"]:
+                e["updated_at"] = "2020-01-01T00:00:00+00:00"
+            if e["id"] == old_b["id"]:
+                e["updated_at"] = "2030-01-01T00:00:00+00:00"
+        path.write_text(json.dumps(entries), encoding="utf-8")
+        direct = handle_get_context({"project_dir": str(tmp_path), "id": new["id"]})
+        assert old_b["id"] in direct["predecessor"]
+        assert old_a["id"] not in direct["predecessor"]
+
+    def test_budget_drops_the_line_and_keeps_the_id_trail(self, tmp_path):
+        """dec-021-b607: what gets dropped under budget pressure is the LINE,
+        never the entry, and an id trail is left so the history is still
+        reachable in one targeted call."""
+        _, new = self._supersede(
+            tmp_path, "A predecessor with a fairly long summary line here",
+            "The replacement decision")
+        # Budget sized to admit the entry but not the ~30-token line after it.
+        entry_tokens = None
+        for budget in range(200, 4001, 10):
+            r = handle_get_context({
+                "project_dir": str(tmp_path), "query": "replacement",
+                "token_budget": budget, "include_related": False})
+            item = next((x for x in r["results"]
+                         if x["entry"]["id"] == new["id"]), None)
+            if item is None:
+                continue
+            if "predecessor_id" in item:
+                entry_tokens = budget
+                assert "predecessor" not in item
+                assert item["predecessor_id"].startswith("dec-")
+                assert item["entry"]["id"] == new["id"]  # the ENTRY survived
+                break
+        assert entry_tokens is not None, "no budget produced the id-trail fallback"
+
+    def test_line_is_counted_against_the_budget(self, tmp_path):
+        self._supersede(tmp_path, "An older approach", "A newer approach")
+        r = handle_get_context({
+            "project_dir": str(tmp_path), "query": "approach",
+            "token_budget": 4000, "include_related": False})
+        assert any("predecessor" in x for x in r["results"])
+        assert r["tokens_used"] <= r["token_budget"]
+
+    def test_line_stays_ascii(self, tmp_path):
+        """The store has already been through one mojibake incident
+        (con-008-dc30); a derived line is a new place for it to reappear."""
+        _, new = self._supersede(tmp_path, "Old plan", "New plan")
+        direct = handle_get_context({"project_dir": str(tmp_path), "id": new["id"]})
+        direct["predecessor"].encode("ascii")  # raises if it is not
+
+
+# ===========================================================================
 # Tool-schema token budget (v0.7.1)
 # ===========================================================================
 
