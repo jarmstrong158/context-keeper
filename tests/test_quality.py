@@ -358,6 +358,32 @@ class TestDemojibake:
         assert looks_like_mojibake(garbled), f"not detected: {clean!r}"
         assert demojibake(garbled) == clean
 
+    @pytest.mark.parametrize("clean", [
+        "a → b", "set to −1e9", "trademark ™", "«guillemets»",
+        "d_model 256→512", "45° ± 2", "6 × 3", "café naïve",
+    ])
+    def test_structural_rule_catches_what_the_list_does_not(self, clean):
+        """The enumerated list came up short four times in one session -- the
+        multiplication sign, the maths minus, then the arrow -- and every miss
+        was silent, because looks_like_mojibake gates demojibake.
+
+        Every multi-byte UTF-8 sequence begins 0xC2-0xF4 (Ã/Â/â in cp1252) and
+        continues with bytes >= 0x80 (also non-ASCII). So mojibake is always a
+        lead character followed by another non-ASCII one, and enumerating the
+        pairs is the wrong shape of solution. This asserts the derived rule
+        covers cases nobody added to the list by hand.
+        """
+        garbled = clean.encode("utf-8").decode("cp1252")
+        assert looks_like_mojibake(garbled)
+        assert demojibake(garbled) == clean
+
+    def test_correct_text_using_those_lead_characters_is_safe(self):
+        """The structural rule must not fire on real words. A genuine â or é is
+        followed by an ordinary letter, which is exactly what distinguishes it."""
+        for clean in ("château", "café latte", "naïve", "Ärger", "über",
+                      "→ arrow", "a — dash", "6 × 3", "45° ± 2"):
+            assert demojibake(clean) is None, clean
+
     def test_legitimate_uses_of_those_characters_are_not_flagged(self):
         """The other half: markers are multi-character sequences precisely so
         that correct text using the same characters is left alone."""

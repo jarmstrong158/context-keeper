@@ -67,9 +67,40 @@ _MOJIBAKE_MARKERS = (
 )
 
 
+# The structural rule the enumerated list above is only a fast path for.
+#
+# Every multi-byte UTF-8 sequence starts with a byte in 0xC2-0xF4, which cp1252
+# renders as Ã, Â or â. Its continuation bytes are all >= 0x80, which cp1252
+# renders as some other non-ASCII character. So mojibake is ALWAYS "one of
+# Ã/Â/â immediately followed by another non-ASCII character" -- and correct
+# text almost never is, because a real â or é is followed by an ordinary
+# letter ("château", "café").
+#
+# This exists because the enumerated list came up short four separate times in
+# one session -- the multiplication sign, then the maths minus, then the arrow.
+# Each miss was silent and each cost real repairs, because looks_like_mojibake
+# GATES demojibake (con-016-16be). Enumerating a set that the world keeps
+# adding to is the wrong shape of solution; deriving it is the right one.
+#
+# Over-detection is cheap and safe: demojibake still refuses anything that does
+# not survive the exact-inverse round trip, so a false positive here costs one
+# wasted encode attempt and never a wrong repair.
+_MOJIBAKE_LEADS = "ÃÂâ"
+
+
 def looks_like_mojibake(text):
-    """Cheap pre-filter: does this string carry a known misdecode signature?"""
-    return isinstance(text, str) and any(m in text for m in _MOJIBAKE_MARKERS)
+    """Does this string carry a misdecode signature?
+
+    Fast path is the enumerated list; the structural rule catches the rest.
+    """
+    if not isinstance(text, str):
+        return False
+    if any(m in text for m in _MOJIBAKE_MARKERS):
+        return True
+    for i, ch in enumerate(text[:-1]):
+        if ch in _MOJIBAKE_LEADS and ord(text[i + 1]) > 127:
+            return True
+    return False
 
 
 def demojibake(text):
