@@ -32,16 +32,38 @@ Imports nothing. Used by the quality checks and by the repair handler.
 # Sequences that only occur when UTF-8 bytes were decoded as cp1252. Requiring
 # one of these before attempting a repair keeps the round-trip check below
 # from "fixing" text that merely happens to survive the transform.
+# Two-and-three character sequences that only ever arise from reading UTF-8 as
+# cp1252. Every one begins with Ã / Â / â, because that is what the leading
+# byte of a multi-byte UTF-8 sequence becomes when mis-decoded -- which is also
+# why a bare em-dash or a bare multiplication sign is NOT listed: those are
+# legitimate characters, and matching them would flag correct text as damaged.
+#
+# The list was incomplete, and silently so. The sequence for a multiplication
+# sign was missing, so eleven entries across two stores read "-10 <mojibake>
+# min(...)" and neither verify_quality nor repair_mojibake could see them:
+# looks_like_mojibake GATES the repair, so a marker this list lacks is a field
+# demojibake never even attempts. dec-020 healed 160 entries and left these
+# behind. Found 2026-08-05 by a second detector disagreeing with this one.
 _MOJIBAKE_MARKERS = (
-    "â€",      # â€  - the em/en-dash and smart-quote family
-    "Ã©",      # Ã©  - accented latin
-    "Ã¨",      # Ã¨
-    "Ã¼",      # Ã¼
-    "Ã±",      # Ã±
-    "â",      # â„  - trademark/numero
-    "â",      # â ˆ - maths
-    "Â ",      # Â   - non-breaking space
-    "Â·",      # Â·
+    "â€",        # em/en-dash and smart-quote family
+    "Ã©",        # accented latin: e-acute
+    "Ã¨",        # e-grave
+    "Ã¼",        # u-umlaut
+    "Ã±",        # n-tilde
+    "Ã ",        # a-grave
+    "Ã´",        # o-circumflex
+    "Ã¶",        # o-umlaut
+    "Ã¤",        # a-umlaut
+    "Ã—",        # multiplication sign
+    "Ã·",        # division sign
+    "â„",        # trademark / numero
+    "âˆ",        # maths
+    "Â ",        # non-breaking space
+    "Â·",        # middle dot
+    "Â«",        # guillemets
+    "Â»",
+    "Â°",        # degree
+    "Â±",        # plus-minus
 )
 
 

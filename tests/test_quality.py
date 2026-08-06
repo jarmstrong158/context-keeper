@@ -335,6 +335,37 @@ class TestDemojibake:
     def test_repairs_a_known_misdecode(self):
         assert demojibake(_GARBLED) == _CLEAN
 
+    @pytest.mark.parametrize("clean", [
+        "penalty at -10 × min(N, 50)",   # multiplication sign
+        "scale ÷ 2",                      # division sign
+        "cafà and hôtel",            # a-grave, o-circumflex
+        "schön and ähnlich",         # umlauts
+        "« quoted »",                # guillemets
+        "45° ± 2",                   # degree, plus-minus
+    ])
+    def test_every_marker_family_round_trips(self, clean):
+        """The detector GATES the repair, so a family missing from
+        _MOJIBAKE_MARKERS is one demojibake never attempts.
+
+        That is not hypothetical: the multiplication sign was absent, so eleven
+        entries across Clark and balatron sat unrepaired through dec-020's
+        160-entry heal and stayed invisible to verify_quality. Each case below
+        is corrupted the way the transport used to corrupt it, then must be
+        detected AND repaired back to the original.
+        """
+        garbled = clean.encode("utf-8").decode("cp1252")
+        assert garbled != clean
+        assert looks_like_mojibake(garbled), f"not detected: {clean!r}"
+        assert demojibake(garbled) == clean
+
+    def test_legitimate_uses_of_those_characters_are_not_flagged(self):
+        """The other half: markers are multi-character sequences precisely so
+        that correct text using the same characters is left alone."""
+        for clean in ("penalty at -10 × min(N, 50)", "45° ± 2",
+                      "an em — dash", "café latte", "« quoted »"):
+            assert not looks_like_mojibake(clean), clean
+            assert demojibake(clean) is None, clean
+
     def test_clean_text_is_left_alone(self):
         for text in (_CLEAN, "plain ascii text", "already fine — em dash",
                      "accented café latte", ""):
