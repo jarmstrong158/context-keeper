@@ -32,22 +32,75 @@ Imports nothing. Used by the quality checks and by the repair handler.
 # Sequences that only occur when UTF-8 bytes were decoded as cp1252. Requiring
 # one of these before attempting a repair keeps the round-trip check below
 # from "fixing" text that merely happens to survive the transform.
+# Two-and-three character sequences that only ever arise from reading UTF-8 as
+# cp1252. Every one begins with Ã / Â / â, because that is what the leading
+# byte of a multi-byte UTF-8 sequence becomes when mis-decoded -- which is also
+# why a bare em-dash or a bare multiplication sign is NOT listed: those are
+# legitimate characters, and matching them would flag correct text as damaged.
+#
+# The list was incomplete, and silently so. The sequence for a multiplication
+# sign was missing, so eleven entries across two stores read "-10 <mojibake>
+# min(...)" and neither verify_quality nor repair_mojibake could see them:
+# looks_like_mojibake GATES the repair, so a marker this list lacks is a field
+# demojibake never even attempts. dec-020 healed 160 entries and left these
+# behind. Found 2026-08-05 by a second detector disagreeing with this one.
 _MOJIBAKE_MARKERS = (
-    "â€",      # â€  - the em/en-dash and smart-quote family
-    "Ã©",      # Ã©  - accented latin
-    "Ã¨",      # Ã¨
-    "Ã¼",      # Ã¼
-    "Ã±",      # Ã±
-    "â",      # â„  - trademark/numero
-    "â",      # â ˆ - maths
-    "Â ",      # Â   - non-breaking space
-    "Â·",      # Â·
+    "â€",        # em/en-dash and smart-quote family
+    "Ã©",        # accented latin: e-acute
+    "Ã¨",        # e-grave
+    "Ã¼",        # u-umlaut
+    "Ã±",        # n-tilde
+    "Ã ",        # a-grave
+    "Ã´",        # o-circumflex
+    "Ã¶",        # o-umlaut
+    "Ã¤",        # a-umlaut
+    "Ã—",        # multiplication sign
+    "Ã·",        # division sign
+    "â„",        # trademark / numero
+    "âˆ",        # maths
+    "Â ",        # non-breaking space
+    "Â·",        # middle dot
+    "Â«",        # guillemets
+    "Â»",
+    "Â°",        # degree
+    "Â±",        # plus-minus
 )
 
 
+# The structural rule the enumerated list above is only a fast path for.
+#
+# Every multi-byte UTF-8 sequence starts with a byte in 0xC2-0xF4, which cp1252
+# renders as Ã, Â or â. Its continuation bytes are all >= 0x80, which cp1252
+# renders as some other non-ASCII character. So mojibake is ALWAYS "one of
+# Ã/Â/â immediately followed by another non-ASCII character" -- and correct
+# text almost never is, because a real â or é is followed by an ordinary
+# letter ("château", "café").
+#
+# This exists because the enumerated list came up short four separate times in
+# one session -- the multiplication sign, then the maths minus, then the arrow.
+# Each miss was silent and each cost real repairs, because looks_like_mojibake
+# GATES demojibake (con-016-16be). Enumerating a set that the world keeps
+# adding to is the wrong shape of solution; deriving it is the right one.
+#
+# Over-detection is cheap and safe: demojibake still refuses anything that does
+# not survive the exact-inverse round trip, so a false positive here costs one
+# wasted encode attempt and never a wrong repair.
+_MOJIBAKE_LEADS = "ÃÂâ"
+
+
 def looks_like_mojibake(text):
-    """Cheap pre-filter: does this string carry a known misdecode signature?"""
-    return isinstance(text, str) and any(m in text for m in _MOJIBAKE_MARKERS)
+    """Does this string carry a misdecode signature?
+
+    Fast path is the enumerated list; the structural rule catches the rest.
+    """
+    if not isinstance(text, str):
+        return False
+    if any(m in text for m in _MOJIBAKE_MARKERS):
+        return True
+    for i, ch in enumerate(text[:-1]):
+        if ch in _MOJIBAKE_LEADS and ord(text[i + 1]) > 127:
+            return True
+    return False
 
 
 def demojibake(text):
