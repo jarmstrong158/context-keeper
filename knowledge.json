@@ -191,7 +191,7 @@
       "type": "memory",
       "kind": "decision",
       "content": "Dual-write mirror for context-keeper, local store canonical",
-      "why": "Dual-write mirror with the LOCAL store as single source of truth. Transport is the context-keeper-remote Cloudflare Worker's stateless JSON-RPC MCP endpoint (POST /mcp/<token>): mirror-out calls its import_entries tool (preserves ids, SKIPS existing ones = additive), pull calls query_entries and merges additively. Local-canonical keeps the offline path unchanged and avoids conflict resolution \u00e2\u20ac\u201d the remote is a sync surface, never the authority. Push is fire-and-forget with a local queue fallback so the network can never affect a local write. stdlib urllib only; the auth token is the final URL path segment so there is no secret in code and no auth header.",
+      "why": "Dual-write mirror with the LOCAL store as single source of truth. Transport is the context-keeper-remote Cloudflare Worker's stateless JSON-RPC MCP endpoint (POST /mcp/<token>): mirror-out calls its import_entries tool (preserves ids, SKIPS existing ones = additive), pull calls query_entries and merges additively. Local-canonical keeps the offline path unchanged and avoids conflict resolution — the remote is a sync surface, never the authority. Push is fire-and-forget with a local queue fallback so the network can never affect a local write. stdlib urllib only; the auth token is the final URL path segment so there is no secret in code and no auth header.",
       "tags": [
         "mirror",
         "architecture",
@@ -224,7 +224,7 @@
       "type": "memory",
       "kind": "decision",
       "content": "Mirror propagates edits/deprecations both ways via a remote upsert_entries tool + timestamp-based (newest-wins) merge, replacing the old additive-only sync.",
-      "why": "Last-writer-wins keyed on updated_at is the minimum mechanism that lets a lifecycle change cross the mirror without a central lock or clock. A new remote upsert_entries tool (same input shape as import_entries) inserts new ids and replaces an existing id only when the incoming updated_at is strictly newer, else skips; it never deletes, so deprecation rides across naturally as a status change. pull_remote mirrors the same rule locally: a newer remote row replaces the local copy, a newer local copy is kept and pushes back on its next write. To keep the data-loss guarantee that the old additive rule provided by refusing to overwrite, an overwrite whose loser differed in substance (not just timestamps) is appended to .context/.mirror_conflicts.json \u00e2\u20ac\u201d the information is preserved even though last-writer-wins already resolved the winner.",
+      "why": "Last-writer-wins keyed on updated_at is the minimum mechanism that lets a lifecycle change cross the mirror without a central lock or clock. A new remote upsert_entries tool (same input shape as import_entries) inserts new ids and replaces an existing id only when the incoming updated_at is strictly newer, else skips; it never deletes, so deprecation rides across naturally as a status change. pull_remote mirrors the same rule locally: a newer remote row replaces the local copy, a newer local copy is kept and pushes back on its next write. To keep the data-loss guarantee that the old additive rule provided by refusing to overwrite, an overwrite whose loser differed in substance (not just timestamps) is appended to .context/.mirror_conflicts.json — the information is preserved even though last-writer-wins already resolved the winner.",
       "tags": [
         "mirror",
         "sync",
@@ -439,7 +439,7 @@
       "type": "memory",
       "kind": "constraint",
       "content": "Mirror must fail soft (never block or fail a local write), never delete, and contain no secrets in code. The merge is timestamp-based newest-wins (was additive-only): an overwrite is allowed only when the incoming updated_at is strictly newer, and the losing version of any substantive overwrite is preserved to .context/.mirror_conflicts.json.",
-      "why": "The local store is canonical and must keep working offline. If a mirror push could raise, a remote outage would break record_*/update_entry/deprecate_entry \u00e2\u20ac\u201d the exact operations that must always succeed, so push failures queue and log but never propagate. The old rule forbade overwriting a local id at all, which guaranteed no data loss but also froze edits/deprecations out of the mirror (see dec-013). It is replaced by newest-wins: a stale or malicious remote still cannot clobber a newer local entry (its older updated_at loses), and any overwrite that changes substance is logged to .mirror_conflicts.json so nothing is silently lost. The mirror never deletes (deprecation is a status change). Remote URL and token come from env vars only, so publishing the repo leaks nothing.",
+      "why": "The local store is canonical and must keep working offline. If a mirror push could raise, a remote outage would break record_*/update_entry/deprecate_entry — the exact operations that must always succeed, so push failures queue and log but never propagate. The old rule forbade overwriting a local id at all, which guaranteed no data loss but also froze edits/deprecations out of the mirror (see dec-013). It is replaced by newest-wins: a stale or malicious remote still cannot clobber a newer local entry (its older updated_at loses), and any overwrite that changes substance is logged to .mirror_conflicts.json so nothing is silently lost. The mirror never deletes (deprecation is a status change). Remote URL and token come from env vars only, so publishing the repo leaks nothing.",
       "tags": [
         "mirror",
         "sync",
@@ -470,7 +470,7 @@
       "type": "memory",
       "kind": "constraint",
       "content": "Mirror HTTP requests to the remote Worker must send an explicit User-Agent header (never urllib's default)",
-      "why": "Cloudflare fronts the context-keeper-remote Worker and its bot-fight rules block urllib's default User-Agent (Python-urllib/x.y) with HTTP 403 \"error 1010\" (browser/bot signature ban). Without an explicit User-Agent, every mirror request \u00e2\u20ac\u201d import_entries, query_entries, backfill \u00e2\u20ac\u201d fails, so mirroring silently degrades to queue-only and no data ever reaches the remote. Setting any normal-looking User-Agent on the single _rpc_call request path fixes it.",
+      "why": "Cloudflare fronts the context-keeper-remote Worker and its bot-fight rules block urllib's default User-Agent (Python-urllib/x.y) with HTTP 403 \"error 1010\" (browser/bot signature ban). Without an explicit User-Agent, every mirror request — import_entries, query_entries, backfill — fails, so mirroring silently degrades to queue-only and no data ever reaches the remote. Setting any normal-looking User-Agent on the single _rpc_call request path fixes it.",
       "tags": [
         "mirror",
         "cloudflare",
