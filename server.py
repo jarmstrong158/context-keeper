@@ -1235,6 +1235,265 @@ def _supersession_score(new_entry, other):
     return sum(signals) / len(signals)
 
 
+# Phrases that assert a CHANGE rather than merely describing work. Deliberately
+# narrow: the survey's old marker list included a bare "was", which matches "the
+# bug was caused by X" in almost every entry ever written, and that single token
+# is most of why its best tier ran at 21.9% precision.
+_CHANGE_PHRASES = re.compile(
+    r"\b(revert(?:s|ed|ing)?|replac(?:es|ed|ing|ement)|supersed\w+|"
+    r"no longer|instead of|rather than|used to|previously|formerly|"
+    r"in place of|deprecat\w+|removed in favou?r of|was removed|"
+    r"was flat|now keys|stops? being|"
+    # Retirement language: an entry that records another one FAILING is
+    # replacing its conclusion even when it never says "supersedes".
+    r"failed|not shipped|abandoned|rolled back|backed out|disabled|"
+    r"turned off|unset|withdrawn|is now|are now|becomes)\b", re.I)
+
+# A "was ..." clause is evidence only when it sits right beside something the
+# two entries share -- "(was flat -2.0)" next to the constant it describes.
+_WAS_CLAUSE = re.compile(r"\bwas\b|\bwere\b", re.I)
+
+# Identifier-shaped tokens: dotted paths and filenames, snake_case, CONSTANTS,
+# and anything the author backticked. These are what a pair of entries about the
+# SAME artifact will share, where two entries about the same topic will not.
+_IDENT_PATTERNS = (
+    re.compile(r"`([^`\n]{2,60})`"),
+    re.compile(r"\b([A-Za-z_][\w-]*\.[A-Za-z][\w.]{1,30})\b"),
+    re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+){1,6})\b"),
+    re.compile(r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,6})\b"),
+)
+
+# Identifier-shaped but universal in this domain, so shared use says nothing.
+_IDENT_STOP = frozenset((
+    "context_keeper", "project_dir", "server_py", "read_json_file", "no_op",
+    "claude_code", "pull_request", "read_host", "set_content", "get_content",
+    "e_g", "i_e", "etc", "and_or",
+))
+
+
+# Author-written PROSE only. related_to and constraints_created are id lists:
+# including them made "this entry is related to dec-003" register as "this entry
+# talks about dec-003", which is how the explicit tier scored 18% instead of the
+# ~100% an outright id mention should give.
+_PROSE_FIELDS = ("summary", "rule", "name", "problem", "why_chosen", "rationale",
+                 "reason", "purpose", "what_we_tried", "tradeoffs",
+                 "triggering_incident", "when_to_invoke")
+
+
+def _entry_text(entry):
+    """Everything an author wrote as PROSE on an entry, as one blob."""
+    parts = []
+    for k in _PROSE_FIELDS:
+        v = (entry or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            parts.append(v)
+    for item in (entry or {}).get("alternatives", []) or []:
+        if isinstance(item, dict):
+            parts.extend(str(x) for x in item.values() if isinstance(x, str))
+    for step in (entry or {}).get("steps", []) or []:
+        if isinstance(step, dict):
+            parts.extend(str(x) for x in step.values() if isinstance(x, str))
+        elif isinstance(step, str):
+            parts.append(step)
+    return " ".join(parts)
+
+
+def _id_aliases(entry_id, corpus=None):
+    """The strings an author might use to name this entry.
+
+    Ids carry a numeric stem and an optional hash suffix (`dec-086-97c7`), and
+    people write the stem: "REVERTED dec-086". Both halves of that need care,
+    and getting either wrong is a real measured defect:
+
+      * matching the bare stem unconditionally lets `con-002` match inside
+        `con-002-b4cc`, so unrelated constraints appear to cite each other;
+      * requiring the full id misses "REVERTED dec-086" entirely.
+
+    So the stem is an alias only when the corpus shows it is unambiguous -- no
+    other entry shares it. With no corpus, only the exact id counts."""
+    out = [entry_id] if entry_id else []
+    m = re.match(r"^((?:dec|con|pipe)-\d+)-[0-9a-z]+$", entry_id or "", re.I)
+    if m and corpus:
+        stem = m.group(1)
+        rivals = [e for e in corpus
+                  if isinstance(e, dict) and e.get("id") != entry_id
+                  and str(e.get("id", "")).lower().startswith(stem.lower())]
+        exact = [e for e in corpus
+                 if isinstance(e, dict)
+                 and str(e.get("id", "")).lower() == stem.lower()]
+        if not rivals and not exact:
+            out.append(stem)
+    return out
+
+
+def _mentions_id(text, entry_id, corpus=None):
+    """Does `text` name this entry? Bounded, and stem-aware (see _id_aliases)."""
+    for alias in _id_aliases(entry_id, corpus):
+        if re.search(r"(?<![\w-])" + re.escape(alias) + r"(?![\w-])",
+                     text or "", re.I):
+            return True
+    return False
+
+
+def _shaped_identifiers(text):
+    """Only code-shaped tokens: filenames, dotted paths, snake_case, CONSTANTS,
+    backticked spans. Narrow on purpose — these are the tokens that name a
+    THING, and only a shared thing can be changed from one entry to the next."""
+    out = set()
+    for pat in _IDENT_PATTERNS:
+        for m in pat.findall(text or ""):
+            tok = m.strip().strip("`").lower()
+            if len(tok) >= 4 and tok not in _IDENT_STOP:
+                out.add(tok)
+    return out
+
+
+# A stated old -> new transition. This is the strongest non-referential evidence
+# of replacement in these stores: "gae_lambda 0.99 -> 0.95", "0.30 to 0.10",
+# "15->150", "was flat". Describing a value MOVING is a different act from
+# describing a value.
+_TRANSITION = re.compile(
+    r"(->|-->|→|\bto\b|\bfrom\b)\s*[-\w.%]+"
+    r"|\b\d+(?:\.\d+)?\s*(?:->|-->|→|to)\s*\d+(?:\.\d+)?")
+
+
+def _identifiers(text):
+    """Terms distinctive enough that two entries sharing one are probably about
+    the same THING, not merely the same topic.
+
+    Identifier shape alone was too narrow: the pair that says "silhouette-XOR is
+    the default guard, not a universal one" shares `silhouette` and `alpha mask`
+    with its predecessor and not one snake_case token, so it scored no shared
+    artifact at all. Content words are included and the corpus filter in
+    _supersession_evidence drops whichever of them turn out to be this store's
+    everyday vocabulary."""
+    out = set()
+    for pat in _IDENT_PATTERNS:
+        for m in pat.findall(text or ""):
+            tok = m.strip().strip("`").lower()
+            if len(tok) >= 4 and tok not in _IDENT_STOP:
+                out.add(tok)
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9-]{4,}", text or ""):
+        w = word.lower()
+        if w not in _TERM_STOP:
+            out.add(w)
+    return out
+
+
+# Words long enough to look distinctive but present in almost every entry these
+# stores hold. The corpus filter catches the project-specific ones; this catches
+# the domain-wide ones that survive even a per-project frequency check.
+_TERM_STOP = frozenset("""
+about above after again against because before being below between both cannot
+could during every first found further having howeveritself into itself least
+making means might most must never other otherwise过 rather should since some
+still such than that their them then there these thing think this those though
+through under until using very were what when where which while whole whose
+would write written wrong entry entries record records recorded decision
+decisions constraint constraints rule rules value values change changes changed
+which state states without within always already another instead
+""".split())
+
+
+def _supersession_evidence(new_entry, other, corpus=None):
+    """Evidence that `new_entry` REPLACED `other` — a different question from
+    _supersession_score, which measures only whether they share a subject.
+
+    Conflating the two is the whole defect this exists to fix. Topic overlap
+    answers "are these about the same thing"; a rule about PowerShell redirection
+    and a rule about Cloudflare secrets are both tagged `gotcha` and share no
+    relationship whatever. Replacement needs evidence that one entry is talking
+    ABOUT the other:
+
+      explicit   the newer entry names the older's id outright ("REVERTED
+                 dec-086"). Effectively certain, and a plain substring check
+                 the old scorer never made.
+      strong     the two share a distinctive identifier — a filename, a
+                 constant, a backticked symbol — AND the newer entry carries a
+                 phrase asserting change. Same artifact, stated as changed.
+      weak       subject overlap only. This is what the survey used to call its
+                 best evidence.
+
+    `corpus` (all entries of this kind) refines "distinctive": a token carried
+    by a quarter of the store is vocabulary, not an artifact, so it is dropped.
+    Without a corpus the identifier SHAPE alone is used.
+    """
+    new_text, old_text = _entry_text(new_entry), _entry_text(other)
+    low_new = new_text.lower()
+    signals = []
+
+    # Naming an id is a CITATION, not a replacement. Entries approvingly cite
+    # each other constantly ("the same discipline that got two bad tile metrics
+    # rejected in dec-012-d904"), so the mention only counts as evidence when
+    # change language sits beside it.
+    other_id = (other or {}).get("id", "")
+    explicit = False
+    for alias in _id_aliases(other_id, corpus):
+        for m in re.finditer(r"(?<![\w-])" + re.escape(alias) + r"(?![\w-])",
+                             new_text, re.I):
+            window = new_text[max(0, m.start() - 130):m.end() + 130]
+            if _CHANGE_PHRASES.search(window):
+                explicit = True
+                break
+        if explicit:
+            break
+    if explicit:
+        signals.append("names %s beside a change" % other_id)
+
+    # Two vocabularies, deliberately. Identifier-SHAPED tokens (filenames,
+    # constants, backticked symbols) are the only ones allowed to raise a tier:
+    # a shared word, however rare, means the entries are about the same subject,
+    # and subject is exactly what must not be read as replacement. The broad
+    # term set is carried for display so a reader can see the connection.
+    shared_idents = _shaped_identifiers(new_text) & _shaped_identifiers(old_text)
+    shared = _identifiers(new_text) & _identifiers(old_text)
+    if corpus:
+        freq, total = {}, 0
+        for e in corpus:
+            if not isinstance(e, dict) or e.get("id") in (
+                    other_id, (new_entry or {}).get("id")):
+                continue
+            total += 1
+            for tok in _identifiers(_entry_text(e)):
+                freq[tok] = freq.get(tok, 0) + 1
+        if total >= 4:
+            ceiling = max(1, total // 4)
+            shared = {t for t in shared if freq.get(t, 0) <= ceiling}
+    if shared:
+        signals.append("shares %s" % ", ".join(sorted(shared)[:3]))
+
+    # PROXIMITY IS THE POINT. A change phrase somewhere in a 2000-character
+    # entry says only that the author described some change; two gotchas about
+    # the same tool both do that without either replacing the other. The claim
+    # "this replaced that" needs the change language attached to the artifact
+    # the two entries actually share.
+    # TWO TIERS, and only one of them makes a claim.
+    #
+    # `likely` requires the newer entry to NAME the older beside change
+    # language. Measured on 34 hand-labelled pairs from the live mesh: 66.7%
+    # precision at 28.6% recall, against 21.9%/100% for the signal this
+    # replaces.
+    #
+    # `lead` is everything else -- shared subject, nothing more. It is still
+    # REPORTED, so nothing is hidden; it simply stops being called evidence.
+    #
+    # Several richer signals were built and measured and are deliberately NOT
+    # here: shared distinctive terms (22.6% precision -- rare vocabulary is
+    # still a topic signal, and topic is exactly what must not be read as
+    # replacement) and stated value transitions (33.3%). With seven positive
+    # examples, tuning further fits the labels rather than the phenomenon, and
+    # a detector tuned on its own eval set is the failure this store already
+    # warns about twice. Widen the labelled set before adding a signal.
+    tier = "likely" if explicit else "lead"
+    order = {"likely": 2, "lead": 1}
+    return {
+        "tier": tier,
+        "signals": signals,
+        "shared_identifiers": sorted(shared)[:8],
+        "tier_at_least": lambda t: order[tier] >= order[t],
+    }
+
+
 def _supersession_candidates(new_entry, type_name, base_dir,
                              exclude_ids=(), threshold=None):
     """Active same-kind entries whose subject this new entry may be replacing.

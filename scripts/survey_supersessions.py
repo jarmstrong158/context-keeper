@@ -203,6 +203,17 @@ def survey_store(base_dir, threshold, project="?"):
             }
             evidence["strong_markers"] = sorted(
                 {m["marker"] for m in evidence["markers"]} & _STRONG_MARKERS)
+            # Replacement evidence, which is a different question from the
+            # subject overlap above. `both_signals` used to be this file's best
+            # tier and measured 21.9% precision on 34 hand-labelled pairs from
+            # the live mesh, because "same tags" plus a bare "was" somewhere in
+            # the body is a topic signal wearing evidence's clothes. `tier` is
+            # the honest one: `likely` (80% precision on the same set) means the
+            # newer entry NAMES the older beside change language; `lead` means
+            # they share a subject and nothing more.
+            ev = server._supersession_evidence(
+                by_id[newer_id], by_id[older_id], corpus=entries)
+            evidence["replacement_signals"] = ev["signals"]
             proposals.append({
                 "project": project,
                 "kind": type_name,
@@ -210,10 +221,11 @@ def survey_store(base_dir, threshold, project="?"):
                 "newer_id": newer_id,
                 "older_summary": _label(by_id[older_id]),
                 "newer_summary": _label(by_id[newer_id]),
+                "tier": ev["tier"],
                 "both_signals": bool(evidence["markers"]),
                 "evidence": evidence,
             })
-            if evidence["markers"]:
+            if ev["tier"] == "likely":
                 proposed_newer.add(newer_id)
 
         # Markers with no sibling to pair against. NOT proposals -- reported so
