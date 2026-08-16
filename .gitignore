@@ -32,3 +32,13 @@ evals/.emb_cache.json
 # .context (the embedding path caches embeddings.json next to the entries it
 # embeds). Rebuilt on demand; the warm embedding cache lives here too.
 evals/.snapshots/
+
+# cambium's LOCAL knowledge store. Local scope is documented as "yours; not
+# shared" but physically lives in the project repo, and this repo is public --
+# so the two statements contradict each other, invisibly, for exactly as long as
+# the store stays empty of cross-project captures. It was harmless while it held
+# only this project's own knowledge; the first session that captured across the
+# mesh put references to several other projects in it, one of which has no
+# remote at all. Same rule as con-015-12da. Knowledge that should travel goes to
+# team or org scope, which have their own repos and their own gates.
+.cambium/knowledge.json
