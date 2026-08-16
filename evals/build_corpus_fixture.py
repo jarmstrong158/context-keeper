@@ -29,6 +29,7 @@ applies with more force to vendoring the entries themselves.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -45,6 +46,11 @@ STORES = ("context-keeper", "Clark", "Conductor", "cambium",
 # the place a remote URL would live).
 ENTRY_FILES = ("decisions.json", "pipelines.json", "constraints.json")
 
+# Repo names that are also ordinary English words. Matching these by name would
+# fire on almost every entry, so the scan reports them as UNCHECKED instead of
+# crying wolf. Keep it short and justify each addition.
+_COMMON_WORDS = {"knowledge", "logs", "docs", "notes", "tools", "scratch"}
+
 
 def _is_public(store):
     """Refuse to vendor a private or remote-less project's entries."""
@@ -58,6 +64,66 @@ def _is_public(store):
     if out.returncode != 0:
         return None
     return out.stdout.strip().upper() == "PUBLIC"
+
+
+def _nonpublic_projects():
+    """Every project on this machine that is NOT public: private repos, and any
+    directory with no remote at all. Derived, never hand-listed — a hand-listed
+    set is one `gh repo create --private` away from being wrong."""
+    names = set()
+    for name in sorted(os.listdir(REPOS)):
+        path = os.path.join(REPOS, name)
+        if not os.path.isdir(os.path.join(path, ".git")):
+            continue
+        remote = subprocess.run(["git", "-C", path, "remote"],
+                                capture_output=True, text=True, timeout=20)
+        if not remote.stdout.strip():
+            names.add(name)                      # no remote at all
+            continue
+        vis = subprocess.run(
+            ["gh", "repo", "view", f"jarmstrong158/{name}", "--json", "visibility",
+             "-q", ".visibility"], capture_output=True, text=True, timeout=25)
+        if vis.returncode != 0 or vis.stdout.strip().upper() != "PUBLIC":
+            names.add(name)                      # private, or cannot tell
+    return names
+
+
+def _scan_for_nonpublic_mentions():
+    """A PUBLIC store's entries can still describe a PRIVATE project.
+
+    The store-level check above asks "may we vendor this project's entries"; it
+    cannot ask "do those entries talk about somebody else". They do: a public
+    project's decision described a private game's sprite generator by filename,
+    and another detailed a private repo's dependency bug. Both were committed
+    and pushed here before anyone looked.
+
+    So the copied fixture is scanned for the NAME of every non-public project on
+    the machine, and a hit fails the build. Names are matched on word boundaries
+    so a substring inside an unrelated word does not fire."""
+    nonpublic = _nonpublic_projects()
+    if not nonpublic:
+        return [], []
+    # A project whose name is also an ordinary word cannot be found by name:
+    # `knowledge` is a private repo AND appears in dozens of entries as plain
+    # English ("the knowledge layer", "knowledge.json"). Scanning for it fires on
+    # nearly every file, and a check that fires everywhere is not a check. Those
+    # names are returned as UNCHECKED so the gap is stated rather than hidden.
+    unscannable = sorted(n for n in nonpublic if n.lower() in _COMMON_WORDS)
+    scannable = nonpublic - set(unscannable)
+    hits = []
+    for base, _dirs, files in os.walk(CORPUS):
+        for fname in files:
+            path = os.path.join(base, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    blob = f.read()
+            except OSError:
+                continue
+            for proj in scannable:
+                if re.search(r"(?<![\w-])" + re.escape(proj) + r"(?![\w-])",
+                             blob, re.I):
+                    hits.append((os.path.relpath(path, HERE), proj))
+    return hits, unscannable
 
 
 def build(check_visibility=True):
@@ -99,6 +165,22 @@ def build(check_visibility=True):
                        "_note": "Frozen eval corpus. Not live state."}, f, indent=2)
         total += n
         print("  %-18s %4d entries" % (store, n))
+
+    if check_visibility:
+        hits, unchecked = _scan_for_nonpublic_mentions()
+        if unchecked:
+            print("\n  NOT CHECKED (name is an ordinary word): %s"
+                  % ", ".join(unchecked))
+        if hits:
+            shutil.rmtree(CORPUS, ignore_errors=True)
+            print("\nREFUSING: the frozen corpus names non-public projects.")
+            for path, proj in sorted(set(hits)):
+                print("   %-56s mentions %s" % (path, proj))
+            raise SystemExit(
+                "\nA public store's entries can still describe a private one "
+                "(con-015-12da). Redact those entries, drop the store, or "
+                "re-run with --no-visibility-check having checked by hand.")
+
     print("frozen corpus: %d entries across %d stores" % (total, len(STORES)))
     return total
 
