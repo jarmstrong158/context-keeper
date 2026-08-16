@@ -42,7 +42,6 @@
     "verified_sha": "25857be93e5fd1803b5386cfc62974394e7f5f3b"
   },
   {
-    "id": "con-003",
     "rule": "Keep server.json's top-level description at 100 characters or fewer - the MCP registry rejects longer ones at publish time.",
     "reason": "The official MCP registry (registry.modelcontextprotocol.io) validates body.description with expected length <= 100 and returns HTTP 422, so a longer description blocks the entire version publish.",
     "triggering_incident": "Publishing v0.5.0 on 2026-07-02: the first publish attempt failed with 422 'expected length <= 100' because the description was 193 chars. The 0.2.0-era registry accepted it, so the limit was added between April and July 2026.",
@@ -55,10 +54,11 @@
       "publishing"
     ],
     "schema_version": 4,
-    "status": "active",
     "created_at": "2026-07-02T23:58:21.312952+00:00",
     "verified_at": "2026-07-02T23:58:21.312952+00:00",
-    "updated_at": "2026-07-02T23:58:21.312952+00:00"
+    "id": "con-003",
+    "status": "active",
+    "updated_at": "2026-07-10T12:40:41.013Z"
   },
   {
     "id": "con-004",
@@ -80,7 +80,6 @@
     "updated_at": "2026-07-25T20:32:32.663961+00:00"
   },
   {
-    "id": "con-005",
     "rule": "Never bulk-edit repo text files with PowerShell Get-Content/Set-Content. Use the Edit tool or a Python script for text transformations.",
     "reason": "Windows PowerShell 5.1 reads BOM-less UTF-8 files as cp1252 and Set-Content -Encoding utf8 writes a BOM, so a simple find-replace bakes mojibake into every non-ASCII character (em-dash becomes a-circumflex euro quote) and the BOM breaks json.load on data files.",
     "triggering_incident": "v0.7.1 version bump via Get-Content -Raw / -replace / Set-Content corrupted every em-dash in server.py and added BOMs to server.json and pyproject.toml. Recovered by inverting the encoding (text.encode cp1252 then decode utf-8) and stripping BOMs - the corruption is exactly invertible if caught before further edits.",
@@ -94,10 +93,11 @@
       "tooling"
     ],
     "schema_version": 4,
-    "status": "active",
     "created_at": "2026-07-03T01:55:17.190587+00:00",
     "verified_at": "2026-07-03T01:55:17.190587+00:00",
-    "updated_at": "2026-07-03T01:55:17.190587+00:00"
+    "id": "con-005",
+    "status": "active",
+    "updated_at": "2026-07-10T12:40:41.121Z"
   },
   {
     "id": "con-006",
@@ -256,7 +256,7 @@
     "id": "con-011-76f8",
     "rule": "Constraint scope matching must compare whole path COMPONENTS, never raw substrings. Every surface that decides \"does this scope cover this file\" (the scope_guard hook, the .claude/rules/ projection's glob patterns, work_focus) must agree on the answer.",
     "reason": "A substring test silently over-matches: `src/` matches `mysrc/main.py`, `hooks/` matches `webhooks/send.py`, `server.py` matches `test_server.py`. The damage is not the stray message. scope_guard injects each constraint at most once per session, so a false positive MARKS THAT CONSTRAINT DELIVERED - and the file it actually governs then never receives it for the rest of the session. An over-eager match therefore causes a silent under-delivery, which is the opposite of what the loose match looks like it is doing. Surfaces that disagree about coverage are worse still: one of them is claiming protection the other does not provide.",
-    "triggering_incident": "Observed live on 2026-08-01: a vanguard constraint scoped to `hooks/` fired on a scratchpad file whose absolute path merely contained the substring. A 7-case probe then showed 3 false positives. The bug dated from v0.6 and was tolerable while scope_guard ran on PostToolUse (a stray rule after the fact is noise); moving it to PreToolUse in v0.16 turned it into a rule stated before an unrelated edit, spending the constraint. Fixed in b6cdc6c by matching components, with a file scope matching the path tail exactly and a directory scope requiring at least one component after it.",
+    "triggering_incident": "Observed live on 2026-08-01: a <private-project> constraint scoped to `hooks/` fired on a scratchpad file whose absolute path merely contained the substring. A 7-case probe then showed 3 false positives. The bug dated from v0.6 and was tolerable while scope_guard ran on PostToolUse (a stray rule after the fact is noise); moving it to PreToolUse in v0.16 turned it into a rule stated before an unrelated edit, spending the constraint. Fixed in b6cdc6c by matching components, with a file scope matching the path tail exactly and a directory scope requiring at least one component after it.",
     "enforced_by": "tests/test_server.py::TestScopeCovers",
     "scope": "hooks/",
     "hardness": "absolute",
@@ -388,8 +388,8 @@
   {
     "id": "con-015-12da",
     "rule": "Never commit anything derived from OTHER projects' .context stores into this repo. It is public, and the machine's stores include private repos and local-only projects with no remote. Tools that read every store (scripts/survey_supersessions.py) must default their output to a gitignored path, and evals/retrieval_golden.json may only draw cases from stores whose project repo is public.",
-    "reason": "This repo is published to PyPI and the MCP registry and its GitHub remote is public. Cross-store tooling is genuinely useful and inherently reads projects that are not public: on this machine that is 23 stores, of which vanguard is a private repo and aethermoor has no remote at all. Any artifact those tools emit -- a proposal list, an eval fixture, a golden-set case, a README table of examples -- quotes the entries it found, so committing one publishes another project's design history as a side effect of a chore in this one. The failure is silent and one-way: nothing in the tool, the test suite or code review flags it, and once pushed to a public remote it cannot be reliably unpublished.",
-    "triggering_incident": "2026-08-05, during the v0.19 supersession work. scripts/survey_supersessions.py defaulted its output to docs/supersession_backfill_proposal.md and that file was committed and pushed to a public branch (PR #17, commit 0539373). It contained 33 lines quoting aethermoor (local-only, no remote) and vanguard (private repo) decision text -- skill-chain and quest design for an unreleased game. The first draft of evals/retrieval_golden.json then repeated the mistake with 5 vanguard cases whose queries and notes paraphrased private entries. Caught only because building the eval prompted a check of which source repos were actually public. Fixed by moving the survey's default output to a gitignored .supersession_proposal.md, dropping the private stores from the golden set, amending the commit so the file was never in it, and force-pushing (0539373 -> 700c480). The exposure window was roughly 35 minutes; the orphaned commit may still be reachable by SHA on GitHub until it is garbage-collected.",
+    "reason": "This repo is published to PyPI and the MCP registry and its GitHub remote is public. Cross-store tooling is genuinely useful and inherently reads projects that are not public: on this machine that is 23 stores, of which <private-project> is a private repo and <private-project> has no remote at all. Any artifact those tools emit -- a proposal list, an eval fixture, a golden-set case, a README table of examples -- quotes the entries it found, so committing one publishes another project's design history as a side effect of a chore in this one. The failure is silent and one-way: nothing in the tool, the test suite or code review flags it, and once pushed to a public remote it cannot be reliably unpublished.",
+    "triggering_incident": "2026-08-05, during the v0.19 supersession work. scripts/survey_supersessions.py defaulted its output to docs/supersession_backfill_proposal.md and that file was committed and pushed to a public branch (PR #17, commit 0539373). It contained 33 lines quoting <private-project> (local-only, no remote) and <private-project> (private repo) decision text -- skill-chain and quest design for an unreleased game. The first draft of evals/retrieval_golden.json then repeated the mistake with 5 <private-project> cases whose queries and notes paraphrased private entries. Caught only because building the eval prompted a check of which source repos were actually public. Fixed by moving the survey's default output to a gitignored .supersession_proposal.md, dropping the private stores from the golden set, amending the commit so the file was never in it, and force-pushing (0539373 -> 700c480). The exposure window was roughly 35 minutes; the orphaned commit may still be reachable by SHA on GitHub until it is garbage-collected.",
     "enforced_by": "Reviewer check: any new file under docs/, evals/fixtures/ or evals/*.json must name only public-repo stores. .gitignore carries .supersession_proposal.md and evals/.snapshots/.",
     "scope": "global",
     "hardness": "absolute",
@@ -416,5 +416,83 @@
     "updated_at": "2026-08-05T14:13:35.560798+00:00",
     "verified_at": "2026-08-05T14:13:35.510216+00:00",
     "verified_sha": "700c480eef47fd6b3a14f436817b5dc2f4a6fede"
+  },
+  {
+    "id": "con-016-16be",
+    "rule": "When a detector gates a repair, the detector's coverage IS the repair's coverage. Prefer a DERIVED rule over an enumerated list, and test both directions -- corrupted input must be detected AND repaired back to the original, and legitimate text using the same characters must not be flagged. Never let a repair path depend on a hand-maintained pattern list that nothing exercises, and never keep more copies of that rule than the dependency graph forces.",
+    "reason": "looks_like_mojibake() gates demojibake(), and demojibake() is what repair_mojibake and verify_quality both call. A sequence missing from _MOJIBAKE_MARKERS is therefore not merely undetected -- it is a field the repair never attempts, and a quality issue verify_quality reports as clean. The failure is silent in the worst way: the tool runs, reports success, and the damage stays. dec-020 healed 160 entries across 8 stores and reported completion while eleven entries carrying the same class of corruption sat untouched, because one sequence was absent from a list of nine.",
+    "triggering_incident": "2026-08-05. cambium's tools/dashboard.py was written with its own inlined marker list and reported 8 mojibake entries that context-keeper's detector called clean. The stored text was U+00C3 U+2014, the mis-decode of the multiplication sign, absent from a nine-entry list -- so looks_like_mojibake returned False, demojibake returned None without trying, and verify_quality reported clean. dec-020 had healed 160 entries and left these. The list was widened to 19 and both directions tested. It then came up short THREE more times in the same session: the maths minus (a third copy of the list, in cambium's repair script, lacked it), then the rightwards arrow (context-keeper's widened list still lacked it, hiding 8 more entries). Enumerating a set the world keeps adding to was the wrong shape of solution. Replaced with a structural rule: every multi-byte UTF-8 sequence begins 0xC2-0xF4 (rendered as one of A-tilde / A-circumflex / a-circumflex by cp1252) and continues with bytes >= 0x80 (also non-ASCII), so mojibake is always a lead character immediately followed by another non-ASCII character, while correct text is not -- a real accented letter is followed by an ordinary one. Over-detection is safe because demojibake still refuses anything failing the exact-inverse round trip. Total repaired across the session: 72 local cambium items, 64 team-branch items, 23 context-keeper entries. The copies were also consolidated -- cambium's two tools now share tools/_mojibake.py, leaving two copies in the world (one per repo) rather than three, because cambium must run when the sibling checkout is absent.",
+    "enforced_by": "tests/test_quality.py::TestDemojibake::test_every_marker_family_round_trips and ::test_legitimate_uses_of_those_characters_are_not_flagged",
+    "scope": "mojibake.py",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-020-9b22",
+      "con-008-dc30",
+      "con-011-76f8"
+    ],
+    "tags": [
+      "mojibake",
+      "detection",
+      "repair",
+      "silent-failure",
+      "encoding"
+    ],
+    "retrieval_hints": [
+      "repair ran but did not fix everything",
+      "verify_quality says clean but the text is garbled",
+      "why is this entry still corrupted",
+      "detector gates the fix",
+      "two detectors disagree"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-06T02:11:10.180016+00:00",
+    "updated_at": "2026-08-06T02:37:59.960345+00:00",
+    "verified_at": "2026-08-06T02:37:59.919622+00:00",
+    "verified_sha": "4e1c27614b0c62afe62b800a086191b12e9200cf"
+  },
+  {
+    "rule": "context-keeper project names are case-sensitive with no normalization. Enumerate via list_projects (or probe the exact on-disk casing) \u2014 never a lowercased guess, which silently returns zero and drops real stores.",
+    "reason": "A lowercase sweep returned 0 for the Title-cased stores Clark and Conductor and dropped them from the org dashboard until re-probed at exact casing.",
+    "tags": [
+      "case-sensitivity",
+      "enumeration",
+      "gotcha"
+    ],
+    "id": "con-009",
+    "status": "active",
+    "created_at": "2026-07-17T19:50:35.491Z",
+    "updated_at": "2026-07-17T19:50:35.491Z"
+  },
+  {
+    "id": "con-017-9acb",
+    "rule": "Never track .cambium/knowledge.json in a PUBLIC repo. cambium's local scope physically lives in the project repo, so in a public project repo it is a publication channel. Gitignore it; knowledge that should travel goes to team or org scope, which have their own repos and gates.",
+    "reason": "cambium documents local scope as \"yours; not shared\", but local scope is a file inside the project repo. For a public repo those two statements contradict each other, and the contradiction is invisible for exactly as long as the store holds only that project's own knowledge. This store was tracked and harmless for months while it held 19 entries distilled from context-keeper itself. The first session that captured across the mesh added seven items carrying references to four other projects, one of which has no remote at all, and they appeared in git status as an ordinary modified file with nothing flagging them. This is con-015-12da's failure mode arriving through a different door: nothing in cambium, the test suite, or code review distinguishes a local store full of this project's knowledge from one full of everyone's.",
+    "triggering_incident": "Found on 2026-08-16 while committing an unrelated fix: the same leak had just been caught and fixed in a sibling public repo minutes earlier, so the staged diff here was scanned for other-project names on the way past. It had them. Untracked with `git rm --cached` (the file stays on disk) and gitignored. Checking the already-committed version showed no historical leak - all 19 public items were this project's own knowledge - so the exposure was prospective only. The scan that caught it was a habit from the previous incident, not a control; there is still nothing automated that would catch the third occurrence.",
+    "enforced_by": "",
+    "scope": ".gitignore",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "publishing",
+      "privacy",
+      "gitignore",
+      "cambium",
+      "silent-failure"
+    ],
+    "retrieval_hints": [
+      "can I commit .cambium/knowledge.json",
+      "cambium local scope in a public repo",
+      "private project names leaking into a public repo",
+      "why is the knowledge store gitignored"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-16T18:17:01.454223+00:00",
+    "updated_at": "2026-08-16T18:17:01.454223+00:00",
+    "verified_at": "2026-08-16T18:17:01.454223+00:00",
+    "verified_sha": "b8d74fba852bdcc35fbdd25871d80b7616d47301"
   }
 ]

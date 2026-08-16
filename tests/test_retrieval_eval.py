@@ -92,10 +92,23 @@ class TestGoldenSetIntegrity:
 
 
 class TestLexicalRetrievalRegression:
-    # Measured 2026-08-05 on the 44 positive cases, lexical arm, token_budget
+    # Measured 2026-08-16 on the 44 positive cases, lexical arm, token_budget
     # 4000, include_related off, against the FROZEN corpus in
-    # evals/fixtures/corpus: recall@5 = 0.473 (hit@5 = 0.568, MRR = 0.409).
+    # evals/fixtures/corpus (192 entries across 7 stores): recall@5 = 0.407.
     # Bit-for-bit reproducible across runs -- nothing in score_entry samples.
+    #
+    # Moved from 0.473 on a deliberate corpus refresh. TWO things changed in
+    # that refresh, so which one moved the number was measured rather than
+    # assumed:
+    #
+    #     corpus growth (a session's new entries)   0.473 -> 0.407   -0.066
+    #     redaction of non-public project names     0.407 -> 0.407    0.000
+    #
+    # All of it is dilution: more entries to rank against, same ranker. The
+    # redaction (build_corpus_fixture replaces private project NAMES with a
+    # placeholder, keeping the surrounding prose) cost exactly nothing, which is
+    # the answer that mattered -- it means the privacy gate is free rather than
+    # paid for in retrieval quality.
     #
     # The first pin was 0.549 against LIVE stores, and it broke within a day
     # without a single line of ranking code changing: recording three new
@@ -113,7 +126,7 @@ class TestLexicalRetrievalRegression:
     # This test OWNS the number (con-009-6bdc). No constraint and no README
     # restates it -- if the value moves, it moves here, deliberately, with the
     # new measurement recorded above.
-    POSITIVE_RECALL_AT_5 = 0.473
+    POSITIVE_RECALL_AT_5 = 0.407
     TOLERANCE = 0.03
 
     def test_positive_recall_at_5_holds(self, harness, lexical_rows):

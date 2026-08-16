@@ -62,7 +62,7 @@
   },
   {
     "id": "dec-003-42ba",
-    "summary": "Landing page (docs/index.html) repositioned around \"one install \u00e2\u2020\u2019 habit by default\": new hero + install command, a \"A week of real use\" section with 4 commit/PR-linked items, two new numbers groups (Mirror, Schema reclaim), grid xylem cell now describes onboarding, meta/OG synced. Shipped to origin/main (44f13a5).",
+    "summary": "Landing page (docs/index.html) repositioned around \"one install \u2192 habit by default\": new hero + install command, a \"A week of real use\" section with 4 commit/PR-linked items, two new numbers groups (Mirror, Schema reclaim), grid xylem cell now describes onboarding, meta/OG synced. Shipped to origin/main (44f13a5).",
     "problem": "The landing page led with \"agents that CAN remember/coordinate/ask\", which undersold the differentiator: the installer's habit layer that makes those behaviors happen BY DEFAULT. It also had no concrete, clickable evidence of real use.",
     "why_chosen": "The habit layer is the actual product wedge (per README tagline), so the hero now leads with \"one install \u2014 by default\" and shows ./install.sh up top. Evidence section uses only verified commits/PRs a skeptic can click (Balatron dec-058/061 LR fix, agentsync two-peer CAS test 8cd14ed, knowledge harvest 132\u21929 via reviewed PRs, agentsync-remote handshake hardening 2a40c92) to keep the page falsifiable. New numbers reuse the existing reveal/count-up mechanism and keep honest-label styling; caveats block left untouched.",
     "what_we_tried": "",
@@ -336,11 +336,12 @@
     "retrieval_hints": [],
     "origin": "agent",
     "schema_version": 4,
-    "status": "active",
-    "superseded_by": null,
+    "status": "superseded",
+    "superseded_by": "dec-013-001d",
     "created_at": "2026-07-21T15:53:29.794162+00:00",
-    "updated_at": "2026-07-21T15:53:29.794162+00:00",
-    "verified_at": "2026-07-21T15:53:29.794162+00:00"
+    "updated_at": "2026-08-16T17:56:07.908843+00:00",
+    "verified_at": "2026-08-16T17:56:07.871355+00:00",
+    "verified_sha": "e0b2cff60672a6f70b195b77cf64960adead0eb8"
   },
   {
     "id": "dec-012-845b",
@@ -499,5 +500,65 @@
     "created_at": "2026-07-24T21:32:19.924104+00:00",
     "updated_at": "2026-07-24T21:32:19.924104+00:00",
     "verified_at": "2026-07-24T21:32:19.924104+00:00"
+  },
+  {
+    "summary": "The observability dashboard is a generic template + zero-dep stdlib generator (xylem_dashboard.py) with a local-first default and an opt-in --remote route; only counts/summaries are baked into the HTML, never a token.",
+    "problem": "The dashboard was hardcoded to one operator's data and needed to work per-user and update over time, without exposing the Worker's secret connector URL.",
+    "why_chosen": "Local-first matches the stack ethos and needs no secret: the local route reads the agentsync branch via git history + scans each clone's .context/ store (+ optional .cambium funnel). The --remote route (list_projects + get_project_summary + survey) gives the full central mirror but reads the token only from the gitignored config and writes only counts/summaries to the self-contained HTML. Specifics live in a JSON data island so template and data are cleanly separated; the author's dashboard is just the template rendered with their data.",
+    "what_we_tried": "A live browser dashboard that fetches the Workers at view time \u2014 rejected because it would embed the token in the page (a leak).",
+    "tradeoffs": "The local route only sees projects cloned on that machine; the Pages copy is a committed snapshot, not continuously live.",
+    "tags": [
+      "dashboard",
+      "generator",
+      "local-first",
+      "no-token",
+      "template"
+    ],
+    "id": "dec-005",
+    "status": "active",
+    "created_at": "2026-07-17T19:50:33.483Z",
+    "updated_at": "2026-07-17T19:50:33.483Z"
+  },
+  {
+    "summary": "The Pages dashboard auto-refreshes via a scheduled GitHub Action that runs the generator's --remote route and commits docs/dashboard.html; connector URLs are Actions secrets, and an empty pull fails the step rather than committing an empty dashboard.",
+    "problem": "The committed dashboard is a static snapshot that goes stale; recording a decision or new coordination doesn't update the public Pages page.",
+    "why_chosen": "A scheduled Action keeps the public snapshot current with no human in the loop. The remote route reads the token from an Actions secret (never committed, never written into the HTML \u2014 only counts/summaries), matching the no-secrets-in-output rule. A guard makes the generator exit non-zero in --remote mode when it collects zero projects and zero events, so a transient Worker outage fails the step and leaves the last good dashboard intact instead of overwriting it with an empty one. The job stays dormant (skips with a notice) until the secrets exist, so it never red-Xes before setup.",
+    "what_we_tried": "A live browser dashboard fetching the Workers at view time (rejected earlier \u2014 token leak); a SessionEnd hook (kept as the option for a personal always-fresh local copy, but it doesn't update the public Pages page).",
+    "tradeoffs": "Runs on a fixed schedule (not event-driven), so the page lags real activity by up to a day; the auto-refreshed feed reflects raw board/registry data, which reads rawer than a hand-curated snapshot.",
+    "tags": [
+      "dashboard",
+      "ci",
+      "github-actions",
+      "automation",
+      "secrets"
+    ],
+    "id": "dec-006",
+    "status": "active",
+    "created_at": "2026-07-17T20:01:18.898Z",
+    "updated_at": "2026-07-17T20:01:18.898Z"
+  },
+  {
+    "summary": "Dashboard remote coordination was empty: agentsync-remote returns results in content[].text not structuredContent, and the history regex dropped releases-with-notes",
+    "why_chosen": "The auto-refreshed remote dashboard rendered its coordination feed/activity/peers empty (0 events, 0 peers) despite agentsync-remote having data, with no error. Two root causes: (1) rpc_call_tool only read result.structuredContent, but agentsync-remote (unlike context-keeper-remote) returns survey/history results ONLY as content[].text (a JSON string), so every agentsync call silently yielded {}; fixed by falling back to json.loads(content[].text) when structuredContent is absent. (2) The history-parsing regex anchored the closing quote to end-of-line (`'(.*)'\\s*$`), so every `releases '<task>' (completion note...)` commit \u2014 the majority of releases \u2014 was dropped; fixed by matching the task lazily up to a closing quote followed by EOL or ` (`, tolerating apostrophes/parens inside the task. Also now always fold survey's current claims into the timeline (not just as a history-empty fallback) so an active in-progress claim with no commit in the fetched window still surfaces as live. Verified live: run #4 collected 43 coordination events / 2 peers (was 0/0), 1 live claim surfaced, junk stores filtered, no secrets leaked (Xylem PR #25, merged 21b3922; refresh commit 32c6c4e).",
+    "id": "dec-007",
+    "status": "active",
+    "created_at": "2026-07-17T20:50:16.552Z",
+    "updated_at": "2026-07-17T20:50:16.552Z"
+  },
+  {
+    "summary": "Packaged the Xylem stack as a Claude Code plugin and turned the repo into its own marketplace (.claude-plugin/marketplace.json sourcing ./plugin)",
+    "why_chosen": "To make the stack installable in two commands (/plugin marketplace add jarmstrong158/xylem; /plugin install xylem@xylem-stack), the repo root now carries a marketplace catalog and a self-contained plugin/. Memory + coordination ship as HTTP MCP servers (context-keeper-remote, agent-sync-remote) configured in plugin/.mcp.json with URL+Bearer-token env vars (CONTEXT_KEEPER_REMOTE_URL/_TOKEN, AGENTSYNC_REMOTE_URL/_TOKEN) \u2014 the Bearer-header convention consistent with dec-004. Knowledge ships via the cambium CLI and is optional: scripts/distill.sh (SessionEnd hook) always exits 0 and no-ops with a one-line note if cambium is absent, so the hook can never fail a session; the three knowledge skills (distill-session, recall-knowledge, promote-to-org) likewise degrade gracefully. SessionStart cats an ASCII-only discipline primer. Seven skills encode the habit (record-decision, recall-context, claim-work, check-conflicts, distill-session, recall-knowledge, promote-to-org), each with YAML frontmatter and metadata.version 0.1.0. KEY GOTCHA worth remembering: the plugin hooks file MUST wrap its events in a top-level \"hooks\" key \u2014 the flat form (SessionStart/SessionEnd at top level) fails `claude plugin validate` with 'hooks: expected record, received undefined'. Both marketplace.json and plugin.json pass `claude plugin validate`. Shipped via PR #30, squash-merged to main (b5ab7a6). No DECISIONS.md in the repo, so nothing to mirror.",
+    "id": "dec-008",
+    "status": "active",
+    "created_at": "2026-07-18T14:30:17.362Z",
+    "updated_at": "2026-07-18T14:30:17.362Z"
+  },
+  {
+    "summary": "Plugin failed to LOAD at runtime despite passing validation: manifest.hooks referencing ./hooks/hooks.json double-loads the auto-loaded standard hooks file \u2014 removed the field",
+    "why_chosen": "`claude plugin validate` passed for both manifests, but a real test-install (claude plugin marketplace add ./ ; install xylem@xylem-stack ; details) surfaced a runtime load failure that validation missed: 'Duplicate hooks file detected: ./hooks/hooks.json resolves to already-loaded file ... The standard hooks/hooks.json is loaded automatically, so manifest.hooks should only reference additional hook files.' Claude Code auto-loads plugin/hooks/hooks.json by convention, so the explicit \"hooks\": \"./hooks/hooks.json\" in plugin.json (from the task's verbatim spec) loaded it a second time and the plugin errored out (Status: failed to load). Fix: remove the hooks field from plugin.json entirely; the standard hooks/hooks.json still loads automatically. After the fix, reinstall showed Status: enabled and `claude plugin details xylem` enumerated all components: Skills (7), Hooks (2: SessionStart, SessionEnd), MCP servers (2: context-keeper-remote, agent-sync-remote). LESSON: `claude plugin validate` checks manifest shape but not the auto-load/duplicate-load rules \u2014 always test-install (marketplace add + install + details) to confirm a plugin actually loads. This is the second deviation from the task's verbatim spec (the first being the required top-level \"hooks\" wrapper in hooks.json, dec-008). Also added a DECISIONS.md to the repo mirroring dec-001..dec-009 so future record-decision calls have a human-readable mirror to sync to.",
+    "id": "dec-009",
+    "status": "active",
+    "created_at": "2026-07-18T14:43:34.865Z",
+    "updated_at": "2026-07-18T14:43:34.865Z"
   }
 ]

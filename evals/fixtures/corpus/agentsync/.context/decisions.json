@@ -65,11 +65,12 @@
     ],
     "origin": "agent",
     "schema_version": 4,
-    "status": "active",
-    "superseded_by": null,
+    "status": "superseded",
+    "superseded_by": "dec-007-635e",
     "created_at": "2026-07-25T13:45:38.391740+00:00",
-    "updated_at": "2026-07-25T13:45:38.391740+00:00",
-    "verified_at": "2026-07-25T13:45:38.391740+00:00"
+    "updated_at": "2026-08-16T17:56:01.821109+00:00",
+    "verified_at": "2026-08-16T17:56:01.775267+00:00",
+    "verified_sha": "4d190adb7f711f5e64eb358612ecabd97c1b2fd5"
   },
   {
     "id": "dec-003-a3f9",
@@ -115,14 +116,14 @@
   {
     "id": "dec-004-c6f5",
     "summary": "Consolidated agentsync client configs onto ONE board with one identity per CLIENT (not per session). Removed the stray repos-root .mcp.json, pinned the Claude Code global entry to the shared board. Per-session agent ids were considered and rejected as unachievable at app scope; collisions are now DETECTED via survey().my_claim rather than prevented.",
-    "problem": "The same local Python server (agentsync_server.py) was configured in three places with three identities and TWO different boards: Claude Desktop's claude_desktop_config.json (jonny-desktop -> agentsync-remote board), Claude Code's ~/.claude/settings.json (claude-code -> NO board set, so board resolution fell back unpredictably), and a stray ~/repos/.mcp.json (jarmstrong -> aethermoor board). The repos-root file was the dangerous one: it sits above EVERY project, so any session started at the repos root would claim on the aethermoor board under a different identity, and neither board would show the conflict. Separately, the Desktop config is app-level - one agent id shared by every session in the app, and MCP server processes are shared across sessions - which is how a balatron claim and a meristem claim both landed under jonny-desktop with the same INSTANCE token, defeating dec-002's shared_id guard.",
-    "why_chosen": "One board, one identity per CLIENT, is the coherent model: jonny-desktop (Desktop app), claude-code (Claude Code CLI), jonny-mobile (Cloudflare Worker) are peers on the shared board, so overlap detection works BETWEEN clients instead of them fighting over one slot. aethermoor keeps its own board deliberately - it is a separate mesh with an external collaborator, not an accident. The repos-root .mcp.json was byte-identical to aethermoor's own .mcp.json, so removing it loses nothing while eliminating the misrouting trap. Per-session identities were rejected: the Desktop app spawns MCP servers from an app-level config and shares processes across sessions, so a distinct id per session is not achievable there without per-project duplicate server entries that every session would then see and have to choose between. Detection (survey().my_claim, dec-003-a3f9) is the proportionate answer given the collision is rare.",
+    "problem": "The same local Python server (agentsync_server.py) was configured in three places with three identities and TWO different boards: Claude Desktop's claude_desktop_config.json (jonny-desktop -> agentsync-remote board), Claude Code's ~/.claude/settings.json (claude-code -> NO board set, so board resolution fell back unpredictably), and a stray ~/repos/.mcp.json (jarmstrong -> <private-project> board). The repos-root file was the dangerous one: it sits above EVERY project, so any session started at the repos root would claim on the <private-project> board under a different identity, and neither board would show the conflict. Separately, the Desktop config is app-level - one agent id shared by every session in the app, and MCP server processes are shared across sessions - which is how a balatron claim and a meristem claim both landed under jonny-desktop with the same INSTANCE token, defeating dec-002's shared_id guard.",
+    "why_chosen": "One board, one identity per CLIENT, is the coherent model: jonny-desktop (Desktop app), claude-code (Claude Code CLI), jonny-mobile (Cloudflare Worker) are peers on the shared board, so overlap detection works BETWEEN clients instead of them fighting over one slot. <private-project> keeps its own board deliberately - it is a separate mesh with an external collaborator, not an accident. The repos-root .mcp.json was byte-identical to <private-project>'s own .mcp.json, so removing it loses nothing while eliminating the misrouting trap. Per-session identities were rejected: the Desktop app spawns MCP servers from an app-level config and shares processes across sessions, so a distinct id per session is not achievable there without per-project duplicate server entries that every session would then see and have to choose between. Detection (survey().my_claim, dec-003-a3f9) is the proportionate answer given the collision is rare.",
     "what_we_tried": "",
     "tradeoffs": "Concurrent sessions in the Claude Desktop app still share the identity jonny-desktop and can still evict each other's claim; my_claim makes that visible but does not prevent it. Accepted because both prevention options add friction to every session for a rare event. If it recurs, revisit per-project server entries. All four configs were backed up as *.20260726-bak before editing; revert is a file copy.",
     "alternatives": [
       {
         "option": "Per-project .mcp.json with distinct AGENTSYNC_AGENT_ID per project",
-        "reason_rejected": "Verified to work for Claude Code project sessions (aethermoor proves it), but the server actually in use is spawned by the Claude Desktop app, which does not read project-scoped configs. It would not have fixed the observed collision."
+        "reason_rejected": "Verified to work for Claude Code project sessions (<private-project> proves it), but the server actually in use is spawned by the Claude Desktop app, which does not read project-scoped configs. It would not have fixed the observed collision."
       },
       {
         "option": "Duplicate agentsync entries per project in the Desktop config",
@@ -186,10 +187,10 @@
   },
   {
     "id": "dec-006-5058",
-    "summary": "Added a Dockerfile so Glama can build and introspect this server. Glama never grades a server it cannot build, which is why agentsync, Conductor and waveform-mcp sat at profile-completion only rather than scoring badly. The three Cloudflare Workers cannot be fixed this way at all.",
+    "summary": "Added a Dockerfile so Glama can build and introspect this server. Glama never grades a server it cannot build, which is why agentsync, Conductor and <private-project> sat at profile-completion only rather than scoring badly. The three Cloudflare Workers cannot be fixed this way at all.",
     "problem": "Six of the ten servers listed on Glama had no grade at all, showing 17-25 percent profile completion. The cause was not poor tool descriptions: Glama runs Tool Definition Quality and Server Coherence scoring off a successful container build and MCP introspection sweep, and per its methodology, maintainers either provide a Dockerfile or Glama infers one, and if inference fails distribution is withheld. No image meant no build, no introspection, and therefore no score.",
     "why_chosen": "Providing the Dockerfile explicitly removes the inference step, which is the only part of the pipeline a maintainer can influence from the repository. Releases themselves are made only through Glama's web admin UI at /admin/dockerfile behind GitHub OAuth, with no API or CLI, so publishing cannot be automated and remains a manual account-holder action. Each image is deliberately minimal, targeting the tools/list introspection that scoring actually needs rather than trying to make every tool functional in a container.",
-    "what_we_tried": "Confirmed containerisability by reading imports rather than assuming. Conductor's server.py imports only the stdlib and the MCP SDK, so its image installs mcp alone rather than requirements.txt, which describes the full desktop app including pystray. waveform-mcp looked impossible at first because pyautogui is a core dependency, but it is imported lazily inside functions and the Windows-only tool modules sit behind a sys.platform guard, so the catalogue builds headless. Docker Desktop's engine would not start on the authoring machine, so the Dockerfiles are NOT build-tested and say so in their own commit message.",
+    "what_we_tried": "Confirmed containerisability by reading imports rather than assuming. Conductor's server.py imports only the stdlib and the MCP SDK, so its image installs mcp alone rather than requirements.txt, which describes the full desktop app including pystray. <private-project> looked impossible at first because pyautogui is a core dependency, but it is imported lazily inside functions and the Windows-only tool modules sit behind a sys.platform guard, so the catalogue builds headless. Docker Desktop's engine would not start on the authoring machine, so the Dockerfiles are NOT build-tested and say so in their own commit message.",
     "tradeoffs": "The three Cloudflare Workers (agentsync-remote, context-keeper-remote, cambium-remote) are structurally unfixable this way: they are not containers, and their auth token IS the URL path segment, so there is no publicly introspectable endpoint to hand a registry. They will stay unscored unless Glama's hosted-connector path is used with a credential, which is a deliberate security trade rather than an oversight.",
     "alternatives": [
       {

@@ -120,13 +120,80 @@ def _scan_for_nonpublic_mentions():
             except OSError:
                 continue
             for proj in scannable:
-                if re.search(r"(?<![\w-])" + re.escape(proj) + r"(?![\w-])",
-                             blob, re.I):
+                if any(re.search(_name_pattern(v), blob, re.I)
+                       for v in _name_variants(proj)):
                     hits.append((os.path.relpath(path, HERE), proj))
     return hits, unscannable
 
 
-def build(check_visibility=True):
+REDACTION = "<private-project>"
+
+
+def _name_variants(name):
+    """The forms a project name actually appears in.
+
+    A repo whose directory name contains a space is written in prose as its pip
+    name (hyphenated), as an identifier (underscored), and often as just its
+    first word. Matching only the directory name misses every one of them."""
+    out = {name}
+    if " " in name:
+        out.add(name.replace(" ", "-"))
+        out.add(name.replace(" ", "_"))
+        first = name.split()[0]
+        if len(first) >= 5:
+            out.add(first)
+    return out
+
+
+def _name_pattern(name):
+    """Bounded on the LEFT, and on the right by anything that is not
+    alphanumeric — so a name matches inside `<name>_module.py` and
+    `<name>-notes.md` but not inside `<name>s`.
+
+    The first version guarded both sides with `(?![\\w-])`, which refused to
+    match inside exactly the compounds that matter: a source filename naming a
+    private project is more revealing than the bare word, and the scan reported
+    the corpus clean while every one of them was still there. Over-redaction is
+    the safe direction here; under-redaction is the one that publishes."""
+    return r"(?<![\w-])" + re.escape(name) + r"(?![A-Za-z0-9])"
+
+
+def _redact_nonpublic():
+    """Replace non-public project NAMES in the vendored copy with a placeholder.
+
+    Only the identifier goes; the surrounding prose stays, so the entry remains
+    exactly as useful as retrieval material and exactly as unhelpful to anyone
+    trying to learn what those projects are. The live stores are never touched —
+    this rewrites the frozen copy under fixtures/ only."""
+    nonpublic = _nonpublic_projects()
+    scannable = {n for n in nonpublic if n.lower() not in _COMMON_WORDS}
+    if not scannable:
+        return 0
+    # Longest first, so a compound name is redacted before a shorter name could
+    # match inside it and leave a fragment behind.
+    ordered = sorted(scannable, key=len, reverse=True)
+    count = 0
+    for base, _dirs, files in os.walk(CORPUS):
+        for fname in files:
+            path = os.path.join(base, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    blob = f.read()
+            except OSError:
+                continue
+            original = blob
+            for proj in ordered:
+                for variant in sorted(_name_variants(proj), key=len, reverse=True):
+                    blob, n = re.subn(_name_pattern(variant), REDACTION,
+                                      blob, flags=re.I)
+                    count += n
+            if blob != original:
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(blob)
+    return count
+
+
+def build(check_visibility=True, redact=True):
     if os.path.isdir(CORPUS):
         shutil.rmtree(CORPUS)
     os.makedirs(CORPUS, exist_ok=True)
@@ -171,15 +238,31 @@ def build(check_visibility=True):
         if unchecked:
             print("\n  NOT CHECKED (name is an ordinary word): %s"
                   % ", ".join(unchecked))
-        if hits:
+        if hits and redact:
+            # Redact rather than refuse. Refusing leaves the corpus unbuildable
+            # forever, which in practice means nobody rebuilds it and the stale
+            # committed copy — the one with the names in it — stays. Replacing
+            # the name keeps the entry's shape, and therefore its value as
+            # retrieval material, while the identifier stops travelling.
+            n = _redact_nonpublic()
+            print("\n  REDACTED %d mention(s) of non-public projects:" % n)
+            for path, proj in sorted(set(hits)):
+                print("     %-54s %s" % (path, proj))
+            print("  (entry text is otherwise unchanged; the name is replaced "
+                  "with %s)" % REDACTION)
+            left, _ = _scan_for_nonpublic_mentions()
+            if left:
+                shutil.rmtree(CORPUS, ignore_errors=True)
+                raise SystemExit("redaction did not clear: %s" % sorted(set(left)))
+        elif hits:
             shutil.rmtree(CORPUS, ignore_errors=True)
             print("\nREFUSING: the frozen corpus names non-public projects.")
             for path, proj in sorted(set(hits)):
                 print("   %-56s mentions %s" % (path, proj))
             raise SystemExit(
                 "\nA public store's entries can still describe a private one "
-                "(con-015-12da). Redact those entries, drop the store, or "
-                "re-run with --no-visibility-check having checked by hand.")
+                "(con-015-12da). Re-run with --redact, drop the store, or use "
+                "--no-visibility-check having checked by hand.")
 
     print("frozen corpus: %d entries across %d stores" % (total, len(STORES)))
     return total
@@ -188,7 +271,8 @@ def build(check_visibility=True):
 def main(argv=None):
     import sys
     argv = sys.argv[1:] if argv is None else argv
-    build(check_visibility="--no-visibility-check" not in argv)
+    build(check_visibility="--no-visibility-check" not in argv,
+          redact="--no-redact" not in argv)
     return 0
 
 

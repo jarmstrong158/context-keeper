@@ -2,7 +2,7 @@
   {
     "id": "con-001-491f",
     "rule": "To distill agentsync outcomes for a project, that project's OWN origin must carry the agentsync coordination branch. distill() reads origin/<agentsync_branch> of CAMBIUM_REPO only \u2014 it will not reach a board hosted on a different repo, and released claims are never reconstructed from history.",
-    "reason": "In balatron's first cycle distill() returned 0 agentsync items and reported 'no coordination branch found', because balatron's origin has no agentsync branch \u2014 the team's live board lives on agentsync-remote/aethermoor, and all of balatron's claims had already been released. Cambium silently falls back to context-keeper only, so you lose every agentsync outcome-memory without any error. Verify the branch exists (git ls-remote --heads origin agentsync) before trusting a distill's agentsync count.",
+    "reason": "In balatron's first cycle distill() returned 0 agentsync items and reported 'no coordination branch found', because balatron's origin has no agentsync branch \u2014 the team's live board lives on agentsync-remote/<private-project>, and all of balatron's claims had already been released. Cambium silently falls back to context-keeper only, so you lose every agentsync outcome-memory without any error. Verify the branch exists (git ls-remote --heads origin agentsync) before trusting a distill's agentsync count.",
     "triggering_incident": "balatron distill on 2026-07-10: sources.agentsync = 'no coordination branch found'; 80/80 items came from context-keeper, 0 from agentsync.",
     "scope": "global",
     "hardness": "advisory",
@@ -78,5 +78,73 @@
     "updated_at": "2026-07-31T17:37:42.279430+00:00",
     "verified_at": "2026-07-31T17:37:42.279430+00:00",
     "verified_sha": "cfdf09e5b53f449e6b51dd3923bf8d9b427d43bb"
+  },
+  {
+    "id": "con-004-e3b9",
+    "rule": "Never track .cambium/knowledge.json in this repo. The local knowledge store must stay gitignored here, because this repo is public and local scope accumulates captures quoting every project the operator works in. Knowledge that should travel goes to team or org scope, which have their own repos and their own gates.",
+    "reason": "DESIGN calls local scope \"yours; not shared\", but local scope physically lives in the project repo - so for a PUBLIC project repo those two statements contradict each other, and the contradiction is invisible while the store happens to be empty. It was committed empty (items: [], only distill watermarks) and stayed harmless for months. The first session that captured real cross-project knowledge into it put dozens of references to other projects on the machine - including one with no remote at all - into a file staged for a public push. con-015-12da in context-keeper forbids exactly this and notes the failure is silent, one-way, and cannot be reliably unpublished once pushed. Nothing in the tool, the test suite, or code review flags it; the file simply appears as a normal modified file in git status. Note that the write-up of an incident like this must itself be generic: naming the projects involved would leak, in the explanation, the very thing the rule exists to protect.",
+    "triggering_incident": "Caught on 2026-08-16 at git-add time, after a session captured two dozen cross-project law items into the local store. The staged diff was inspected for other-project references before committing only because con-015-12da was fresh in context from earlier in the same session; a routine `git add -A` would have published it. Untracked with `git rm --cached` (the file stays on disk) and gitignored alongside pages.json and snapshot.json, which were already excluded for the identical reason. The only loss is three distill watermarks, which re-import harmlessly.",
+    "enforced_by": "",
+    "scope": ".gitignore",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-015-71d6",
+      "dec-018-0a86"
+    ],
+    "tags": [
+      "publishing",
+      "privacy",
+      "gitignore",
+      "local-scope",
+      "silent-failure"
+    ],
+    "retrieval_hints": [
+      "can I commit the cambium local store",
+      "why is knowledge.json gitignored",
+      "private project names in a public repo",
+      "local scope in a public repo"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-16T17:50:23.428579+00:00",
+    "updated_at": "2026-08-16T17:51:16.730666+00:00",
+    "verified_at": "2026-08-16T17:51:16.693169+00:00",
+    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+  },
+  {
+    "id": "con-005-22d0",
+    "rule": "A Cloudflare Worker that gates static assets MUST set `run_worker_first = true` under [assets], and every deploy must verify the gate by requesting a protected path WITHOUT the credential and asserting 404. Never deploy data before the gate has been proven on a data-free build.",
+    "reason": "Cloudflare serves a matching static asset BEFORE invoking the Worker script unless run_worker_first is set. A Worker whose fetch handler checks a path token therefore never runs for any path that matches an uploaded file, so the auth check is silently absent on exactly the URLs that matter. The failure presents as a completely normal successful deploy: wrangler reports success, the Worker exists, the code is correct, and the credential check is simply never reached. There is no error anywhere.",
+    "triggering_incident": "2026-08-16: deployed a token-gated dashboard Worker with [assets] pointing at a bundle containing snapshot.json - 869KB of cross-project memory with entry bodies from 20 projects, several private and one with no remote. The gate code was correct but never executed: https://<worker>.workers.dev/snapshot.json returned the full file to unauthenticated requests. Caught within about four minutes by the post-deploy gate test, which requested protected paths without the token and expected 404. Remediation had to be a deny-all Worker deployed over the same name, because `wrangler delete` left the edge serving the old assets for at least a minute. Worse, a --no-data build flag had been written specifically to prevent this and was used for an earlier Pages attempt, then skipped for the Worker deploy - the safety mechanism existed and was bypassed by the person who built it.",
+    "enforced_by": "",
+    "scope": "worker/wrangler.toml",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-015-71d6",
+      "con-004-e3b9"
+    ],
+    "tags": [
+      "cloudflare",
+      "workers",
+      "auth",
+      "publishing",
+      "privacy",
+      "silent-failure"
+    ],
+    "retrieval_hints": [
+      "cloudflare worker assets bypass auth",
+      "run_worker_first",
+      "worker token gate not running",
+      "static assets served before worker",
+      "leaked snapshot via workers.dev"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-16T20:27:50.676194+00:00",
+    "updated_at": "2026-08-16T20:27:57.069769+00:00",
+    "verified_at": "2026-08-16T20:27:57.031415+00:00",
+    "verified_sha": "efd91c10daea3b8070115d381f7c966fb1404483"
   }
 ]

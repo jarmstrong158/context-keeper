@@ -89,23 +89,23 @@
   },
   {
     "id": "dec-004-e7c9",
-    "summary": "Sim test vs Vanguard (the RPG whose style guide Meristem's shading was ported from) validated Meristem's design and surfaced concrete gaps. Vanguard's enemy_sprite_generator.gd independently uses ~13 family archetypes recolored by base_color -- the same 'config over a fixed library' pattern (dec-0022) -- and Meristem's bestiary covers 10/12 of those families (wolf/slime/serpent/wisp/bat/stalker/4x humanoid). Crucially Meristem is MORE disciplined than its source: Vanguard's enemy gen uses pure brightness scaling (_darker/_lighter), violating its OWN guide's mandatory hue-shift, whereas Meristem makes hue-shift structural (Ramp is the only shader) and gate-enforced. See docs/reference/vanguard-comparison.md + vanguard-enemy-mapping.png.",
-    "problem": "Needed to test whether Meristem's sprite architecture holds up against a real GBA-style RPG's needs, and whether anything could be learned from Vanguard, the project that originated the hue-shift standard.",
-    "why_chosen": "A cross-project mapping is the cheapest strong evidence: a separate human-authored RPG converging on the same family-archetype structure confirms dec-0022 is a real pattern, not idiosyncratic; and Vanguard's enemy generator drifting from its own hue-shift rule (which Meristem's gate would have caught) confirms the value of making the discipline structural and enforced rather than a doc convention.",
+    "summary": "Sim test vs <private-project> (the RPG whose style guide Meristem's shading was ported from) validated Meristem's design and surfaced concrete gaps. <private-project>'s enemy_sprite_generator.gd independently uses ~13 family archetypes recolored by base_color -- the same 'config over a fixed library' pattern (dec-0022) -- and Meristem's bestiary covers 10/12 of those families (wolf/slime/serpent/wisp/bat/stalker/4x humanoid). Crucially Meristem is MORE disciplined than its source: <private-project>'s enemy gen uses pure brightness scaling (_darker/_lighter), violating its OWN guide's mandatory hue-shift, whereas Meristem makes hue-shift structural (Ramp is the only shader) and gate-enforced. See docs/reference/<private-project>-comparison.md + <private-project>-enemy-mapping.png.",
+    "problem": "Needed to test whether Meristem's sprite architecture holds up against a real GBA-style RPG's needs, and whether anything could be learned from <private-project>, the project that originated the hue-shift standard.",
+    "why_chosen": "A cross-project mapping is the cheapest strong evidence: a separate human-authored RPG converging on the same family-archetype structure confirms dec-0022 is a real pattern, not idiosyncratic; and <private-project>'s enemy generator drifting from its own hue-shift rule (which Meristem's gate would have caught) confirms the value of making the discipline structural and enforced rather than a doc convention.",
     "what_we_tried": "",
-    "tradeoffs": "The learnings flowing back to Meristem carry real tension: per-material selective outlining (Vanguard _sel_outline = shadow(c,0.5)) improves quality but costs colours against the 15-budget, so it can only be an opt-in for single-material classes; shade-sharing could relax con-001 but complicates the generative palette.",
+    "tradeoffs": "The learnings flowing back to Meristem carry real tension: per-material selective outlining (<private-project> _sel_outline = shadow(c,0.5)) improves quality but costs colours against the 15-budget, so it can only be an opt-in for single-material classes; shade-sharing could relax con-001 but complicates the generative palette.",
     "alternatives": [],
     "constraints_created": [],
     "related_to": [],
     "tags": [
       "meristem",
-      "vanguard",
+      "<private-project>",
       "sim-test",
       "sprites",
       "validation"
     ],
     "retrieval_hints": [
-      "meristem vs vanguard comparison",
+      "meristem vs <private-project> comparison",
       "enemy family archetype coverage",
       "why hue-shift is structural not a doc rule",
       "raptor beetle archetype gaps"
@@ -151,7 +151,7 @@
       "props",
       "budget",
       "generators",
-      "vanguard"
+      "<private-project>"
     ],
     "retrieval_hints": [
       "how to make characters look distinct",
@@ -218,11 +218,11 @@
   },
   {
     "id": "dec-007-c767",
-    "summary": "Filled the two archetype gaps the Vanguard sim test found (dec-004-e7c9) and delivered Vanguard's full bestiary. Added `raptor` (side-view biped beast: raptor/drake/roc) and `beetle` (top-down armored bug: beetle/scorpion/mite) archetypes -- 8 creature archetypes now cover every Vanguard enemy family. tools/vanguard_bestiary.py maps all 43 Vanguard enemy ids -> Meristem (archetype, config) recoloured from base_color/element, and packs each into a 768x256 Puny-layout battle sheet (row 0, idle + walk-cycle, art facing RIGHT for the loader's flip_h). Delivered to BOTH: Meristem (archetypes + script + docs/reference/vanguard-bestiary.png) and Vanguard (43 sheets in sprites/enemies/ + 43 SPRITE_MAP entries in battle_sprite_loader.gd, verified: godot --headless --import generated 43 .import files, no script errors).",
-    "problem": "Vanguard's enemy generator rendered 20 of its 43 creatures as a grey default-slime placeholder, and Meristem lacked the raptor (biped) and beetle (armored bug) families needed to cover the roster. The user asked to build out the sprite database: a sprite for every Vanguard creature, in both projects.",
-    "why_chosen": "The families already line up (wolf->quadruped, slime->blob, wisp->ghost, etc. per dec-004), so adding the two missing archetypes made Meristem's bestiary a superset of Vanguard's families; then a deterministic id->(archetype,config) mapping generates every sheet with hue-shift discipline (an upgrade over Vanguard's brightness-only, half-placeholder art). Packing into the exact 768x256 Puny layout the loader expects, with humanoids held to <=5 materials for the 15-colour budget, let all 43 gate-clean and import into Godot unchanged.",
+    "summary": "Filled the two archetype gaps the <private-project> sim test found (dec-004-e7c9) and delivered <private-project>'s full bestiary. Added `raptor` (side-view biped beast: raptor/drake/roc) and `beetle` (top-down armored bug: beetle/scorpion/mite) archetypes -- 8 creature archetypes now cover every <private-project> enemy family. tools/<private-project>_bestiary.py maps all 43 <private-project> enemy ids -> Meristem (archetype, config) recoloured from base_color/element, and packs each into a 768x256 Puny-layout battle sheet (row 0, idle + walk-cycle, art facing RIGHT for the loader's flip_h). Delivered to BOTH: Meristem (archetypes + script + docs/reference/<private-project>-bestiary.png) and <private-project> (43 sheets in sprites/enemies/ + 43 SPRITE_MAP entries in battle_sprite_loader.gd, verified: godot --headless --import generated 43 .import files, no script errors).",
+    "problem": "<private-project>'s enemy generator rendered 20 of its 43 creatures as a grey default-slime placeholder, and Meristem lacked the raptor (biped) and beetle (armored bug) families needed to cover the roster. The user asked to build out the sprite database: a sprite for every <private-project> creature, in both projects.",
+    "why_chosen": "The families already line up (wolf->quadruped, slime->blob, wisp->ghost, etc. per dec-004), so adding the two missing archetypes made Meristem's bestiary a superset of <private-project>'s families; then a deterministic id->(archetype,config) mapping generates every sheet with hue-shift discipline (an upgrade over <private-project>'s brightness-only, half-placeholder art). Packing into the exact 768x256 Puny layout the loader expects, with humanoids held to <=5 materials for the 15-colour budget, let all 43 gate-clean and import into Godot unchanged.",
     "what_we_tried": "",
-    "tradeoffs": "A few creatures map only approximately to available archetypes (deep_angler/hollow_vine/shadow_creeper/granite_golem have no exact plant/fish/golem archetype). Vanguard changes are made + verified-to-import but left uncommitted in that repo for the user to eyeball in-battle (sprite quality is their call).",
+    "tradeoffs": "A few creatures map only approximately to available archetypes (deep_angler/hollow_vine/shadow_creeper/granite_golem have no exact plant/fish/golem archetype). <private-project> changes are made + verified-to-import but left uncommitted in that repo for the user to eyeball in-battle (sprite quality is their call).",
     "alternatives": [],
     "constraints_created": [],
     "related_to": [
@@ -230,14 +230,14 @@
     ],
     "tags": [
       "meristem",
-      "vanguard",
+      "<private-project>",
       "bestiary",
       "archetypes",
       "sprites"
     ],
     "retrieval_hints": [
       "raptor and beetle archetypes",
-      "vanguard bestiary 43 creatures sprite sheets",
+      "<private-project> bestiary 43 creatures sprite sheets",
       "Puny 768x256 layout SPRITE_MAP delivery"
     ],
     "origin": "agent",
@@ -384,12 +384,12 @@
     ],
     "origin": "agent",
     "schema_version": 4,
-    "status": "active",
-    "superseded_by": null,
+    "status": "superseded",
+    "superseded_by": "dec-013-e61a",
     "created_at": "2026-07-26T00:54:19.894714+00:00",
-    "updated_at": "2026-07-26T00:54:19.894714+00:00",
-    "verified_at": "2026-07-26T00:54:19.894714+00:00",
-    "verified_sha": "d59d7cc768f8b10cc6b3e805345545c8947c7ed3"
+    "updated_at": "2026-08-16T17:56:07.617138+00:00",
+    "verified_at": "2026-08-16T17:56:07.583839+00:00",
+    "verified_sha": "8c4c1d7446959277f717cdaf5294a33d394bf803"
   },
   {
     "id": "dec-012-d904",
@@ -944,7 +944,7 @@
   {
     "id": "dec-021-11f0",
     "summary": "The humanoid archetype has four facings (south/north/east/west) via a `facing` config knob, and the compiler emits all four. `west` is never drawn -- it is `east` mirrored. `south` renders byte-identical whether the config names it or not.",
-    "problem": "A top-down game moves in four directions and every Meristem archetype drew ONE front view, so a character walking north showed you its face and one walking left was the same drawing mirrored via flip_h. This affected Meristem's own compiled games as much as Vanguard, whose Godot overworld could not consume Meristem art at all for exactly this reason and kept using its own PartyOverworldSpriteGenerator.",
+    "problem": "A top-down game moves in four directions and every Meristem archetype drew ONE front view, so a character walking north showed you its face and one walking left was the same drawing mirrored via flip_h. This affected Meristem's own compiled games as much as <private-project>, whose Godot overworld could not consume Meristem art at all for exactly this reason and kept using its own PartyOverworldSpriteGenerator.",
     "why_chosen": "Two hard rules bound the design and are asserted by tests rather than left to convention. `west` is east mirrored: half the work, and a guarantee the two profiles cannot drift apart when one is next edited. `south` is frozen byte-for-byte because every sprite that already existed is a south sprite -- adding a direction must not silently redraw the whole cast. `facing` is a catalog variant axis so a typo is a validation error, not a quiet render of the default direction (consistent with dec-0029). The key craft finding: what makes a profile legible at 32px is the SILHOUETTE, not the shading. A first cut that only narrowed the torso scored 76px of outline difference against the front view and read as a smudge; adding a nose on the leading edge, the hair mass behind, and the near arm clear of the trunk reached 149px.",
     "what_we_tried": "First attempt narrowed the east torso and moved the eye, keeping front-facing sideburns and a square head -- 76px silhouette gap, unreadable at 1x. Rendering and looking at it (rather than trusting the code read correctly) is what caught it, the same discipline that caught three unusable metrics earlier in the project.",
     "tradeoffs": "A humanoid character now costs 5x the walk frames on disk (four facings plus the undirected set). At 32x32 that is noise, and keeping the undirected `walk_*` set is what makes pre-facing manifests byte-stable and lets single-view archetypes compile unchanged.",
@@ -977,7 +977,7 @@
       "humanoid",
       "compiler",
       "godot",
-      "vanguard"
+      "<private-project>"
     ],
     "retrieval_hints": [
       "how do Meristem characters face different directions",
@@ -997,14 +997,14 @@
   {
     "id": "dec-022-4f59",
     "summary": "Every declared entity stat reaches the runtime via BASE_STATS + a generic Game.stat(name), not a hand-picked atk/def. Abilities gain an optional `scaling` stat added to power, read at cast time so gear moves it. A scaling reference to a stat the caster lacks is refused at both cross-ref and compile time.",
-    "problem": "entities.stats is an open map in the schema (additionalProperties: number), so an author could always write `mag: 6` -- and the compiler consumed hp/atk/def/mp/mp_regen only. Every other stat validated clean and compiled to nothing. Worse, Game.stat_bonus(name) was ALREADY generic over the stat name, so an item granting +4 mag faithfully accumulated a bonus that nothing in the runtime could ever read. The Vanguard sim-test fit report ranked this the cheapest fix with the widest reach: Maren is a MAG-based support whose rod grants +MAG, and the rod had to be authored as +4 atk, which changes what the item means.",
+    "problem": "entities.stats is an open map in the schema (additionalProperties: number), so an author could always write `mag: 6` -- and the compiler consumed hp/atk/def/mp/mp_regen only. Every other stat validated clean and compiled to nothing. Worse, Game.stat_bonus(name) was ALREADY generic over the stat name, so an item granting +4 mag faithfully accumulated a bonus that nothing in the runtime could ever read. The <private-project> sim-test fit report ranked this the cheapest fix with the widest reach: Maren is a MAG-based support whose rod grants +MAG, and the rod had to be authored as +4 atk, which changes what the item means.",
     "why_chosen": "stat_bonus was already generic, so the whole gap was the OTHER half: baking every declared stat instead of two, and adding one `scaling` field. atk()/defense() keep named accessors because they carry real floors (an attack lands for at least 1, defense never goes negative) that are runtime rules, not properties of stats in general. hp/mp/mp_regen stay as their own Game fields and are excluded from BASE_STATS so no stat has two homes that can disagree. Scaling is read at CAST time, never baked: gear moves stats mid-run, so a power resolved at compile time would ignore the staff the player is holding, which is the entire point. All four ability kinds go through one _effective_power, including dash where the stat scales distance -- one rule instead of two.",
     "what_we_tried": "Deriving the new stat_scaling assertion exposed that the EXISTING ability_damage assertion computed its expectation from raw `power`. It failed the moment scaling started working, which is how the omission was found -- the assertion loop catching a gap in its own derivation.",
     "tradeoffs": "`power` alone no longer tells you what an ability hits for -- you have to know the caster's stat too. That is inherent to scaling; the HUD readout (scaling stats shown next to atk/def) and the stat_scaling engine assertion are what make it legible.",
     "alternatives": [
       {
         "option": "A fixed second stat named `mag`",
-        "reason_rejected": "Vanguard's five stats are not every game's; the open map was already right, only the consumption was wrong"
+        "reason_rejected": "<private-project>'s five stats are not every game's; the open map was already right, only the consumption was wrong"
       },
       {
         "option": "Resolve scaling at compile time into the baked power",
@@ -1030,7 +1030,7 @@
       "abilities",
       "compiler",
       "godot",
-      "vanguard",
+      "<private-project>",
       "verifier"
     ],
     "retrieval_hints": [
@@ -1051,7 +1051,7 @@
   {
     "id": "dec-023-7643",
     "summary": "NPC overworld art is generated one sheet per PLACED NPC (keyed {map}_{node}), not per sprite_id, and each NPC's palette is read out of the running game rather than re-derived. Added `headband` and `wide_brim` hats to the humanoid archetype.",
-    "problem": "Meristem generated 18 generic NPC sheets keyed on Vanguard's sprite_id and the overworld could not use them. A placed NPC carries hand-authored shirt/pants/hair/skin colours, so a sheet keyed on sprite_id would have made every \"worker_cyan\" in the game the same person -- which is exactly why the sprite ladder had deliberately kept Vanguard's own procedural generator ABOVE the generated sheets. The art was better and still unusable.",
+    "problem": "Meristem generated 18 generic NPC sheets keyed on <private-project>'s sprite_id and the overworld could not use them. A placed NPC carries hand-authored shirt/pants/hair/skin colours, so a sheet keyed on sprite_id would have made every \"worker_cyan\" in the game the same person -- which is exactly why the sprite ladder had deliberately kept <private-project>'s own procedural generator ABOVE the generated sheets. The art was better and still unusable.",
     "why_chosen": "Keying on the placed NPC dissolves the tradeoff instead of managing it: the variety is authored, not random, and there are only fifteen NPCs in the whole game. Map + node rather than npc_name because a JRPG has several NPCs called \"Traveler\". Crucially the palette is DUMPED from the running game (dump_npc_palettes.gd loads each map, lets _ready run, reads the resolved colours off the live node) rather than parsed from .tscn: half of what an NPC looks like is not in the scene file at all, because colours the author left unset are derived at runtime from npc_color plus a hash of the node name. Re-implementing that rule in the Python generator would be a second copy free to drift, and the drift would be invisible -- the sprite would simply be the wrong colour.",
     "what_we_tried": "",
     "tradeoffs": "Sheets go stale if an NPC is renamed or recoloured, and a rename would silently fall back to the old procedural look. Mitigated by the verifier walking every map, asserting each placed NPC resolves to its own sheet, and flagging orphaned sheets that match no placed NPC.",
@@ -1061,7 +1061,7 @@
         "reason_rejected": "A third place to keep in sync; deriving the lookup from where the node lives means adding an NPC and re-running the generator is enough"
       },
       {
-        "option": "Re-derive Vanguard's palette rules in the Python generator",
+        "option": "Re-derive <private-project>'s palette rules in the Python generator",
         "reason_rejected": "A second implementation of one rule, free to drift, and the drift is invisible -- the sprite is just the wrong colour"
       },
       {
@@ -1082,7 +1082,7 @@
     "tags": [
       "sprites",
       "npcs",
-      "vanguard",
+      "<private-project>",
       "godot",
       "humanoid"
     ],
@@ -1100,5 +1100,52 @@
     "updated_at": "2026-07-28T01:23:40.520229+00:00",
     "verified_at": "2026-07-28T01:23:40.520229+00:00",
     "verified_sha": "60c1cf318e34873117ac0de9c0575c292532e288"
+  },
+  {
+    "id": "dec-024-f3fd",
+    "summary": "Variant separation within an archetype is ASSIGNED across the roster, not hashed per item. The golem gained `proportion` as a second silhouette axis independent of `size`, and <private-project>_new_enemies assigns it round-robin per (build, size) group, reserving \"even\" for the hand-mapped bestiary constructs it cannot see.",
+    "problem": "Mapping family \"construct\" to the new golem archetype fixed constructs being drawn as people but moved the duplicate-silhouette failure down one level. frost_construct, crystallized_stillkeeper, crystallized_mage and living_crystal are all level 26-27, so they resolved to one build at one size and differed only in palette -- four endgame enemies sharing an outline, which is the same failure dec-011 exists to prevent.",
+    "why_chosen": "Size could not separate them because level drives size and they share a level band, so a second axis was needed that varies shape without varying scale. Choosing that axis by crc32(name) is stable across runs but only spreads ON AVERAGE: it collided immediately and left crystallized_stillkeeper and frost_construct at 100% silhouette IoU. Assigning round-robin over each (build, size) group spreads IN FACT, guarantees no two constructs in a group share an outline up to the number of proportions, and stays deterministic because the roster is sorted. Reserving \"even\" for the bestiary's hand-mapped constructs is necessary because the derived tool never sees them, and starting the derived assignment at index 0 reproduced the collision across the two-tool boundary.",
+    "what_we_tried": "Element-derived builds first, which rendered living_crystal (element earth) as a brown boulder; the NAME states the material more reliably than the element, so build now reads the name first. Then crc32 proportions, which collided. Then round-robin from index 0, which collided with the bestiary's crystallized_mage across the tool boundary.",
+    "tradeoffs": "Proportion is decoupled from anything the enemy declares, so it carries no meaning -- a \"tall\" construct is not lore-tall, it is just not shaped like its neighbour. Assignment depends on roster order, so inserting a construct can reshape others; acceptable because the art is regenerated wholesale. Worst construct pair is 85% IoU rather than something lower, because stone and crystal at the same proportion still share a base mass.",
+    "alternatives": [
+      {
+        "option": "Pick proportion from crc32(name)",
+        "reason_rejected": "Stable but collides: measured 100% IoU between two endgame constructs on the first run. A hash spreads on average, which is not a guarantee."
+      },
+      {
+        "option": "Derive size from finer level bands",
+        "reason_rejected": "The colliding constructs are all level 26-27, so any level-derived value gives them the same answer."
+      },
+      {
+        "option": "Add more golem builds",
+        "reason_rejected": "More art per build, and the build already encodes MATERIAL (stone/crystal/lattice). Overloading it with shape would make a crystal golem and a stone golem differ for two unrelated reasons."
+      }
+    ],
+    "constraints_created": [],
+    "related_to": [
+      "dec-011-b5c3",
+      "dec-013-e61a"
+    ],
+    "tags": [
+      "sprites",
+      "golem",
+      "silhouette",
+      "<private-project>"
+    ],
+    "retrieval_hints": [
+      "why do two enemies look the same",
+      "golem proportion knob",
+      "silhouette IoU collision",
+      "hash vs assignment for variant spread"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-11T16:54:40.264281+00:00",
+    "updated_at": "2026-08-11T16:54:40.264281+00:00",
+    "verified_at": "2026-08-11T16:54:40.264281+00:00",
+    "verified_sha": "61a0faa6ef8c7949e4aaef66058afb2f424d8a8e"
   }
 ]
