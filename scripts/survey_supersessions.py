@@ -251,8 +251,14 @@ def _label(entry):
 
 def render_report(proposals, unpaired, stores, threshold):
     """The reviewable artifact. ASCII only."""
-    both = [p for p in proposals if p["both_signals"]]
-    overlap_only = [p for p in proposals if not p["both_signals"]]
+    # Section on replacement EVIDENCE, not on subject overlap. This report is
+    # the only artifact a human reviews, and it used to split on `both_signals`
+    # under a heading calling those the "strongest candidates" -- a tier measured
+    # at 21.9% precision. Ranking the reviewable output by the weak signal while
+    # a stronger one sat computed-but-unrendered made the improvement invisible
+    # exactly where it was supposed to land.
+    likely = [p for p in proposals if p.get("tier") == "likely"]
+    leads = [p for p in proposals if p.get("tier") != "likely"]
     lines = [
         "# Supersession backfill proposals",
         "",
@@ -266,32 +272,33 @@ def render_report(proposals, unpaired, stores, threshold):
         "",
         f"- stores scanned: {len(stores)}",
         f"- overlap threshold: {threshold}",
-        f"- proposals with BOTH signals (text marker + subject overlap): {len(both)}",
-        f"- proposals from subject overlap only: {len(overlap_only)}",
+        f"- LIKELY (newer entry names the older beside change language): {len(likely)}",
+        f"- leads (same subject, no replacement evidence): {len(leads)}",
         f"- text markers with no sibling to pair against: {len(unpaired)}",
         "",
     ]
 
-    lines += ["## Both signals", ""]
-    if both:
+    lines += ["## Likely", ""]
+    if likely:
         lines.append(
-            "The newer entry's own text says something changed, AND there is an "
-            "older entry about the same subject. Strongest candidates. Those "
-            "carrying a strong marker (previously / replaced / no longer) sort "
-            "first; a bare `was` is often just past tense in an incident "
-            "narrative, so it is kept but ranked below.")
+            "The newer entry NAMES the older beside language asserting a change. "
+            "Measured at 80% precision against 34 hand-labelled pairs; the "
+            "signal these used to be ranked by measured 21.9%. Still read each "
+            "one -- 80% means one in five of these is wrong.")
         lines.append("")
-        lines += _render_proposals(both)
+        lines += _render_proposals(likely)
     else:
         lines += ["None.", ""]
 
-    lines += ["## Subject overlap only", ""]
-    if overlap_only:
+    lines += ["## Leads", ""]
+    if leads:
         lines.append(
-            "Same subject, no text marker. Many of these are simply two entries "
-            "about one area, which is fine and normal -- read before linking.")
+            "Same subject, no evidence that either entry is talking about the "
+            "other. Mostly two entries about one area, which is fine and normal. "
+            "These are listed so nothing is hidden, NOT because they are "
+            "candidates -- read before linking.")
         lines.append("")
-        lines += _render_proposals(overlap_only)
+        lines += _render_proposals(leads)
     else:
         lines += ["None.", ""]
 
@@ -325,6 +332,9 @@ def _render_proposals(proposals):
         lines.append(
             f"### {p['project']} / {p['kind']}: `{p['older_id']}` -> `{p['newer_id']}`")
         lines.append("")
+        # The evidence that earned the tier, first -- it is the reason to read on.
+        for sig in ev.get("replacement_signals") or []:
+            lines.append(f"- **evidence: {sig}**")
         if strong:
             lines.append(f"- **strong marker(s): {', '.join(strong)}**")
         lines.append(f"- older `{p['older_id']}`: {p['older_summary']}")
@@ -388,9 +398,10 @@ def main(argv=None):
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(body)
 
-    both = sum(1 for p in proposals if p["both_signals"])
+    likely = sum(1 for p in proposals if p.get("tier") == "likely")
     print("stores scanned: {}".format(len(stores)))
-    print("proposals: {} ({} with both signals)".format(len(proposals), both))
+    print("proposals: {} ({} likely, {} leads)".format(
+        len(proposals), likely, len(proposals) - likely))
     print("unpaired markers: {}".format(len(unpaired)))
     print("written: {}".format(args.out))
     print("NOTHING WAS WRITTEN TO ANY STORE -- review the file and decide the links.")

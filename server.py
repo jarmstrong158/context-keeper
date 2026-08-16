@@ -1244,10 +1244,13 @@ _CHANGE_PHRASES = re.compile(
     r"no longer|instead of|rather than|used to|previously|formerly|"
     r"in place of|deprecat\w+|removed in favou?r of|was removed|"
     r"was flat|now keys|stops? being|"
-    # Retirement language: an entry that records another one FAILING is
-    # replacing its conclusion even when it never says "supersedes".
-    r"failed|not shipped|abandoned|rolled back|backed out|disabled|"
-    r"turned off|unset|withdrawn|is now|are now|becomes)\b", re.I)
+    # Retirement language. Deliberately NOT here: `failed`, `disabled`, `unset`,
+    # `is now`, `are now`, `becomes`. Those describe a STATE, not an act of
+    # replacement, and inside a +/-130 character window almost any sentence
+    # beside a citation supplies one -- which let approving citations reach the
+    # top tier, the exact failure this module exists to prevent.
+    r"not shipped|abandoned|rolled back|backed out|withdrawn|"
+    r"no longer shipped|reverted to)\b", re.I)
 
 # A "was ..." clause is evidence only when it sits right beside something the
 # two entries share -- "(was flat -2.0)" next to the constant it describes.
@@ -1385,8 +1388,8 @@ def _identifiers(text):
 # the domain-wide ones that survive even a per-project frequency check.
 _TERM_STOP = frozenset("""
 about above after again against because before being below between both cannot
-could during every first found further having howeveritself into itself least
-making means might most must never other otherwise过 rather should since some
+could during every first found further having however into itself least
+making means might most must never other otherwise rather should since some
 still such than that their them then there these thing think this those though
 through under until using very were what when where which while whole whose
 would write written wrong entry entries record records recorded decision
