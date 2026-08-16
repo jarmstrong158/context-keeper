@@ -66,22 +66,42 @@ def _is_public(store):
     return out.stdout.strip().upper() == "PUBLIC"
 
 
+def _remote_slug(path):
+    """`owner/name` from a checkout's origin, or None."""
+    r = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/\s]+?)(?:\.git)?$",
+                  r.stdout.strip())
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
 def _nonpublic_projects():
-    """Every project on this machine that is NOT public: private repos, and any
-    directory with no remote at all. Derived, never hand-listed — a hand-listed
-    set is one `gh repo create --private` away from being wrong."""
+    """Every project on this machine whose name must not travel: private repos
+    — whoever owns them — and any directory with no remote at all.
+
+    Visibility is asked of the ACTUAL remote, not of `jarmstrong158/<dirname>`.
+    Asking about the wrong repo answered "cannot tell" for two kinds of
+    directory and swept both into the redaction set: a third-party open-source
+    checkout (public, nothing to protect, and redacting its name would corrupt
+    a legitimate reference) and a local directory whose name differs from its
+    repo name (public, resolvable only under the real slug). Both were caught
+    only because the names looked wrong in the replacement list.
+
+    A collaborator's PRIVATE repo is still protected, even though it is not
+    owned by this account — it is somebody's private work either way."""
     names = set()
     for name in sorted(os.listdir(REPOS)):
         path = os.path.join(REPOS, name)
         if not os.path.isdir(os.path.join(path, ".git")):
             continue
-        remote = subprocess.run(["git", "-C", path, "remote"],
-                                capture_output=True, text=True, timeout=20)
-        if not remote.stdout.strip():
+        slug = _remote_slug(path)
+        if slug is None:
             names.add(name)                      # no remote at all
             continue
         vis = subprocess.run(
-            ["gh", "repo", "view", f"jarmstrong158/{name}", "--json", "visibility",
+            ["gh", "repo", "view", slug, "--json", "visibility",
              "-q", ".visibility"], capture_output=True, text=True, timeout=25)
         if vis.returncode != 0 or vis.stdout.strip().upper() != "PUBLIC":
             names.add(name)                      # private, or cannot tell
