@@ -187,8 +187,24 @@ def _check_enforced_by(c):
 
 
 def _check_unused(c):
-    """Carried into every session and never actually sought."""
-    if usage is None:
+    """Carried into every session and never actually sought.
+
+    DECISIONS ONLY. A constraint is delivered by injection on purpose -- the
+    session-start summary, the .claude/rules projection and scope_guard all push
+    it at you, and nobody queries a rule they are already being handed. So
+    "injected many times, never retrieved" is a constraint working exactly as
+    designed, and flagging it was measuring decision-shaped behaviour against a
+    rule.
+
+    That miscalibration was not academic: it flagged 45 constraints, 36 of them
+    `absolute`, and a bulk action on the flag would have retired live rules --
+    "never treat the won flag as proof of a win" among them. A signal that fires
+    on healthy entries is not a signal, and one that fires on the rules is worse
+    than useless because acting on it removes the rules.
+
+    Pipelines are excluded for the same reason: they are looked up by name when
+    you already know the flow exists."""
+    if usage is None or c.type_name != "decisions":
         return []
     return list(usage.issues_for(
         usage.stats_for(c.base_dir, c.entry_id, c.usage_data)))
